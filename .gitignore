@@ -34,6 +34,7 @@ analyze_*.py
 debug_*.py
 re_*.py
 phase0_*.py
+probe_*.py
 
 # OS / editor
 .DS_Store
