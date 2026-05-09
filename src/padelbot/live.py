@@ -38,6 +38,9 @@ def _tz() -> ZoneInfo:
 
 # ------------ rendering ------------
 
+WEEKLY_BOOKING_QUOTA = 2  # KU Leuven Sport limit for padel students
+
+
 def render_slots_embed(
     slots: list[Slot],
     court_names: dict[int, str],
@@ -45,13 +48,14 @@ def render_slots_embed(
     member_name: str = "",
     num_days: int = 8,
     my_booking_days: set[str] | None = None,
+    my_bookings_count: int = 0,
 ) -> discord.Embed:
-    """`/week`-style ANSI grid per day, one embed field each. Bold-green = open,
-    faint-gray = unavailable. Compact enough that 8 days fit comfortably.
+    """One embed field per day with the bookable courts.
 
-    `my_booking_days` is a set of YYYY-MM-DD strings where the user already
-    has an upcoming booking. Those days get marked so the user knows why
-    booking another slot the same day might be rejected by the API.
+    Days where the user already has a booking are HIDDEN (KUL blocks
+    another booking that day). When the user has hit the weekly quota
+    (`my_bookings_count >= WEEKLY_BOOKING_QUOTA`), no slots are shown
+    and the embed just explains the situation.
     """
     tz = _tz()
     today = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -78,14 +82,34 @@ def render_slots_embed(
 
     embed = discord.Embed(title="🎾 Padel — next 8 days", color=0x377dff, timestamp=datetime.now(tz))
 
+    # Quota banner — when user is at the weekly cap, no slot is bookable.
+    if my_bookings_count >= WEEKLY_BOOKING_QUOTA:
+        embed.add_field(
+            name=f"🚫 Weekly quota reached ({my_bookings_count}/{WEEKLY_BOOKING_QUOTA})",
+            value=(
+                "KU Leuven Sport limits students to "
+                f"**{WEEKLY_BOOKING_QUOTA} padel reservations per week**. "
+                "Cancel one with `/cancel booking_id:N` to free a slot "
+                "(find ids with `/bookings`)."
+            ),
+            inline=False,
+        )
+        embed.set_footer(text=(member_name + " · " if member_name else "") + "no bookable slots until quota frees up")
+        return embed
+
     total_slots = 0
-    # Reverse order: latest day at top, today at bottom (so the most recent
-    # message bumps the upcoming weekend up — easier to scan).
+    # Reverse order: latest day at top, today at bottom.
     for offset in reversed(range(num_days)):
         d = today + timedelta(days=offset)
         day_label = d.strftime("%a %d %b")
         time_map = by_day.get(day_label, {})
         is_hol, has_bk = day_meta.get(day_label, (False, False))
+        day_key = d.strftime("%Y-%m-%d")
+
+        # Hide days where the user already has a booking — KUL blocks another.
+        if day_key in my_booking_days:
+            continue
+
         n_open = sum(len(v) for v in time_map.values())
         total_slots += n_open
 
@@ -94,10 +118,6 @@ def render_slots_embed(
             tag = " ⚠️"
         elif is_hol and has_bk:
             tag = " 🎉"
-        # Mark days where the user already has a booking
-        day_key = d.strftime("%Y-%m-%d")
-        if day_key in my_booking_days:
-            tag += " 🎾 you have a booking"
 
         if not time_map:
             value = "*no slots*"
@@ -120,7 +140,8 @@ def render_slots_embed(
 
     refresh_min = max(1, settings.padelbot_slots_refresh_s // 60)
     legend = "  ".join(f"{col_label(c)}={court_names.get(c, str(c))}" for c in courts_sorted)
-    footer = f"{total_slots} open · {legend} · auto-refresh every {refresh_min} min · click day to book"
+    quota_str = f"quota {my_bookings_count}/{WEEKLY_BOOKING_QUOTA}"
+    footer = f"{total_slots} open · {quota_str} · {legend} · refresh every {refresh_min} min · click day to book"
     if member_name:
         footer = f"{member_name} · " + footer
     embed.set_footer(text=footer[:2000])

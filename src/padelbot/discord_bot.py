@@ -324,6 +324,7 @@ class PadelBot(commands.Bot):
             slots, names,
             member_name=f"{me.get('firstName')} {me.get('lastName')}",
             my_booking_days=my_days,
+            my_bookings_count=len(mine),
         )
         await msg.edit(embed=embed, view=SlotsView(settings.discord_owner_id))
 
@@ -951,6 +952,7 @@ def _register_commands(bot: PadelBot) -> None:
             slots, names,
             member_name=f"{me.get('firstName')} {me.get('lastName')}",
             my_booking_days=my_days,
+            my_bookings_count=len(mine),
         )
         view = SlotsView(settings.discord_owner_id)
         msg = await interaction.channel.send(embed=embed, view=view)
