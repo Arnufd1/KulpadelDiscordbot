@@ -82,19 +82,6 @@ def render_slots_embed(
 
     embed = discord.Embed(title="🎾 Padel — next 8 days", color=0x377dff, timestamp=datetime.now(tz))
 
-    # Soft warning when user is near/at the inferred quota — but ALWAYS show
-    # all real slots so the user can still attempt to book if our quota guess
-    # is wrong. The API is the source of truth.
-    if my_bookings_count >= WEEKLY_BOOKING_QUOTA:
-        embed.add_field(
-            name=f"⚠️ You have {my_bookings_count} bookings this window",
-            value=(
-                f"KU Leuven *might* block more (cap appears to be ~{WEEKLY_BOOKING_QUOTA}/week). "
-                "Try anyway; if rejected, cancel one with `/cancel booking_id:N`."
-            ),
-            inline=False,
-        )
-
     total_slots = 0
     # Reverse order: latest day at top, today at bottom.
     for offset in reversed(range(num_days)):
