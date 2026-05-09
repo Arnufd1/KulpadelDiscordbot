@@ -44,11 +44,18 @@ def render_slots_embed(
     *,
     member_name: str = "",
     num_days: int = 8,
+    my_booking_days: set[str] | None = None,
 ) -> discord.Embed:
     """`/week`-style ANSI grid per day, one embed field each. Bold-green = open,
-    faint-gray = unavailable. Compact enough that 8 days fit comfortably."""
+    faint-gray = unavailable. Compact enough that 8 days fit comfortably.
+
+    `my_booking_days` is a set of YYYY-MM-DD strings where the user already
+    has an upcoming booking. Those days get marked so the user knows why
+    booking another slot the same day might be rejected by the API.
+    """
     tz = _tz()
     today = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    my_booking_days = my_booking_days or set()
 
     by_day: dict[str, dict[str, set[int]]] = {}  # day -> time -> set of court parents
     day_meta: dict[str, tuple[bool, bool]] = {}
@@ -87,6 +94,10 @@ def render_slots_embed(
             tag = " ⚠️"
         elif is_hol and has_bk:
             tag = " 🎉"
+        # Mark days where the user already has a booking
+        day_key = d.strftime("%Y-%m-%d")
+        if day_key in my_booking_days:
+            tag += " 🎾 you have a booking"
 
         if not time_map:
             value = "*no slots*"

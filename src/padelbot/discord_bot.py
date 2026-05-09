@@ -314,11 +314,17 @@ class PadelBot(commands.Bot):
             logger.warning("Slots message gone: {}", e)
             return
         try:
-            me, slots, _mine, names = await self._fetch_my_state()
+            me, slots, mine, names = await self._fetch_my_state()
         except Exception:
             logger.exception("slots refresh fetch failed")
             return
-        embed = render_slots_embed(slots, names, member_name=f"{me.get('firstName')} {me.get('lastName')}")
+        tz = ZoneInfo(settings.padel_local_tz)
+        my_days = {b.start_dt.astimezone(tz).strftime("%Y-%m-%d") for b in mine}
+        embed = render_slots_embed(
+            slots, names,
+            member_name=f"{me.get('firstName')} {me.get('lastName')}",
+            my_booking_days=my_days,
+        )
         await msg.edit(embed=embed, view=SlotsView(settings.discord_owner_id))
 
     async def _refresh_bookings_message(self) -> None:
@@ -935,11 +941,17 @@ def _register_commands(bot: PadelBot) -> None:
             return
         await interaction.response.defer(thinking=True, ephemeral=True)
         try:
-            me, slots, _mine, names = await bot._fetch_my_state()
+            me, slots, mine, names = await bot._fetch_my_state()
         except Exception as e:
             await interaction.followup.send(f":x: API error: `{type(e).__name__}: {e}`", ephemeral=True)
             return
-        embed = render_slots_embed(slots, names, member_name=f"{me.get('firstName')} {me.get('lastName')}")
+        tz = ZoneInfo(settings.padel_local_tz)
+        my_days = {b.start_dt.astimezone(tz).strftime("%Y-%m-%d") for b in mine}
+        embed = render_slots_embed(
+            slots, names,
+            member_name=f"{me.get('firstName')} {me.get('lastName')}",
+            my_booking_days=my_days,
+        )
         view = SlotsView(settings.discord_owner_id)
         msg = await interaction.channel.send(embed=embed, view=view)
         bot.rules_store.kv_set("slots_channel_id", str(interaction.channel_id))
