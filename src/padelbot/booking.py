@@ -157,9 +157,9 @@ def find_slots(
         end = r.get("endDate") or r.get("end")
         if not (sid_parent and sid_linked and start and end):
             continue
+        # Trust isAvailable — that's the real "can I book this" signal,
+        # same one the KU Leuven app uses.
         if r.get("isAvailable") is False:
-            continue
-        if (int(sid_parent), start) in booked:
             continue
         key = (start, int(sid_parent))
         if key in seen:
@@ -210,11 +210,13 @@ def find_slots_window(
     out = client.get("/products/bookable-slots", params={"s": s_filter})
     raw_slots = out.get("data", out) if isinstance(out, dict) else out
 
+    # Source of truth for availability is the `isAvailable` field on each
+    # bookable-slots row — that's what the real KU Leuven app uses. Cross-
+    # referencing /bookings was over-aggressive (filtered group slots where
+    # joining is still allowed). We still query bookings to power the
+    # "is gym open today" signal for the holiday warning.
     parent_ids = sorted({int(r["bookableProductId"]) for r in (raw_slots or []) if r.get("bookableProductId")})
     booked = _booked_keys(client, parent_ids=parent_ids, start_utc=start_utc, end_utc=end_utc)
-
-    # Live "is gym open today?" signal: any padel court has a booking that day.
-    # Combined with the holiday list, this gives the warning for likely-closed days.
     days_with_bookings: set[str] = set()
     for _pid, sd in booked:
         try:
@@ -242,9 +244,9 @@ def find_slots_window(
         end = r.get("endDate") or r.get("end")
         if not (sid_parent and sid_linked and start and end):
             continue
+        # Trust isAvailable — that's the real "can I book this" signal,
+        # same one the KU Leuven app uses.
         if r.get("isAvailable") is False:
-            continue
-        if (int(sid_parent), start) in booked:
             continue
         # Beyond 168h booking horizon — would 403 on /cart-items
         try:
