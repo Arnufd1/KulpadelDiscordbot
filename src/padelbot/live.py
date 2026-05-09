@@ -104,17 +104,14 @@ def render_slots_embed(
         if not time_map:
             value = "*no slots*"
         else:
-            rows = []
+            # Plain monospace grid — fits 8 days within Discord's 6000-char cap.
+            # X=available, .=not. Header row shows P1..P5.
+            header = "      " + " ".join(col_label(c) for c in courts_sorted)
+            rows = [header]
             for t in sorted(time_map.keys()):
-                cells = []
-                for c in courts_sorted:
-                    lab = col_label(c)
-                    if c in time_map[t]:
-                        cells.append(f"{GREEN}{lab}{RESET}")
-                    else:
-                        cells.append(f"{GRAY}{lab}{RESET}")
-                rows.append(f"{t} " + " ".join(cells))
-            value = "```ansi\n" + "\n".join(rows) + "\n```"
+                cells = " ".join(("X " if c in time_map[t] else ". ") for c in courts_sorted)
+                rows.append(f"{t} {cells}".rstrip())
+            value = "```\n" + "\n".join(rows) + "\n```"
             if len(value) > 1020:
                 value = value[:1015] + "\n```"
 
