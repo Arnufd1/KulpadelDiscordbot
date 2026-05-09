@@ -88,6 +88,28 @@ SUBMIT_SELECTORS = [
 ]
 
 
+def _detect_card_brand(card_number: str) -> str | None:
+    """Map card number BIN → Worldline brand value used by the selection page.
+    Returns one of BCMC_brand / Eurocard_brand / Maestro_brand / VISA_brand."""
+    n = card_number.strip().replace(" ", "")
+    if not n.isdigit():
+        return None
+    if n.startswith("4"):
+        return "VISA_brand"
+    # Mastercard ranges: 51-55 and 2221-2720
+    if n[:2] in {"51", "52", "53", "54", "55"}:
+        return "Eurocard_brand"
+    if n[:4].isdigit() and 2221 <= int(n[:4]) <= 2720:
+        return "Eurocard_brand"
+    # Bancontact (Belgian)
+    if n.startswith("6703"):
+        return "BCMC_brand"
+    # Maestro: 6759 / 5018 / 5020 / 5038 / 6304 / 6759 / 676...
+    if n[:4] in {"6759", "5018", "5020", "5038", "6304"}:
+        return "Maestro_brand"
+    return None
+
+
 def _try_fill(page, selectors: list[str], value: str, *, kind: str) -> bool:
     for sel in selectors:
         try:
@@ -174,6 +196,52 @@ def pay_via_worldline(
                 logger.warning("[worldline] didn't detect worldline URL after 20s; current URL: {}", page.url)
 
             page.wait_for_load_state("networkidle", timeout=10_000)
+
+            # Worldline shows a brand-selection page first when multiple
+            # methods are configured. Pick the brand matching our card number,
+            # then click the "Continue/Proceed" button to go to the form.
+            if "PaymentMethods/Selection" in page.url:
+                brand = _detect_card_brand(card.number)
+                if not brand:
+                    _save_diag(page, diagnostics_dir, "unknown-card-brand")
+                    return WorldlineResult(success=False, error=f"could not infer brand from card BIN {card.number[:6]}", final_url=page.url)
+                logger.info("[worldline] selection page — picking brand={}", brand)
+                try:
+                    page.locator(f'input[type="radio"][value="{brand}"]').first.click(timeout=5_000)
+                except PWError as e:
+                    _save_diag(page, diagnostics_dir, f"brand-radio-{brand}")
+                    return WorldlineResult(success=False, error=f"could not select {brand}: {e}", final_url=page.url)
+                # Click "proceed to payment" — it un-disables once a radio is picked.
+                proceed_sel = [
+                    'button.proceed-to-payment-button-id:not(.disabled)',
+                    'button.proceed-to-payment-button-id',
+                    'button[class*="proceed"]:not(.disabled)',
+                    'button[class*="proceed"]',
+                ]
+                proceeded = False
+                for sel in proceed_sel:
+                    try:
+                        el = page.locator(sel).first
+                        if el.is_visible(timeout=2_000):
+                            el.click()
+                            proceeded = True
+                            break
+                    except PWError:
+                        continue
+                if not proceeded:
+                    # Last resort: submit the selection form via JS
+                    try:
+                        page.evaluate("document.getElementById('payment-paymentmethodselection').submit()")
+                        proceeded = True
+                    except PWError as e:
+                        _save_diag(page, diagnostics_dir, "no-proceed-button")
+                        return WorldlineResult(success=False, error=f"could not proceed past brand selection: {e}", final_url=page.url)
+                # Wait for the actual card form to load
+                try:
+                    page.wait_for_url(lambda u: "Payment/Form" in u or "Selection" not in u, timeout=15_000)
+                except PWTimeout:
+                    logger.warning("[worldline] still on selection page after click; URL: {}", page.url)
+                page.wait_for_load_state("networkidle", timeout=10_000)
 
             # Fill the card form
             number_ok = _try_fill(page, CARD_NUMBER_SELECTORS, card.number, kind="cardNumber")
