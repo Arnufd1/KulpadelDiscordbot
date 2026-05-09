@@ -63,6 +63,13 @@ class BackboneClient:
         except Exception:
             body = r.text[:500]
         logger.error("API call failed [{}]: {} {} — {}", ctx, r.status_code, r.reason_phrase, body)
+        # Re-raise with the actual API message included so callers can show it.
+        msg = body if isinstance(body, str) else (body.get("message") if isinstance(body, dict) else str(body))
+        if isinstance(msg, str) and msg:
+            raise httpx.HTTPStatusError(
+                f"{r.status_code} {ctx} — {msg}",
+                request=r.request, response=r,
+            )
         r.raise_for_status()
 
     # --- public ---

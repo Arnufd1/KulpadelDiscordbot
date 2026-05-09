@@ -229,6 +229,10 @@ def find_slots_window(
     for y in years:
         holidays |= belgian_public_holidays(y)
 
+    # API enforces "168 hours ahead" booking horizon from NOW. Filter to avoid
+    # surfacing slots that would 403 on /cart-items.
+    booking_horizon = datetime.now(timezone.utc) + timedelta(hours=168)
+
     slots: list[Slot] = []
     seen: set[tuple[str, int]] = set()
     for r in raw_slots or []:
@@ -242,6 +246,13 @@ def find_slots_window(
             continue
         if (int(sid_parent), start) in booked:
             continue
+        # Beyond 168h booking horizon — would 403 on /cart-items
+        try:
+            slot_start = datetime.strptime(start[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+            if slot_start > booking_horizon:
+                continue
+        except ValueError:
+            pass
         key = (start, int(sid_parent))
         if key in seen:
             continue
