@@ -82,20 +82,18 @@ def render_slots_embed(
 
     embed = discord.Embed(title="🎾 Padel — next 8 days", color=0x377dff, timestamp=datetime.now(tz))
 
-    # Quota banner — when user is at the weekly cap, no slot is bookable.
+    # Soft warning when user is near/at the inferred quota — but ALWAYS show
+    # all real slots so the user can still attempt to book if our quota guess
+    # is wrong. The API is the source of truth.
     if my_bookings_count >= WEEKLY_BOOKING_QUOTA:
         embed.add_field(
-            name=f"🚫 Weekly quota reached ({my_bookings_count}/{WEEKLY_BOOKING_QUOTA})",
+            name=f"⚠️ You have {my_bookings_count} bookings this window",
             value=(
-                "KU Leuven Sport limits students to "
-                f"**{WEEKLY_BOOKING_QUOTA} padel reservations per week**. "
-                "Cancel one with `/cancel booking_id:N` to free a slot "
-                "(find ids with `/bookings`)."
+                f"KU Leuven *might* block more (cap appears to be ~{WEEKLY_BOOKING_QUOTA}/week). "
+                "Try anyway; if rejected, cancel one with `/cancel booking_id:N`."
             ),
             inline=False,
         )
-        embed.set_footer(text=(member_name + " · " if member_name else "") + "no bookable slots until quota frees up")
-        return embed
 
     total_slots = 0
     # Reverse order: latest day at top, today at bottom.
@@ -105,11 +103,6 @@ def render_slots_embed(
         time_map = by_day.get(day_label, {})
         is_hol, has_bk = day_meta.get(day_label, (False, False))
         day_key = d.strftime("%Y-%m-%d")
-
-        # Hide days where the user already has a booking — KUL blocks another.
-        if day_key in my_booking_days:
-            continue
-
         n_open = sum(len(v) for v in time_map.values())
         total_slots += n_open
 
@@ -118,6 +111,8 @@ def render_slots_embed(
             tag = " ⚠️"
         elif is_hol and has_bk:
             tag = " 🎉"
+        if day_key in my_booking_days:
+            tag += " 🎾 you have a booking this day"
 
         if not time_map:
             value = "*no slots*"
