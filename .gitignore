@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.uv/
+*.pyc
+
+# Project secrets and state
+.env
+data/
+logs/
+*.log
+
+# OIDC / auth artifacts (never commit)
+*.refresh_token
+*.access_token
+tokens.enc
+master.key
+storage_state.json
+card.enc
+
+# HAR files contain auth tokens, card numbers, cookies — keep local only
+*.har
+har/
+
+# Build artifacts
+*.egg-info/
+build/
+dist/
+
+# Debug / experimental scripts at project root (intermediate analysis tools)
+analyze_*.py
+debug_*.py
+re_*.py
+phase0_*.py
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Claude Code local overrides
+.claude/settings.local.json

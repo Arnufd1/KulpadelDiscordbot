@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "Bash",
+      "PowerShell",
+      "WebSearch",
+
+      "Bash(python *)",
+      "Bash(python3 *)",
+      "Bash(py *)",
+
+      "Bash(pip install *)",
+      "Bash(pip list*)",
+      "Bash(pip show *)",
+      "Bash(pip freeze*)",
+      "Bash(pip check)",
+
+      "Bash(uv *)",
+
+      "Bash(node *)",
+      "Bash(npm install*)",
+      "Bash(npm ci*)",
+      "Bash(npm run *)",
+      "Bash(npm test*)",
+      "Bash(npm list*)",
+      "Bash(npx *)",
+
+      "Bash(git status*)",
+      "Bash(git log*)",
+      "Bash(git diff*)",
+      "Bash(git show *)",
+      "Bash(git branch*)",
+      "Bash(git remote -v)",
+      "Bash(git config --get *)",
+      "Bash(git rev-parse *)",
+      "Bash(git ls-files*)",
+
+      "Bash(ls*)",
+      "Bash(dir*)",
+      "Bash(pwd)",
+      "Bash(which *)",
+      "Bash(where *)",
+      "Bash(cat *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(file *)",
+      "Bash(wc *)",
+
+      "PowerShell(Get-ChildItem*)",
+      "PowerShell(Get-Location)",
+      "PowerShell(Test-Path*)",
+      "PowerShell(Get-Content*)"
+    ],
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(rm -fr *)",
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(git reset --hard *)",
+      "Bash(git clean -f*)",
+      "Bash(npm publish*)",
+      "Bash(pip uninstall *)",
+      "PowerShell(Remove-Item* -Recurse*)"
+    ]
+  }
+}
