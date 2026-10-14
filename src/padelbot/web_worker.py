@@ -46,6 +46,19 @@ def payment_summary(me: dict) -> dict:
             "manage_url":"https://usc.kuleuven.cloud/members/profile/myshopping#storedpaymethodcard"}
 
 
+def verified_bookings(client, me):
+    from .booking_manager import list_my_bookings
+    from .booking import get_product_names
+    bookings = list_my_bookings(client,member_id=int(me['id']))
+    names=get_product_names(client,{int(b.raw['productId']) for b in bookings if b.raw.get('productId')})
+    device_verified=settings.padelbot_android_profile_file.exists()
+    return {'device_verified':device_verified,'bookings':[
+        {'id':b.id,'description':b.description,'name':names.get(b.raw.get('productId'),'Reservatie'),
+         'start':b.start_iso,'end':b.end_iso,'paid':b.paid_for,
+         'confirmed':device_verified and b.status==0 and b.paid_for is True and 'padel' in names.get(b.raw.get('productId'),'').lower()}
+        for b in bookings]}
+
+
 def execute(kind: str, payload: dict) -> dict:
     global _reservation_started
     _reservation_started=False
@@ -79,9 +92,21 @@ def execute(kind: str, payload: dict) -> dict:
             return {"slots":[{"product":s.bookable_product_id,"court":s.bookable_linked_product_id,
                               "start":s.start_iso,"end":s.end_iso,"price":s.price,'name':names.get(s.bookable_product_id,'Padel')} for s in slots if s.start_dt>today]}
         if kind == "bookings":
-            return {"bookings":[{"id":b.id,"sale_id":b.sale_id,"description":b.description,
-                                 "start":b.start_iso,"end":b.end_iso,"paid":b.paid_for}
-                                for b in list_my_bookings(client,member_id=int(me["id"]))]}
+            return verified_bookings(client,me)
+        if kind == 'community_join':
+            from .web_community import CommunityBookings
+            from .web_store import PlatformStore
+            with sqlite3.connect(os.environ['PADELWEB_DB']) as c:
+                owner_email=c.execute('SELECT email FROM users WHERE owner=1').fetchone()[0]
+            community=CommunityBookings(PlatformStore(Path(os.environ['PADELWEB_DB']).parent,owner_email))
+            match=community.host(payload['match_id'])
+            host=os.environ['PADELWEB_USER_ID']
+            if match['user_id']!=host:
+                raise ValueError('De organisator kon niet worden bevestigd.')
+            actual=verified_bookings(client,me)
+            community.sync(host,actual['bookings'],device_verified=actual['device_verified'])
+            community.join_verified(match['id'],payload['participant_id'])
+            return {'joined':True,'message':'Je neemt deel aan deze match.'}
         if kind not in {"book","rule","quote"}:
             raise ValueError("Onbekende taak.")
         prefs = current_preferences()

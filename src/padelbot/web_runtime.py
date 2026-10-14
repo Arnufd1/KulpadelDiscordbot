@@ -12,6 +12,7 @@ import time
 from zoneinfo import ZoneInfo
 
 from .web_store import PlatformStore
+from .web_community import CommunityBookings
 
 
 def tenant_root(store: PlatformStore, user: dict) -> Path:
@@ -88,6 +89,7 @@ class JobRunner:
     def __init__(self, store: PlatformStore):
         self.store = store
         self.process = None
+        self.community = CommunityBookings(store)
 
     async def run(self):
         # Writes interrupted by restart are not replayed: their remote outcome may be unknown.
@@ -107,7 +109,17 @@ class JobRunner:
             with self.store.conn() as c:
                 c.execute("UPDATE jobs SET status='running' WHERE id=?",(row["id"],))
             output = tenant_root(self.store,user) / ("job-"+row["id"]+".json")
-            env = tenant_env(self.store,user)
+            source_user = user
+            if row['kind']=='community_join':
+                try:
+                    match = self.community.host(json.loads(row['payload'])['match_id'])
+                    source_user = self.store.user(match['user_id'])
+                    if not source_user or source_user['suspended']:
+                        raise ValueError('Deze online boeking is niet beschikbaar.')
+                except (ValueError,KeyError):
+                    self.finish(row['id'],'failed',{'error':'Deze online boeking is niet meer beschikbaar.'})
+                    continue
+            env = tenant_env(self.store,source_user)
             env["PADELWEB_RESULT"] = str(output)
             try:
                 self.process = await asyncio.create_subprocess_exec(sys.executable,"-m","padelbot.web_worker",
@@ -132,6 +144,10 @@ class JobRunner:
                 self.process = None
 
     def finish(self, job_id, status, result):
+        with self.store.conn() as c:
+            job=c.execute('SELECT user_id,kind FROM jobs WHERE id=?',(job_id,)).fetchone()
+        if job and job['kind']=='bookings' and status=='done':
+            self.community.sync(job['user_id'],result.get('bookings',[]),device_verified=result.get('device_verified') is True)
         with self.store.conn() as c:
             c.execute("UPDATE jobs SET status=?,result=?,finished=? WHERE id=?",(status,json.dumps(result),time.time(),job_id))
             if status=='done' and result.get('waiting') is True:

@@ -15,6 +15,9 @@ Environment=ANDROID_USER_HOME=/var/lib/padelbot/.android
 Environment=ANDROID_EMULATOR_FEATURES=-Vulkan
 Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/padelbot/.tools/playwright
 Environment=PYTHONUNBUFFERED=1
+LoadCredential=card-vault.key:/etc/padelbot/card-vault.key
+Environment=PADELWEB_CARD_VAULT_KEY_FILE=%d/card-vault.key
+LimitCORE=0
 ExecStart=/opt/padelbot/.venv/bin/python -m padelbot.web
 Restart=always
 RestartSec=5

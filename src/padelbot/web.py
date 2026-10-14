@@ -16,15 +16,17 @@ from urllib.parse import urlencode, urlsplit
 import httpx
 import jwt
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr, ConfigDict
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .web_store import PlatformStore
 from .web_runtime import JobRunner, rules_for, tenant_env
 from .web_device import DeviceManager
+from .web_cards import CardVault
 
 
 class WebSettings(BaseSettings):
@@ -39,6 +41,7 @@ class WebSettings(BaseSettings):
     tail_proxy_ip: str = "192.168.0.250"
     tail_admin_node_ids: str = ""
     secure_cookies: bool = True
+    card_vault_key_file: Path | None = None
 
 
 class RangeRequest(BaseModel):
@@ -78,6 +81,19 @@ class QRRequest(BaseModel):
     image: str = Field(max_length=2_800_000)
 
 
+class CardRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    holder: SecretStr = Field(min_length=1,max_length=80)
+    number: SecretStr = Field(min_length=13,max_length=32)
+    month: int = Field(ge=1,le=12)
+    year: int = Field(ge=2026,le=2100)
+
+
+class ShareRequest(BaseModel):
+    booking_id: int = Field(gt=0)
+    shared: bool
+
+
 def validate_google_claims(claims: dict, nonce: str, audience: str):
     if (claims.get("iss") not in {"https://accounts.google.com","accounts.google.com"}
             or claims.get("aud") != audience or claims.get("email_verified") is not True
@@ -91,6 +107,8 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
     config = config or WebSettings()
     store = PlatformStore(config.root,config.owner_email)
     runner, devices = JobRunner(store), DeviceManager(store)
+    cards = CardVault(store,config.card_vault_key_file)
+    community = runner.community
     static = Path(__file__).parent/"web_static"
     keys = jwt.PyJWKClient("https://www.googleapis.com/oauth2/v3/certs",timeout=10)
 
@@ -105,6 +123,7 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
 
     app = FastAPI(title="Sigmadvisor Padel",lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
     app.state.store, app.state.config = store,config
+    app.state.cards, app.state.community = cards,community
     hosts = {urlsplit(config.public_url).hostname,urlsplit(config.tail_url).hostname,"localhost","127.0.0.1","192.168.0.220"}
     app.add_middleware(TrustedHostMiddleware,allowed_hosts=sorted(h for h in hosts if h))
     attempts = {}
@@ -158,6 +177,11 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
     @app.exception_handler(ValueError)
     async def bad_value(request,error):
         return JSONResponse({"detail":str(error)},status_code=400)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request,error):
+        # Pydantic's default response echoes the invalid input, including PAN/CVC.
+        return JSONResponse({'detail':'Controleer de ingevulde gegevens.'},status_code=422)
 
     def current(request:Request):
         session = store.session(request.cookies.get("padel_session",""))
@@ -242,6 +266,56 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
     @app.post("/api/preferences")
     def preferences(body:PreferencesRequest,user=Depends(current)):
         return store.preferences(user["id"],body.model_dump())
+
+    @app.get('/api/payment-card')
+    def card_summary(user=Depends(current)):
+        return {'enabled':cards.key is not None,'card':cards.summary(user['id'])}
+
+    @app.post('/api/payment-card')
+    def card_save(body:CardRequest,user=Depends(current)):
+        return {'card':cards.save(user['id'],holder=body.holder.get_secret_value(),number=body.number.get_secret_value(),month=body.month,year=body.year)}
+
+    @app.delete('/api/payment-card')
+    def card_delete(user=Depends(current)):
+        cards.delete(user['id'])
+        return {'ok':True}
+
+    @app.get('/api/community')
+    def online(user=Depends(current)):
+        with store.conn() as c:
+            refreshing=bool(c.execute("SELECT 1 FROM jobs WHERE kind='bookings' AND dedup LIKE 'online-refresh:%' AND status IN ('queued','running') LIMIT 1").fetchone())
+        return {'matches':community.list(user['id']),'refreshing':refreshing}
+
+    @app.get('/api/community/mine')
+    def online_mine(user=Depends(current)):
+        return {'shared':community.own_shared(user['id'])}
+
+    @app.post('/api/community/share')
+    def share_match(body:ShareRequest,user=Depends(current)):
+        community.share(user['id'],body.booking_id,body.shared)
+        return {'ok':True}
+
+    @app.post('/api/community/{match_id}/join')
+    def join_match(match_id:str,user=Depends(current)):
+        community.host(match_id)
+        return enqueue(user,'community_join',{'match_id':match_id,'participant_id':user['id']})
+
+    @app.post('/api/community/{match_id}/leave')
+    def leave_match(match_id:str,user=Depends(current)):
+        community.leave(match_id,user['id'])
+        return {'ok':True}
+
+    @app.post('/api/community/refresh')
+    def refresh_matches(user=Depends(current)):
+        hosts=set(community.hosts_to_refresh())
+        if Path(tenant_env(store,user)['PADELBOT_ANDROID_PROFILE_FILE']).exists():
+            hosts.add(user['id'])
+        for host in sorted(hosts):
+            try:
+                store.enqueue(host,'bookings',{},dedup=f'online-refresh:{host}:{int(time.time())//120}')
+            except ValueError:
+                pass
+        return {'ok':True}
 
     @app.get("/api/rules")
     def rules(user=Depends(current)):
