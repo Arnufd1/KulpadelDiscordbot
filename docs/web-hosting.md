@@ -40,6 +40,8 @@ padel.sigmadvisor.com -> HTTP localhost:8090
 
 De beheerder meldt aan met `aafmichiels@gmail.com`. De knop Beheer leidt na Google-login naar `https://sigma-minipc.tailad80cf.ts.net:8443/admin/verify` met een kort geldig ticket. De app accepteert Tailscale-identiteitsheaders uitsluitend vanaf het vaste Proxmox-adres én met het geheime brugkenmerk. Het ticket is gekoppeld aan dezelfde Google-sessie, eenmalig bruikbaar, en verleent 30 minuten beheer. Publiek toegevoegde headers leveren geen beheerrechten op.
 
+De desktop heeft in Tailscale `tag:admin` en daardoor geen menselijke identiteitsheader. De private brug verifieert daarom ook de door Serve overschreven bron-IP via de lokale Tailscale-daemon. Alleen de expliciet vastgelegde stabiele node-ID van deze desktop, met `tag:admin`, mag de eigenaar bevestigen. Andere apparaten met dezelfde tag krijgen hierdoor geen rechten. Google-login als de eigenaar blijft vereist.
+
 ## Betalingen en bestaande Discord-regels
 
 Nieuwe webgebruikers stellen expliciet automatisch betalen en hun maximumbedrag per boeking in. De webworker gebruikt uitsluitend het eigen KUL-saldo of een bestaande geldige domiciliëring. Beheer daarvan gebeurt via de officiële KUL-pagina:

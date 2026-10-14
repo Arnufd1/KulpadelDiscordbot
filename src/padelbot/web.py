@@ -37,6 +37,7 @@ class WebSettings(BaseSettings):
     tail_url: str = "https://sigma-minipc.tailad80cf.ts.net:8443"
     tail_proxy_secret: str = ""
     tail_proxy_ip: str = "192.168.0.250"
+    tail_admin_node_ids: str = ""
     secure_cookies: bool = True
 
 
@@ -336,9 +337,12 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
     def verify_admin(request:Request,ticket:str=""):
         secret = request.headers.get("x-padel-tail-secret","")
         peer = request.client.host if request.client else ""
+        identity_ok=request.headers.get("tailscale-user-login","").lower()==config.owner_email.lower()
+        allowed_nodes={node.strip() for node in config.tail_admin_node_ids.split(',') if node.strip()}
+        identity_ok=identity_ok or request.headers.get('x-padel-tail-node','') in allowed_nodes
         if (not config.tail_proxy_secret or peer!=config.tail_proxy_ip
                 or not hmac.compare_digest(secret,config.tail_proxy_secret)
-                or request.headers.get("tailscale-user-login","").lower()!=config.owner_email.lower()):
+                or not identity_ok):
             raise HTTPException(403,"Deze bevestiging moet via jouw Tailscale-account verlopen.")
         if not store.verify_admin_ticket(ticket,config.owner_email):
             raise HTTPException(403,"De beheerbevestiging is verlopen. Begin opnieuw vanuit je profiel.")

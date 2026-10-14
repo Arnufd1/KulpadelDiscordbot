@@ -111,6 +111,19 @@ def test_admin_proof_is_bound_to_google_session_and_cannot_be_replayed(portal):
     assert all(set(u)<= {'id','email','name','owner','suspended','created','connected','rules'} for u in r.json()['users'])
 
 
+def test_explicit_tagged_admin_device_can_confirm_but_public_header_cannot(portal):
+    app,client,store,(owner,_,_)=portal
+    app.state.config.tail_admin_node_ids='trusted-admin-device'
+    token,_=store.new_session(owner['id'])
+    ticket=store.admin_ticket(token)
+    headers={'X-Padel-Tail-Secret':'test-proxy-secret','X-Padel-Tail-Node':'trusted-admin-device'}
+    assert client.get('/admin/verify',params={'ticket':ticket},headers=headers,follow_redirects=False).status_code==403
+    with TestClient(app,client=('192.168.0.250',12345)) as private:
+        response=private.get('/admin/verify',params={'ticket':ticket},headers=headers,follow_redirects=False)
+    assert response.status_code==303
+    assert store.activate_admin(ticket,token)
+
+
 def test_pausing_user_revokes_sessions_and_cancels_queued_tasks(portal):
     _,client,store,(owner,alice,_)=portal
     sign_in(client,store,alice)
