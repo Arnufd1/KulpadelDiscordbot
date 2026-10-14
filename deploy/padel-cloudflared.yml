@@ -1,0 +1,4 @@
+ingress:
+  - hostname: padel.sigmadvisor.com
+    service: http://127.0.0.1:8090
+  - service: http_status:404

@@ -38,6 +38,10 @@ Cloudflare Published application route:
 padel.sigmadvisor.com -> HTTP localhost:8090
 ```
 
+De connector heeft daarnaast een lokale hostname-regel in `/etc/cloudflared/padel.yml` (bron: `deploy/padel-cloudflared.yml`), zodat de juiste origin ook beschikbaar is wanneer de dashboardconfiguratie nog niet is aangekomen. Andere hostnames krijgen 404. De service gebruikt uitsluitend het private tokenbestand; er staan geen tunnelcredentials in de broncode.
+
+Het domein heeft ook een proxied DNS-record nodig: type **CNAME**, naam **padel**, doel **1577ae18-08ed-43fe-a973-13021c76beab.cfargotunnel.com**, TTL **Auto**. Een opgeslagen tunnelroute zonder dit DNS-record maakt de URL nog niet bereikbaar. Controleer de configuratie met `cloudflared tunnel --config /etc/cloudflared/padel.yml ingress validate` en de hostmatch met `cloudflared tunnel --config /etc/cloudflared/padel.yml ingress rule https://padel.sigmadvisor.com`.
+
 De beheerder meldt aan met `aafmichiels@gmail.com`. De knop Beheer leidt na Google-login naar `https://sigma-minipc.tailad80cf.ts.net:8443/admin/verify` met een kort geldig ticket. De app accepteert Tailscale-identiteitsheaders uitsluitend vanaf het vaste Proxmox-adres én met het geheime brugkenmerk. Het ticket is gekoppeld aan dezelfde Google-sessie, eenmalig bruikbaar, en verleent 30 minuten beheer. Publiek toegevoegde headers leveren geen beheerrechten op.
 
 De desktop heeft in Tailscale `tag:admin` en daardoor geen menselijke identiteitsheader. De private brug verifieert daarom ook de door Serve overschreven bron-IP via de lokale Tailscale-daemon. Alleen de expliciet vastgelegde stabiele node-ID van deze desktop, met `tag:admin`, mag de eigenaar bevestigen. Andere apparaten met dezelfde tag krijgen hierdoor geen rechten. Google-login als de eigenaar blijft vereist.
