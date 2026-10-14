@@ -35,10 +35,13 @@ def match_embed(match: Match, post=None, store=None):
     tz = ZoneInfo(settings.padel_local_tz)
     start = datetime.fromisoformat(match.start_iso.replace("Z", "+00:00")).astimezone(tz)
     closed = match.status != "open" or match.started
+    if match.hub_profile_id and (not match.hub_visible or not match.hub_confirmed):closed=True
     title = "Padel · geannuleerd" if match.status != "open" else "✅ Padel geboekt · wie speelt mee?"
     if match.started and match.status == "open":
         title = "Padel · gestart"
-    body = f"**{start:%d/%m/%Y} · {start:%H:%M} · {discord.utils.escape_markdown(match.court)}**\nOrganisator: <@{match.owner_id}>"
+    def actor_label(uid):
+        return f'<@{uid}>' if isinstance(uid,int) else discord.utils.escape_mentions(discord.utils.escape_markdown(match.names.get(uid,'Speler')))
+    body = f"**{start:%d/%m/%Y} · {start:%H:%M} · {discord.utils.escape_markdown(match.court)}**\nOrganisator: {actor_label(match.owner_id)}"
     forecast = weather.peek_forecast()
     if forecast and (badge := forecast.badge(start)):
         body += f"\nLeuven {badge}"
@@ -48,7 +51,7 @@ def match_embed(match: Match, post=None, store=None):
         embed.title = "Padel · verplaatst" if target else "Padel · groepsbericht gesloten"
         embed.description += f"\n\nVerplaatst naar: {target.jump_url}" if target and target.jump_url else "\n\nAanmelden via dit bericht is gesloten. De KUL-reservatie blijft behouden."
         closed = True
-    embed.add_field(name=f"Spelers ({len(match.players)}/{match.capacity})", value="\n".join(f"<@{uid}>" for uid in match.players), inline=False)
+    embed.add_field(name=f"Spelers ({len(match.players)}/{match.capacity})", value="\n".join(actor_label(uid) for uid in match.players), inline=False)
     footer = "Aanmelden gesloten" if closed else "Volzet" if len(match.players) == match.capacity else f"Nog {match.capacity - len(match.players)} plaatsen · klik Aansluiten"
     embed.set_footer(text=footer + (" · " + weather.CREDIT if forecast else ""))
     return embed
@@ -62,6 +65,7 @@ class GroupMatchView(discord.ui.View):
         post = store.get_post(self.post_id)
         prefix = f"padel:post:{self.post_id}" if post_id is not None else f"padel:match:{match.id}"
         closed = match.status != "open" or match.started or post is None or post.state != "active"
+        if match.hub_profile_id and (not match.hub_visible or not match.hub_confirmed):closed=True
         for action, label, style, disabled in [
             ("join", "Aansluiten", discord.ButtonStyle.success, closed or len(match.players) >= match.capacity),
             ("leave", "Afmelden", discord.ButtonStyle.secondary, closed),
@@ -95,6 +99,8 @@ class GroupMatchView(discord.ui.View):
         # Also validate here for direct callback callers and fresh dispatches.
         if not await self.interaction_check(interaction):
             return
+        from .hub import HubStore
+        HubStore(self.store).remember_discord(interaction.user.id,getattr(interaction.user,'display_name','Discord-speler'))
         if action == "remove" and interaction.user.id != self.store.get(self.match_id).owner_id:
             await interaction.response.send_message("Alleen de organisator kan dit groepsbericht verwijderen.", ephemeral=True)
             return

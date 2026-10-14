@@ -70,13 +70,15 @@ def _reusable(item, category, label):
         return False
 
 
-def remove_own_item(client, item: dict, member_id: int) -> None:
+def remove_own_item(client, item: dict, member_id: int, *, expected_label: str | None = None) -> None:
     """Recheck ownership and the slot immediately before deleting this item."""
     current = next((i for i in own_cart(client, member_id) if i.get("id") == item.get("id")), None)
     if current is None:
         return
     if not _removable(current) or _key(current) != _key(item):
         raise CartStateUnknownError("Dit winkelwagenitem is gewijzigd; het is niet verwijderd.")
+    if expected_label is not None and (current.get('params') or {}).get('primaryPurchaseMessage')!=expected_label:
+        raise CartStateUnknownError('Dit item hoort niet meer bij de draft; het is niet verwijderd.')
     try:
         client.delete(f"/cart-items/{current['id']}")
     except httpx.HTTPStatusError as error:

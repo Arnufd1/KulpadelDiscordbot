@@ -52,11 +52,27 @@ def verified_bookings(client, me):
     bookings = list_my_bookings(client,member_id=int(me['id']))
     names=get_product_names(client,{int(b.raw['productId']) for b in bookings if b.raw.get('productId')})
     device_verified=settings.padelbot_android_profile_file.exists()
+    # paidFor is also true on temporary, unpaid holds. Check the owning sale.
+    completed={}
+    for booking in bookings:
+        if booking.sale_id and booking.sale_id not in completed:
+            sale=client.get(f'/sales/{booking.sale_id}',params={'s':{'id':booking.sale_id,'customerPersonId':int(me['id'])}})
+            completed[booking.sale_id]=(sale.get('id')==booking.sale_id and sale.get('customerPersonId')==int(me['id'])
+                and type(sale.get('statusCode')) is int and sale['statusCode']==0)
     return {'device_verified':device_verified,'bookings':[
         {'id':b.id,'description':b.description,'name':names.get(b.raw.get('productId'),'Reservatie'),
          'start':b.start_iso,'end':b.end_iso,'paid':b.paid_for,
-         'confirmed':device_verified and b.status==0 and b.paid_for is True and 'padel' in names.get(b.raw.get('productId'),'').lower()}
+         'confirmed':device_verified and b.status==0 and b.paid_for is True and completed.get(b.sale_id,False)
+             and 'padel' in names.get(b.raw.get('productId'),'').lower()}
         for b in bookings]}
+
+
+def platform_context():
+    from .web_community import CommunityBookings
+    from .web_store import PlatformStore
+    with sqlite3.connect(os.environ['PADELWEB_DB']) as c:
+        owner_email=c.execute('SELECT email FROM users WHERE owner=1').fetchone()[0]
+    return CommunityBookings(PlatformStore(Path(os.environ['PADELWEB_DB']).parent,owner_email))
 
 
 def execute(kind: str, payload: dict) -> dict:
@@ -93,12 +109,40 @@ def execute(kind: str, payload: dict) -> dict:
                               "start":s.start_iso,"end":s.end_iso,"price":s.price,'name':names.get(s.bookable_product_id,'Padel')} for s in slots if s.start_dt>today]}
         if kind == "bookings":
             return verified_bookings(client,me)
+        if kind in {'draft_refresh','draft_release'}:
+            from .drafts import DraftStore,ensure_draft_cart,draft_deadline
+            from .web_community import timestamp
+            from filelock import FileLock
+            import time
+            drafts=DraftStore(platform_context())
+            draft=drafts.owned(payload['draft_id'],os.environ['PADELWEB_USER_ID'])
+            settings.padelbot_rules_file.parent.mkdir(parents=True,exist_ok=True)
+            with FileLock(str(settings.padelbot_rules_file)+'.booking.lock',timeout=180):
+                if kind=='draft_release':
+                    drafts.release(client,draft['id'],int(me['id']))
+                    return {'message':'Draft gestopt en eigen draft-item opgeruimd.'}
+                if (draft['state'] not in {'pending','active','refreshing'} or time.time()>=min(draft['deadline'],draft_deadline(draft['created'],timestamp(draft['target']),time.time()))):
+                    drafts.stop(draft['id'],draft['profile_id'],'expired')
+                    drafts.release(client,draft['id'],int(me['id']))
+                    raise ValueError('De maximale looptijd van deze draft is voorbij.')
+                if not settings.padelbot_android_profile_file.exists():raise ValueError('Koppel eerst je eigen KUL-authenticator.')
+                slots=find_slots(client,target_date=datetime.fromisoformat(draft['target']))
+                slot=next((s for s in slots if s.start_dt==datetime.fromisoformat(draft['target']) and s.bookable_product_id==draft['product'] and s.bookable_linked_product_id==draft['court']),None)
+                if not slot:
+                    drafts.stop(draft['id'],draft['profile_id'],'unavailable')
+                    drafts.release(client,draft['id'],int(me['id']))
+                    raise ValueError('Dit terrein is niet meer beschikbaar. De draft is gestopt.')
+                user=drafts.community.store.user(os.environ['PADELWEB_USER_ID'])
+                if not user or user['suspended']:
+                    drafts.stop(draft['id'],draft['profile_id'],'cancelled')
+                    drafts.release(client,draft['id'],int(me['id']))
+                    raise ValueError('Dit profiel is gepauzeerd; de draft is gestopt.')
+                item=ensure_draft_cart(client,slot,int(me['id']),int(me.get('category') or 0),'Sigmadvisor draft '+draft['id'])
+                name=get_product_names(client,{slot.bookable_product_id}).get(slot.bookable_product_id,'Padel')
+                drafts.activate(draft['id'],slot,item,name)
+                return {'draft_id':draft['id'],'message':'Draft actief. Er is niets betaald en het terrein is nog niet definitief gereserveerd.'}
         if kind == 'community_join':
-            from .web_community import CommunityBookings
-            from .web_store import PlatformStore
-            with sqlite3.connect(os.environ['PADELWEB_DB']) as c:
-                owner_email=c.execute('SELECT email FROM users WHERE owner=1').fetchone()[0]
-            community=CommunityBookings(PlatformStore(Path(os.environ['PADELWEB_DB']).parent,owner_email))
+            community=platform_context()
             match=community.host(payload['match_id'])
             host=os.environ['PADELWEB_USER_ID']
             if match['user_id']!=host:
@@ -133,7 +177,7 @@ def execute(kind: str, payload: dict) -> dict:
             raise ValueError("Dit tijdstip is niet meer vrij. Vernieuw de beschikbaarheid.")
         amount = slot_price(client,slot,me)
         if kind=="quote":
-            return {"amount":str(amount),"product":slot.bookable_product_id,"court":slot.bookable_linked_product_id,"target":slot.start_iso,
+            return {"amount":str(amount),"product":slot.bookable_product_id,"court":slot.bookable_linked_product_id,"target":slot.start_iso,'end':slot.end_iso,
                     "payment":payment_summary(me)}
         maximum = Decimal(str(prefs.get("max_amount",0)))
         if amount>maximum or maximum<=0:
@@ -148,8 +192,15 @@ def execute(kind: str, payload: dict) -> dict:
         latest=current_preferences()
         if not latest.get('automatic_payment') or Decimal(str(latest.get('max_amount',0)))<amount:
             raise ValueError('Je betaalinstellingen zijn gewijzigd. Er is niets geboekt.')
+        if payload.get('draft_id'):
+            from .drafts import DraftStore
+            DraftStore(platform_context()).start_conversion(payload['draft_id'],os.environ['PADELWEB_USER_ID'])
         _reservation_started=True
         result = book(client,slot,member_id=int(me["id"]),me=me,expected_amount=amount,label=rule.notes if rule else "Sigmadvisor")
+        if payload.get('draft_id') and result.booking_id:
+            DraftStore(platform_context()).converted(payload['draft_id'],result.booking_id,result.paid)
+        elif payload.get('draft_id'):
+            DraftStore(platform_context()).uncertain_conversion(payload['draft_id'])
         rules.record(rule_id=rule.id if rule else None,success=result.paid,sale_id=result.sale_id,
             booking_id=result.booking_id,target_slot_iso=slot.start_dt.astimezone(ZoneInfo("Europe/Brussels")).isoformat(),
             error=None if result.paid else "Betaling nog niet bevestigd; controleer KU Leuven Sport.")
@@ -171,6 +222,13 @@ def main():
         result = {"error":"KUL kon deze taak niet afronden. Controleer je koppeling, saldo en boekingen voor je opnieuw probeert."}
     if 'error' in result and message['kind'] in {'book','rule'} and not _reservation_started:
         result['safe_to_retry']=True
+    if 'error' in result and message['payload'].get('draft_id'):
+        try:
+            from .drafts import DraftStore
+            drafts=DraftStore(platform_context())
+            if message['kind']=='draft_refresh':drafts.failed(message['payload']['draft_id'],'KUL-controle niet bevestigd. Controleer de draft en je winkelwagen.')
+            elif message['kind']=='book' and _reservation_started:drafts.uncertain_conversion(message['payload']['draft_id'])
+        except Exception:pass
     Path(os.environ["PADELWEB_RESULT"]).write_text(json.dumps(result),encoding="utf-8")
 
 

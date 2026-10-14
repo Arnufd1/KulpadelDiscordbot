@@ -66,6 +66,7 @@ class PadelBot(commands.Bot):
         self._bookings_refresh_task: asyncio.Task | None = None
         self._reminder_task: asyncio.Task | None = None
         self._notice_cleanup_task: asyncio.Task | None = None
+        self._hub_posts_task: asyncio.Task | None = None
         self._last_keepalive_ok: bool = True
         self._last_keepalive_at: float = 0.0
 
@@ -117,6 +118,9 @@ class PadelBot(commands.Bot):
         from .match_notices import run_notice_cleanup
         if self._notice_cleanup_task is None or self._notice_cleanup_task.done():
             self._notice_cleanup_task = asyncio.create_task(run_notice_cleanup(self))
+        if self._hub_posts_task is None or self._hub_posts_task.done():
+            from .hub_posts import run_hub_post_updates
+            self._hub_posts_task=asyncio.create_task(run_hub_post_updates(self))
 
         # on_ready can fire multiple times on reconnect — only start tasks once.
         if self._scheduler_task is not None and not self._scheduler_task.done():
@@ -147,6 +151,9 @@ class PadelBot(commands.Bot):
         self._availability_watcher_task = asyncio.create_task(run_availability_watcher(self))
 
     async def close(self):
+        if self._hub_posts_task is not None:
+            self._hub_posts_task.cancel()
+            await asyncio.gather(self._hub_posts_task,return_exceptions=True)
         if self._notice_cleanup_task is not None:
             self._notice_cleanup_task.cancel()
             try:
@@ -509,6 +516,20 @@ def make_bot() -> PadelBot:
 def _register_commands(bot: PadelBot) -> None:
     from .discord_ui import AutoBookView, BookingsView, DaySlotsView, SlotsRangeView, parse_day_range, today
     from datetime import timedelta
+
+    @bot.tree.command(name='koppel',description='Koppel je Discord-account aan je Google-profiel in de padelhub')
+    @app_commands.describe(code='Eenmalige code uit Instellingen op padel.sigmadvisor.com')
+    async def link_profile(interaction:discord.Interaction,code:str):
+        from .hub import HubStore
+        try:
+            if interaction.user.bot:raise ValueError('Gebruik je persoonlijke Discord-account.')
+            hub=HubStore(bot.match_store)
+            await asyncio.to_thread(hub.consume_code,code,interaction.user.id)
+            hub.remember_discord(interaction.user.id,getattr(interaction.user,'display_name','Discord-speler'))
+            message='Discord is gekoppeld. De hub en Discord gebruiken nu dezelfde deelname. Vernieuw je profiel in de hub.'
+        except ValueError as error:
+            message=str(error)
+        await interaction.response.send_message(message,ephemeral=True,allowed_mentions=discord.AllowedMentions.none())
 
     @bot.tree.command(name="checkbookings", description="Bekijk vrije padelvelden en boek via de knoppen")
     @app_commands.describe(dag="0 = vandaag, 1 = morgen, 2 = overmorgen; 0-5 = vandaag t/m over 5 dagen (standaard 0)")

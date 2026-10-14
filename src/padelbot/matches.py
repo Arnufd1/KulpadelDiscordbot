@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 import sqlite3
@@ -13,7 +13,7 @@ import uuid
 @dataclass(frozen=True)
 class Match:
     id: str
-    owner_id: int
+    owner_id: int | str
     booking_id: int
     start_iso: str
     end_iso: str
@@ -22,8 +22,13 @@ class Match:
     guild_id: int | None
     message_id: int | None
     status: str
-    players: tuple[int, ...]
+    players: tuple[int | str, ...]
     capacity: int = 4
+    names: dict = field(default_factory=dict)
+    hub_profile_id: str | None = None
+    hub_verified: float = 0
+    hub_confirmed: bool = False
+    hub_visible: bool = True
 
     @property
     def started(self) -> bool:
@@ -88,7 +93,7 @@ class MatchStore:
                 CREATE UNIQUE INDEX IF NOT EXISTS unique_match_message
                     ON shared_match_posts(channel_id,message_id) WHERE message_id IS NOT NULL;
                 INSERT OR IGNORE INTO shared_match_posts(id,match_id,channel_id,guild_id,message_id)
-                    SELECT id,id,channel_id,guild_id,message_id FROM shared_matches;
+                    SELECT id,id,channel_id,guild_id,message_id FROM shared_matches WHERE channel_id>0;
                 CREATE TABLE IF NOT EXISTS match_notices (
                     channel_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
                     match_id TEXT NOT NULL REFERENCES shared_matches(id),
@@ -96,7 +101,20 @@ class MatchStore:
                     attempts INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY(channel_id,message_id)
                 );
+                CREATE TABLE IF NOT EXISTS hub_profiles (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, discord_id INTEGER UNIQUE,
+                    suspended INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS hub_discord_names (id INTEGER PRIMARY KEY,name TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS hub_link_codes (
+                    code TEXT PRIMARY KEY, profile_id TEXT NOT NULL REFERENCES hub_profiles(id),expires REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS hub_post_updates (
+                    match_id TEXT PRIMARY KEY REFERENCES shared_matches(id),revision INTEGER NOT NULL DEFAULT 1,
+                    retry_at REAL NOT NULL DEFAULT 0);
             """)
+            columns={r['name'] for r in c.execute('PRAGMA table_info(shared_matches)')}
+            for name,definition in {'hub_profile_id':'TEXT','hub_verified':'REAL NOT NULL DEFAULT 0',
+                                    'hub_confirmed':'INTEGER NOT NULL DEFAULT 0','hub_visible':'INTEGER NOT NULL DEFAULT 1'}.items():
+                if name not in columns:c.execute(f'ALTER TABLE shared_matches ADD COLUMN {name} {definition}')
 
     @contextmanager
     def _connection(self):
@@ -115,8 +133,18 @@ class MatchStore:
             return None
         players = tuple(r[0] for r in c.execute(
             "SELECT user_id FROM match_players WHERE match_id=? ORDER BY joined_at, user_id", (match_id,)))
+        names={}
+        for actor in set(players+(row['owner_id'],)):
+            if isinstance(actor,int):
+                person=c.execute('SELECT name FROM hub_profiles WHERE discord_id=?',(actor,)).fetchone()
+                person=person or c.execute('SELECT name FROM hub_discord_names WHERE id=?',(actor,)).fetchone()
+            else:
+                person=c.execute('SELECT name FROM hub_profiles WHERE id=?',(str(actor).removeprefix('web:'),)).fetchone()
+            names[actor]=person['name'] if person else 'Discord-speler' if isinstance(actor,int) else 'Speler'
         return Match(row["id"], row["owner_id"], row["booking_id"], row["start_iso"], row["end_iso"],
-                     row["court"], row["channel_id"], row["guild_id"], row["message_id"], row["status"], players)
+                     row["court"], row["channel_id"], row["guild_id"], row["message_id"], row["status"], players,
+                     names=names,hub_profile_id=row['hub_profile_id'],hub_verified=row['hub_verified'],
+                     hub_confirmed=bool(row['hub_confirmed']),hub_visible=bool(row['hub_visible']))
 
     def get(self, match_id: str) -> Match | None:
         with self._connection() as c:
@@ -140,11 +168,17 @@ class MatchStore:
                             (owner_id, booking_id)).fetchone()
             if row:
                 return self._get(c, row[0])
+            if c.execute("SELECT 1 FROM shared_matches WHERE booking_id=? AND status='open'",(booking_id,)).fetchone():
+                raise MatchError('Deze reservatie staat al in de hub. Koppel eerst je Discord-account aan je profiel.')
             c.execute("INSERT INTO shared_matches (id,owner_id,booking_id,start_iso,end_iso,start_at,court,channel_id,guild_id) VALUES (?,?,?,?,?,?,?,?,?)",
-                      (match_id, owner_id, booking_id, start_iso, end_iso, start.timestamp(), court, channel_id, guild_id))
+                      (match_id, owner_id, booking_id, start_iso, end_iso, start.timestamp(), court, channel_id or 0, guild_id))
             c.execute("INSERT INTO match_players VALUES (?,?,?)", (match_id, owner_id, time.time()))
-            c.execute("INSERT INTO shared_match_posts(id,match_id,channel_id,guild_id) VALUES (?,?,?,?)",
-                (match_id, match_id, channel_id, guild_id))
+            profile=c.execute('SELECT id FROM hub_profiles WHERE discord_id=?',(owner_id,)).fetchone()
+            c.execute('UPDATE shared_matches SET hub_verified=?,hub_confirmed=1,hub_profile_id=? WHERE id=?',
+                      (time.time(),profile['id'] if profile else None,match_id))
+            if channel_id:
+                c.execute("INSERT INTO shared_match_posts(id,match_id,channel_id,guild_id) VALUES (?,?,?,?)",
+                    (match_id, match_id, channel_id, guild_id))
             return self._get(c, match_id)
 
     def bind_message(self, match_id: str, channel_id: int, message_id: int) -> Match:
@@ -173,6 +207,14 @@ class MatchStore:
                 raise MatchError("Dit groepsbericht is niet meer beschikbaar.")
             if match.status != "open" or match.started:
                 raise MatchError("Deze reservatie is geannuleerd of al begonnen.")
+            profile=c.execute('SELECT suspended FROM hub_profiles WHERE discord_id=?',(user_id,)).fetchone()
+            if profile and profile['suspended']:
+                raise MatchError('Dit profiel is gepauzeerd.')
+            if match.hub_profile_id and (not match.hub_confirmed or not match.hub_visible):
+                raise MatchError('Deze boeking is niet meer bevestigd of staat offline in de hub.')
+            host=c.execute('SELECT suspended FROM hub_profiles WHERE id=?',(match.hub_profile_id,)).fetchone()
+            if host and host['suspended']:
+                raise MatchError('De organisator is gepauzeerd.')
             if join:
                 if user_id in match.players:
                     raise MatchError("Je staat al op de deelnemerslijst.")
@@ -187,10 +229,16 @@ class MatchStore:
                 c.execute("DELETE FROM match_players WHERE match_id=? AND user_id=?", (match_id, user_id))
             return self._get(c, match_id)
 
+    @staticmethod
+    def queue_hub_update(c,match_id):
+        c.execute('''INSERT INTO hub_post_updates(match_id) VALUES(?) ON CONFLICT(match_id)
+            DO UPDATE SET revision=revision+1,retry_at=0''',(match_id,))
+
     def cancel_booking(self, owner_id: int, booking_id: int) -> Match | None:
         with self._connection() as c:
             c.execute("UPDATE shared_matches SET status='cancelled' WHERE owner_id=? AND booking_id=?", (owner_id, booking_id))
             row = c.execute("SELECT id FROM shared_matches WHERE owner_id=? AND booking_id=?", (owner_id, booking_id)).fetchone()
+            if row:self.queue_hub_update(c,row['id'])
             return self._get(c, row[0]) if row else None
 
     def future_matches(self) -> list[Match]:

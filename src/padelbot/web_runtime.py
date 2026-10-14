@@ -60,6 +60,7 @@ def tenant_env(store: PlatformStore, user: dict) -> dict[str, str]:
     env["PADELWEB_PREFERENCES"] = json.dumps(store.preferences(user["id"]))
     env['PADELWEB_DB']=str(store.path)
     env['PADELWEB_USER_ID']=user['id']
+    env['PADELWEB_HUB_DB']=str(base.padelbot_rules_file.resolve())
     return env
 
 
@@ -90,20 +91,23 @@ class JobRunner:
         self.store = store
         self.process = None
         self.community = CommunityBookings(store)
+        from .drafts import DraftStore
+        self.drafts=DraftStore(self.community)
 
     async def run(self):
         # Writes interrupted by restart are not replayed: their remote outcome may be unknown.
         with self.store.conn() as c:
             c.execute("UPDATE jobs SET status='unknown', result=?,finished=? WHERE status='running'",
                       (json.dumps({"error":"De server werd herstart. Controleer je boekingen vóór je opnieuw probeert."}),time.time()))
+        self.drafts.recover()
         while True:
             with self.store.conn() as c:
-                row = c.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY CASE kind WHEN 'rule' THEN 0 ELSE 1 END,created LIMIT 1").fetchone()
+                row = c.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY CASE kind WHEN 'rule' THEN 0 WHEN 'draft_release' THEN 1 ELSE 2 END,created LIMIT 1").fetchone()
             if not row:
                 await asyncio.sleep(0.5)
                 continue
             user = self.store.user(row["user_id"])
-            if not user or user["suspended"]:
+            if not user or (user["suspended"] and row['kind']!='draft_release'):
                 self.finish(row["id"],"cancelled",{"error":"Profiel is gepauzeerd."})
                 continue
             with self.store.conn() as c:
@@ -120,6 +124,7 @@ class JobRunner:
                     self.finish(row['id'],'failed',{'error':'Deze online boeking is niet meer beschikbaar.'})
                     continue
             env = tenant_env(self.store,source_user)
+            env['PADELWEB_HUB_DB']=str(self.community.matches.path.resolve())
             env["PADELWEB_RESULT"] = str(output)
             try:
                 self.process = await asyncio.create_subprocess_exec(sys.executable,"-m","padelbot.web_worker",
@@ -145,7 +150,13 @@ class JobRunner:
 
     def finish(self, job_id, status, result):
         with self.store.conn() as c:
-            job=c.execute('SELECT user_id,kind FROM jobs WHERE id=?',(job_id,)).fetchone()
+            job=c.execute('SELECT user_id,kind,payload FROM jobs WHERE id=?',(job_id,)).fetchone()
+        if job and status in {'failed','unknown','cancelled'}:
+            payload=json.loads(job['payload'])
+            if job['kind']=='draft_refresh':
+                self.drafts.failed(payload['draft_id'],'KUL-controle onderbroken. Controleer je draft en winkelwagen.')
+            elif job['kind']=='book' and payload.get('draft_id'):
+                self.drafts.uncertain_conversion(payload['draft_id'])
         if job and job['kind']=='bookings' and status=='done':
             self.community.sync(job['user_id'],result.get('bookings',[]),device_verified=result.get('device_verified') is True)
         with self.store.conn() as c:
@@ -180,6 +191,12 @@ class JobRunner:
                             last_checked[occurrence]=time.monotonic()
                         except ValueError:
                             pass
+            for draft in self.drafts.due():
+                try:
+                    self.store.enqueue(draft['profile_id'],draft['kind'],{'draft_id':draft['id']},
+                        dedup=f"{draft['kind']}:{draft['id']}:{int(time.time())//300}")
+                except ValueError:
+                    self.drafts.failed(draft['id'],'De wachtrij is vol. Controleer je draft.')
             if len(last_checked)>1000:
                 cutoff=time.monotonic()-86400
                 last_checked={key:stamp for key,stamp in last_checked.items() if stamp>cutoff}

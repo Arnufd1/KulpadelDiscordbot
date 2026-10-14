@@ -87,11 +87,24 @@ class CardRequest(BaseModel):
     number: SecretStr = Field(min_length=13,max_length=32)
     month: int = Field(ge=1,le=12)
     year: int = Field(ge=2026,le=2100)
+    label: str = Field(default='',max_length=40)
+    primary: bool = False
 
 
 class ShareRequest(BaseModel):
     booking_id: int = Field(gt=0)
     shared: bool
+
+
+class DraftRequest(BaseModel):
+    product: int = Field(gt=0)
+    court: int = Field(gt=0)
+    target: str = Field(max_length=40)
+    end: str = Field(max_length=40)
+
+
+class DraftConfirmRequest(BaseModel):
+    amount: float = Field(gt=0,le=100)
 
 
 def validate_google_claims(claims: dict, nonce: str, audience: str):
@@ -109,6 +122,7 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
     runner, devices = JobRunner(store), DeviceManager(store)
     cards = CardVault(store,config.card_vault_key_file)
     community = runner.community
+    drafts=runner.drafts
     static = Path(__file__).parent/"web_static"
     keys = jwt.PyJWKClient("https://www.googleapis.com/oauth2/v3/certs",timeout=10)
 
@@ -193,6 +207,7 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
         if request.method not in {"GET","HEAD"} and not hmac.compare_digest(session["csrf"],request.headers.get("x-csrf-token","")):
             raise HTTPException(403,"Vernieuw de pagina en probeer opnieuw.")
         request.state.session = session
+        community.hub.register(user)
         return user
 
     def admin(request:Request,user=Depends(current)):
@@ -261,7 +276,14 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
             "admin":bool(user["owner"] and request.state.session["admin_until"]>time.time()),"csrf":request.state.session["csrf"],
             "connected":Path(env["PADELBOT_TOKEN_FILE"]).exists(),"device_ready":Path(env["PADELBOT_ANDROID_PROFILE_FILE"]).exists(),
             "needs_attention":Path(env["PADELBOT_ANDROID_FAILURE_FILE"]).exists(),
+            "discord_linked":community.hub.linked(user['id']),
             "preferences":store.preferences(user["id"])}
+
+    @app.post('/api/discord/link')
+    def discord_link(user=Depends(current)):
+        code=community.hub.new_code(user['id'])
+        store.audit(user['id'],'discord_link_requested')
+        return {'command':'/koppel '+code,'expires_in':600}
 
     @app.post("/api/preferences")
     def preferences(body:PreferencesRequest,user=Depends(current)):
@@ -269,11 +291,21 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
 
     @app.get('/api/payment-card')
     def card_summary(user=Depends(current)):
-        return {'enabled':cards.key is not None,'card':cards.summary(user['id'])}
+        return {'enabled':cards.key is not None,'card':cards.summary(user['id']),'cards':cards.list(user['id'])}
 
     @app.post('/api/payment-card')
     def card_save(body:CardRequest,user=Depends(current)):
-        return {'card':cards.save(user['id'],holder=body.holder.get_secret_value(),number=body.number.get_secret_value(),month=body.month,year=body.year)}
+        return {'card':cards.save(user['id'],holder=body.holder.get_secret_value(),number=body.number.get_secret_value(),month=body.month,year=body.year,label=body.label,primary=body.primary)}
+
+    @app.post('/api/payment-card/{card_id}/primary')
+    def primary_card(card_id:str,user=Depends(current)):
+        cards.set_primary(user['id'],card_id)
+        return {'ok':True}
+
+    @app.delete('/api/payment-card/{card_id}')
+    def remove_card(card_id:str,user=Depends(current)):
+        cards.delete(user['id'],card_id)
+        return {'ok':True}
 
     @app.delete('/api/payment-card')
     def card_delete(user=Depends(current)):
@@ -284,7 +316,42 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
     def online(user=Depends(current)):
         with store.conn() as c:
             refreshing=bool(c.execute("SELECT 1 FROM jobs WHERE kind='bookings' AND dedup LIKE 'online-refresh:%' AND status IN ('queued','running') LIMIT 1").fetchone())
-        return {'matches':community.list(user['id']),'refreshing':refreshing}
+        return {'matches':community.list(user['id'])+drafts.list(user['id']),'refreshing':refreshing}
+
+    @app.post('/api/drafts')
+    def create_draft(body:DraftRequest,user=Depends(current)):
+        from datetime import datetime
+        try:
+            start,end=datetime.fromisoformat(body.target.replace('Z','+00:00')),datetime.fromisoformat(body.end.replace('Z','+00:00'))
+            if start.tzinfo is None or end.tzinfo is None:raise ValueError()
+        except ValueError:
+            raise ValueError('Kies een geldig tijdslot met tijdzone.') from None
+        if not Path(tenant_env(store,user)['PADELBOT_ANDROID_PROFILE_FILE']).exists():raise ValueError('Koppel eerst je eigen KUL-authenticator.')
+        draft=drafts.create(user['id'],body.product,body.court,start.isoformat(),end.isoformat())
+        try:return enqueue(user,'draft_refresh',{'draft_id':draft['id']})
+        except ValueError:
+            drafts.abort_pending(draft['id'])
+            raise
+
+    @app.get('/api/drafts/mine')
+    def own_drafts(user=Depends(current)):
+        return {'drafts':drafts.own_status(user['id'])}
+
+    @app.post('/api/drafts/{draft_id}/cancel')
+    def cancel_draft(draft_id:str,user=Depends(current)):
+        drafts.stop(draft_id,user['id'])
+        return enqueue(user,'draft_release',{'draft_id':draft_id})
+
+    @app.post('/api/drafts/{draft_id}/quote')
+    def quote_draft(draft_id:str,user=Depends(current)):
+        draft=drafts.owned(draft_id,user['id'])
+        return enqueue(user,'quote',{'target':draft['target'],'product':draft['product'],'court':draft['court'],'amount':1,'draft_id':draft_id})
+
+    @app.post('/api/drafts/{draft_id}/confirm')
+    def confirm_draft(draft_id:str,body:DraftConfirmRequest,user=Depends(current)):
+        draft=drafts.owned(draft_id,user['id'])
+        return enqueue(user,'book',{'target':draft['target'],'product':draft['product'],'court':draft['court'],'amount':body.amount,'draft_id':draft_id},
+                       dedup='draft-confirm:'+draft_id)
 
     @app.get('/api/community/mine')
     def online_mine(user=Depends(current)):
@@ -297,6 +364,10 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
 
     @app.post('/api/community/{match_id}/join')
     def join_match(match_id:str,user=Depends(current)):
+        match=community.matches.get(match_id)
+        if match and match.status=='draft':
+            drafts.joined(match_id,user['id'])
+            return {'joined':True,'message':'Je neemt deel aan dit onbetaalde voorstel.'}
         community.host(match_id)
         return enqueue(user,'community_join',{'match_id':match_id,'participant_id':user['id']})
 
@@ -448,6 +519,7 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
         if not target or target["owner"]:
             raise ValueError("Dit profiel kan niet gepauzeerd worden.")
         store.suspend(user["id"],user_id,not target["suspended"])
+        community.hub.register(store.user(user_id))
         if not target["suspended"] and devices.user_id==user_id:
             await devices.close()
         return {"ok":True}

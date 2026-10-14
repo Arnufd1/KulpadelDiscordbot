@@ -256,7 +256,7 @@ def test_quote_identifies_court_by_both_parent_and_linked_product(monkeypatch):
         def me(self):return {'id':123,'balance':100}
     monkeypatch.setattr(client,'BackboneClient',Client)
     target=datetime(2027,1,1,18,tzinfo=timezone.utc)
-    slots=[SimpleNamespace(start_dt=target,start_iso=target.isoformat(),bookable_product_id=parent,bookable_linked_product_id=123) for parent in (100,200)]
+    slots=[SimpleNamespace(start_dt=target,start_iso=target.isoformat(),end_iso="2027-01-01T19:00:00+00:00",bookable_product_id=parent,bookable_linked_product_id=123) for parent in (100,200)]
     monkeypatch.setattr(booking,'find_slots',lambda *a,**kw:slots)
     selected=[]
     monkeypatch.setattr(checkout,'slot_price',lambda client,slot,me:selected.append(slot.bookable_product_id) or Decimal(12))
@@ -370,7 +370,8 @@ def test_cards_are_encrypted_in_database_and_never_return_full_number(portal):
     data={'holder':'Example Cardholder','number':'4111 1111 1111 1111','month':12,'year':2035}
     result=client.post('/api/payment-card',json=data,headers=headers)
     assert result.status_code==200
-    assert result.json()['card']=={'brand':'Visa','last4':'1111','month':12,'year':2035}
+    assert {k:result.json()['card'][k] for k in ('brand','last4','month','year')}=={'brand':'Visa','last4':'1111','month':12,'year':2035}
+    first_id=result.json()['card']['id']
     assert '4111111111111111' not in result.text and data['holder'] not in result.text
     for path in [store.path,store.path.with_name(store.path.name+'-wal')]:
         if path.exists():
@@ -378,16 +379,19 @@ def test_cards_are_encrypted_in_database_and_never_return_full_number(portal):
             assert b'4111111111111111' not in blob and b'Example Cardholder' not in blob
     with store.conn() as c:
         first=c.execute('SELECT ciphertext,nonce,wrapped_key FROM payment_cards').fetchone()
-    assert client.post('/api/payment-card',json=data,headers=headers).status_code==200
+    second_result=client.post('/api/payment-card',json=data,headers=headers)
+    assert second_result.status_code==200
+    second_id=second_result.json()['card']['id']
     with store.conn() as c:
-        second=c.execute('SELECT ciphertext,nonce,wrapped_key FROM payment_cards').fetchone()
+        second=c.execute('SELECT ciphertext,nonce,wrapped_key FROM payment_cards WHERE id=?',(second_id,)).fetchone()
     assert all(first[i]!=second[i] for i in range(3))
     headers=sign_in(client,store,bob)
     assert client.get('/api/payment-card').json()['card'] is None
     assert client.delete('/api/payment-card',headers=headers).status_code==200
     headers=sign_in(client,store,alice)
     assert client.get('/api/payment-card').json()['card']['last4']=='1111'
-    assert client.delete('/api/payment-card',headers=headers).status_code==200
+    assert client.delete('/api/payment-card/'+first_id,headers=headers).status_code==200
+    assert client.delete('/api/payment-card/'+second_id,headers=headers).status_code==200
     assert client.get('/api/payment-card').json()['card'] is None
 
 
@@ -488,15 +492,22 @@ def test_worker_confirmation_requires_paid_padel_and_registered_device(monkeypat
     from padelbot.config import settings
     profile=tmp_path/'profile.json'
     monkeypatch.setattr(settings,'padelbot_android_profile_file',profile)
-    common={'id':123,'description':'','start_iso':'2035-01-01T18:00:00Z','end_iso':'2035-01-01T19:00:00Z','raw':{'productId':10},'status':0}
+    common={'id':123,'sale_id':77,'description':'','start_iso':'2035-01-01T18:00:00Z','end_iso':'2035-01-01T19:00:00Z','raw':{'productId':10},'status':0}
     rows=[SimpleNamespace(**common,paid_for=paid) for paid in (True,False,None)]
+    sale_client=SimpleNamespace(get=lambda *args,**kwargs:{'id':77,'customerPersonId':42,'statusCode':0})
     monkeypatch.setattr(booking_manager,'list_my_bookings',lambda *args,**kwargs:rows)
     monkeypatch.setattr(booking,'get_product_names',lambda *args:{10:'Padel 1'})
-    assert all(not b['confirmed'] for b in verified_bookings(None,{'id':42})['bookings'])
+    assert all(not b['confirmed'] for b in verified_bookings(sale_client,{'id':42})['bookings'])
     profile.write_text('{}')
-    assert [b['confirmed'] for b in verified_bookings(None,{'id':42})['bookings']]==[True,False,False]
+    assert [b['confirmed'] for b in verified_bookings(sale_client,{'id':42})['bookings']]==[True,False,False]
+    for sale in [{'id':77,'customerPersonId':42,'statusCode':1},
+                 {'id':77,'customerPersonId':999,'statusCode':0},
+                 {'id':78,'customerPersonId':42,'statusCode':0},
+                 {'id':77,'customerPersonId':42,'statusCode':False}]:
+        provisional=SimpleNamespace(get=lambda *a,**k:sale)
+        assert not any(b['confirmed'] for b in verified_bookings(provisional,{'id':42})['bookings'])
     monkeypatch.setattr(booking,'get_product_names',lambda *args:{10:'Tennis 1'})
-    assert all(not b['confirmed'] for b in verified_bookings(None,{'id':42})['bookings'])
+    assert all(not b['confirmed'] for b in verified_bookings(sale_client,{'id':42})['bookings'])
 
 
 def test_join_worker_rechecks_organisers_client_and_cancellation_blocks_join(portal,monkeypatch):
