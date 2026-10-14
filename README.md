@@ -114,11 +114,14 @@ src/padelbot/discord_ui.py    Keuzemenu's voor bekijken, boeken en automatiserin
 src/padelbot/availability_watch.py  Dagwatchers en wijzigingen in vrije tijden
 src/padelbot/watch_ui.py      Watcher-beheer en privé-/publieke chatmeldingen
 src/padelbot/weather.py       Gecachte Leuven-voorspelling
+src/padelbot/web.py           Google-login, persoonlijke API en privébeheer
+src/padelbot/web_runtime.py   Gescheiden workers en gebruikersscheduler
+src/padelbot/web_device.py    Tijdelijke persoonlijke Android-koppeling
 tests/                       Auth, beschikbaarheid, UI, annuleren en betalingen
 ```
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\Scripts\python.exe -m pip install -e ".[dev,web]"
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 

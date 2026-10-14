@@ -3,6 +3,10 @@ import json
 import time
 
 import pytest
+
+for optional in ['fastapi','jwt','PIL','zxingcpp']:
+    pytest.importorskip(optional,reason='Install .[web,dev] to test the web portal')
+
 from fastapi.testclient import TestClient
 
 from padelbot.web import WebSettings,create_app,validate_google_claims
