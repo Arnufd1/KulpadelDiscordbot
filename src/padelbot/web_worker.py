@@ -54,14 +54,16 @@ def execute(kind: str, payload: dict) -> dict:
     from .booking_manager import list_my_bookings
     from .checkout import slot_price
     from .rules_store import RulesStore
-    initialise_key()
+    token_store=initialise_key()
     if kind == "login":
         from .android import AndroidApprover
         from .auth import login_via_android
         if not settings.padelbot_android_profile_file.exists():
             raise ValueError("Koppel eerst je eigen virtuele authenticator via Instellingen.")
-        tokens = login_via_android(AndroidApprover())
-        initialise_key().save(tokens)
+        from filelock import FileLock
+        with FileLock(str(token_store.blob_file)+'.renew.lock',timeout=600):
+            tokens = login_via_android(AndroidApprover())
+            token_store.save(tokens)
     with BackboneClient() as client:
         me = client.me()
         if kind in {"account","login"}:

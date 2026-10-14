@@ -104,12 +104,17 @@ def complete_profile(pin:str,checked:bool=False):
 
 
 def child_main():
+    from filelock import FileLock
     from .android import run_adb, find_adb, PACKAGE, doctor
     from .config import settings
     from .emulator import ensure_emulator
     signal.signal(signal.SIGTERM,lambda *_:sys.exit(1))
     lease = None
+    identity_lock=FileLock(str(settings.padelbot_token_file)+'.renew.lock',timeout=600)
     try:
+        # Match auth renewal's lock order: identity first, then the shared emulator.
+        # A PIN changed interactively must be saved before another approver reads it.
+        identity_lock.acquire()
         provision()
         lease = ensure_emulator()
         if lease is None:
@@ -164,8 +169,11 @@ def child_main():
     except BaseException:
         print(json.dumps({"error":"Het virtuele toestel kon niet starten. Probeer later opnieuw."}),flush=True)
     finally:
-        if lease:
-            lease.close()
+        try:
+            if lease:
+                lease.close()
+        finally:
+            identity_lock.release()
 
 
 class DeviceManager:

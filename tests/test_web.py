@@ -329,3 +329,23 @@ def test_pin_failure_requires_explicit_manual_check_and_survives_failed_save(tmp
     monkeypatch.setattr(web_device,'save_profile',lambda pin:calls.append(pin))
     web_device.complete_profile('1234',True)
     assert calls==['1234'] and not failure.exists()
+
+
+def test_concurrent_profile_initialisation_never_rotates_an_existing_key(tmp_path,monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from padelbot import web_worker
+    from padelbot.config import settings
+    from padelbot.store import TokenStore
+    monkeypatch.setattr(settings,'padelbot_key_file',tmp_path/'key')
+    monkeypatch.setattr(settings,'padelbot_token_file',tmp_path/'tokens')
+    original=TokenStore.init_key
+    calls=[]
+    def slow_init(store):
+        calls.append(True)
+        time.sleep(.05)
+        original(store)
+    monkeypatch.setattr(TokenStore,'init_key',slow_init)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        stores=list(pool.map(lambda _:web_worker.initialise_key(),range(3)))
+    assert len(calls)==1
+    assert all(s.key_file.read_bytes()==stores[0].key_file.read_bytes() for s in stores)
