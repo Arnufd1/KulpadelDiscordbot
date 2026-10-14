@@ -46,6 +46,8 @@ De desktop heeft in Tailscale `tag:admin` en daardoor geen menselijke identiteit
 
 Nieuwe webgebruikers stellen expliciet automatisch betalen en hun maximumbedrag per boeking in. De webworker gebruikt uitsluitend het eigen KUL-saldo of een bestaande geldige domiciliëring. Beheer daarvan gebeurt via de officiële KUL-pagina:
 
+De nieuwe gebruikersscheduler volgt de gecontroleerde API-grens van 168 uur vóór de start, berekend in UTC zodat ook een zomer-/wintertijdwissel klopt. Als er nog geen terrein vrij is, controleert hij de wekelijkse regel om de twee minuten opnieuw binnen het opgegeven startvenster. Alleen een uitdrukkelijk leesresultaat zonder reservatie mag opnieuw gecontroleerd worden; een uitgevoerde of onzekere schrijftaak behoudt zijn ontdubbelingssleutel.
+
 https://usc.kuleuven.cloud/members/profile/myshopping#storedpaymethodcard
 
 De webapp neemt geen kaartnummer of CVC aan en leest ook de eerder opgeslagen kaart van de eigenaar niet. Een opgeslagen-kaartbetaling voor nieuwe gebruikers is **niet geïmplementeerd**. De gecontroleerde USC-frontend gebruikt Ogone; de frontend biedt nieuwe opgeslagen betaalmethoden bij andere providerpaden en eventueel legacy-domiciliëring. Een algemene Worldline-tokenintegratie is daardoor niet zonder meer beschikbaar voor dit KUL-account. Een kaart bij Sigmadvisor bewaren is geen vervanging voor een ondersteunde token-/mandaatkoppeling.

@@ -70,6 +70,7 @@ class DeviceRequest(BaseModel):
     y: int = Field(default=0,ge=0,lt=800)
     link: str = Field(default="",max_length=2048)
     pin: str = Field(default="",max_length=12)
+    checked: bool = False
 
 
 class QRRequest(BaseModel):
@@ -234,6 +235,7 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
         return {"id":user["id"],"name":user["name"],"email":user["email"],"owner":bool(user["owner"]),
             "admin":bool(user["owner"] and request.state.session["admin_until"]>time.time()),"csrf":request.state.session["csrf"],
             "connected":Path(env["PADELBOT_TOKEN_FILE"]).exists(),"device_ready":Path(env["PADELBOT_ANDROID_PROFILE_FILE"]).exists(),
+            "needs_attention":Path(env["PADELBOT_ANDROID_FAILURE_FILE"]).exists(),
             "preferences":store.preferences(user["id"])}
 
     @app.post("/api/preferences")

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -57,6 +57,8 @@ def tenant_env(store: PlatformStore, user: dict) -> dict[str, str]:
             env[key.upper()] = str(value) if not isinstance(value,bool) else str(value).lower()
     env["PADELWEB_PROFILE_ROOT"] = str(root)
     env["PADELWEB_PREFERENCES"] = json.dumps(store.preferences(user["id"]))
+    env['PADELWEB_DB']=str(store.path)
+    env['PADELWEB_USER_ID']=user['id']
     return env
 
 
@@ -64,6 +66,22 @@ def rules_for(store: PlatformStore, user: dict):
     from .rules_store import RulesStore
     env = tenant_env(store,user)
     return RulesStore(Path(env["PADELBOT_RULES_FILE"]))
+
+
+def rule_window(rule,now:datetime):
+    """The API accepts starts up to exactly 168 hours ahead, including across DST."""
+    tz=ZoneInfo('Europe/Brussels')
+    local=now.astimezone(tz)
+    day=local.date()+timedelta(days=(rule.day_of_week-local.weekday())%7)
+    first=datetime.strptime(rule.time_local,'%H:%M').time()
+    last=datetime.strptime(rule.end_time_local or rule.time_local,'%H:%M').time()
+    end=datetime.combine(day,last,tz)
+    if end<=local:
+        day+=timedelta(days=7)
+        end=datetime.combine(day,last,tz)
+    target=datetime.combine(day,first,tz)
+    opens=target.astimezone(timezone.utc)-timedelta(hours=168)
+    return target,end,opens
 
 
 class JobRunner:
@@ -116,10 +134,16 @@ class JobRunner:
     def finish(self, job_id, status, result):
         with self.store.conn() as c:
             c.execute("UPDATE jobs SET status=?,result=?,finished=? WHERE id=?",(status,json.dumps(result),time.time(),job_id))
+            if status=='done' and result.get('waiting') is True:
+                # The worker stopped before any reservation/payment write. Only this
+                # read-only outcome may be checked again. Interrupted writes retain dedup.
+                c.execute("UPDATE jobs SET dedup=NULL WHERE id=? AND kind='rule'",(job_id,))
+            elif status=='failed' and result.get('safe_to_retry') is True:
+                c.execute("UPDATE jobs SET dedup=NULL WHERE id=? AND kind IN ('book','rule')",(job_id,))
 
     async def scheduler(self):
-        from .scheduler import compute_next_fire
         tz = ZoneInfo("Europe/Brussels")
+        last_checked={}
         while True:
             now = datetime.now(tz)
             with self.store.conn() as c:
@@ -128,13 +152,19 @@ class JobRunner:
                 prefs = self.store.preferences(user["id"])
                 if not prefs.get("automatic_payment") or float(prefs.get("max_amount",0))<=0:
                     continue
-                for rule in rules_for(self.store,user).list_rules(enabled_only=True):
-                    spec = compute_next_fire(rule,now=now-timedelta(minutes=5))
-                    delay = (spec.fire_at-now).total_seconds()
-                    if -300 <= delay <= 1:
+                rules=rules_for(self.store,user)
+                for rule in rules.list_rules(enabled_only=True):
+                    target,end,opens=rule_window(rule,now)
+                    occurrence=f"{user['id']}:{rule.id}:{target.date()}"
+                    if opens<=now.astimezone(timezone.utc)<end.astimezone(timezone.utc):
+                        if rules.has_booking_for_day(rule.id,target.date()) or time.monotonic()-last_checked.get(occurrence,-1000)<120:
+                            continue
                         try:
-                            self.store.enqueue(user["id"],"rule",{"rule_id":rule.id,"target":spec.target_slot_local.isoformat()},
-                                dedup=f"{user['id']}:{rule.id}:{spec.target_slot_local.date()}")
+                            self.store.enqueue(user["id"],"rule",{"rule_id":rule.id,"target":target.isoformat()},dedup=occurrence)
+                            last_checked[occurrence]=time.monotonic()
                         except ValueError:
                             pass
+            if len(last_checked)>1000:
+                cutoff=time.monotonic()-86400
+                last_checked={key:stamp for key,stamp in last_checked.items() if stamp>cutoff}
             await asyncio.sleep(1)

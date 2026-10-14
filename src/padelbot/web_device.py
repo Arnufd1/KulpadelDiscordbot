@@ -88,8 +88,19 @@ def save_profile(pin: str):
                     "length":4,"empty_selector":{"resourceId":PACKAGE+":id/pin_input_not_set"},
                     "keypad":{str(i):{"resourceId":PACKAGE+f":id/button{i}","text":str(i)} for i in range(10)}}]}
     AndroidPinStore(initial.key_file,settings.padelbot_android_pin_file).save(pin)
-    settings.padelbot_android_profile_file.write_text(json.dumps(profile),encoding="utf-8")
+    from .idp import save_state
+    save_state(settings.padelbot_android_profile_file,profile)
     # Do not clear an existing failed-PIN latch through an ordinary save.
+
+
+def complete_profile(pin:str,checked:bool=False):
+    from .config import settings
+    failed=settings.padelbot_android_failure_file.exists()
+    if failed and checked is not True:
+        raise ValueError('Controleer eerst de PIN handmatig op dit toestel en bevestig dat hieronder.')
+    save_profile(pin)
+    if failed and checked is True:
+        settings.padelbot_android_failure_file.unlink(missing_ok=True)
 
 
 def child_main():
@@ -141,7 +152,7 @@ def child_main():
                             serial=settings.padelbot_android_serial)
                     answer = {}
                 elif action == "finish":
-                    save_profile(str(request["pin"]))
+                    complete_profile(str(request["pin"]),request.get('checked') is True)
                     answer = {"saved":True}
                 else:
                     raise ValueError("Onbekende actie.")
@@ -174,8 +185,6 @@ class DeviceManager:
                     raise ValueError("Iemand koppelt momenteel een toestel. Probeer het over enkele minuten opnieuw.")
                 self.touched = time.monotonic()
                 return {"ready":True}
-            if user["owner"]:
-                raise ValueError("Jouw bestaande toestel is al gekoppeld. Het hoeft niet opnieuw geregistreerd te worden.")
             self.user_id = user["id"]
             self.started = self.touched = time.monotonic()
             self.process = await asyncio.create_subprocess_exec(sys.executable,"-m","padelbot.web_device",

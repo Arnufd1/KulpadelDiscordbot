@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import sqlite3
 import sys
 from zoneinfo import ZoneInfo
 
@@ -15,10 +16,26 @@ from .config import settings
 from .store import TokenStore
 
 
+_reservation_started=False
+
+
+def current_preferences() -> dict:
+    if os.environ.get('PADELWEB_DB') and os.environ.get('PADELWEB_USER_ID'):
+        with sqlite3.connect(os.environ['PADELWEB_DB']) as c:
+            row=c.execute('SELECT preferences,suspended FROM users WHERE id=?',(os.environ['PADELWEB_USER_ID'],)).fetchone()
+        if row is None or row[1]:
+            raise ValueError('Dit profiel is gepauzeerd.')
+        return json.loads(row[0])
+    return json.loads(os.environ.get('PADELWEB_PREFERENCES','{}'))
+
+
 def initialise_key():
+    from filelock import FileLock
     store = TokenStore(settings.padelbot_key_file,settings.padelbot_token_file)
-    if not store.key_file.exists():
-        store.init_key()
+    store.key_file.parent.mkdir(parents=True,exist_ok=True)
+    with FileLock(str(store.key_file)+'.init.lock',timeout=15):
+        if not store.key_file.exists():
+            store.init_key()
     return store
 
 
@@ -30,6 +47,8 @@ def payment_summary(me: dict) -> dict:
 
 
 def execute(kind: str, payload: dict) -> dict:
+    global _reservation_started
+    _reservation_started=False
     from .client import BackboneClient
     from .booking import find_slots_window, find_slots, book
     from .booking_manager import list_my_bookings
@@ -62,7 +81,7 @@ def execute(kind: str, payload: dict) -> dict:
                                 for b in list_my_bookings(client,member_id=int(me["id"]))]}
         if kind not in {"book","rule","quote"}:
             raise ValueError("Onbekende taak.")
-        prefs = json.loads(os.environ.get("PADELWEB_PREFERENCES","{}"))
+        prefs = current_preferences()
         if kind!="quote" and not prefs.get("automatic_payment"):
             raise ValueError("Schakel automatisch betalen in bij Instellingen voordat je boekt.")
         target = datetime.fromisoformat(payload["target"])
@@ -80,6 +99,8 @@ def execute(kind: str, payload: dict) -> dict:
         else:
             slot = next((s for s in slots if s.start_dt==target and s.bookable_linked_product_id==int(payload["court"])),None)
         if slot is None:
+            if kind=='rule':
+                return {'waiting':True,'message':'Nog geen terrein vrij binnen je venster. We blijven controleren.'}
             raise ValueError("Dit tijdstip is niet meer vrij. Vernieuw de beschikbaarheid.")
         amount = slot_price(client,slot,me)
         if kind=="quote":
@@ -95,6 +116,10 @@ def execute(kind: str, payload: dict) -> dict:
             raise ValueError("Vul eerst je KUL-saldo aan of koppel een domiciliëring in KU Leuven Sport.")
         if kind == "book" and amount != Decimal(str(payload["amount"])):
             raise ValueError("De prijs is gewijzigd. Vernieuw het overzicht en bevestig opnieuw.")
+        latest=current_preferences()
+        if not latest.get('automatic_payment') or Decimal(str(latest.get('max_amount',0)))<amount:
+            raise ValueError('Je betaalinstellingen zijn gewijzigd. Er is niets geboekt.')
+        _reservation_started=True
         result = book(client,slot,member_id=int(me["id"]),me=me,expected_amount=amount,label=rule.notes if rule else "Sigmadvisor")
         rules.record(rule_id=rule.id if rule else None,success=result.paid,sale_id=result.sale_id,
             booking_id=result.booking_id,target_slot_iso=slot.start_dt.astimezone(ZoneInfo("Europe/Brussels")).isoformat(),
@@ -115,6 +140,8 @@ def main():
     except BaseException:
         # Provider exceptions may contain account identifiers, challenge links or cookies.
         result = {"error":"KUL kon deze taak niet afronden. Controleer je koppeling, saldo en boekingen voor je opnieuw probeert."}
+    if 'error' in result and message['kind'] in {'book','rule'} and not _reservation_started:
+        result['safe_to_retry']=True
     Path(os.environ["PADELWEB_RESULT"]).write_text(json.dumps(result),encoding="utf-8")
 
 

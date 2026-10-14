@@ -242,3 +242,70 @@ def test_web_booking_fails_before_reservation_without_consent_funds_or_price_mat
     monkeypatch.setenv('PADELWEB_PREFERENCES',json.dumps(preferences))
     with pytest.raises(ValueError):
         web_worker.execute('book',{'target':target.isoformat(),'court':123,'amount':confirmed})
+
+
+def test_web_scheduler_uses_rolling_168_hours_across_dst_and_keeps_current_window():
+    from datetime import datetime,timedelta,timezone
+    from zoneinfo import ZoneInfo
+    from padelbot.rules_store import Rule
+    from padelbot.web_runtime import rule_window
+    tz=ZoneInfo('Europe/Brussels')
+    rule=Rule(1,0,'18:00',True,None,'20:00')
+    now=datetime(2026,10,19,19,0,tzinfo=tz)
+    target,end,opens=rule_window(rule,now)
+    assert target.date()==now.date() and end.hour==20
+    assert target.astimezone(timezone.utc)-opens==timedelta(hours=168)
+    now=datetime(2026,10,19,21,0,tzinfo=tz)
+    target,end,opens=rule_window(rule,now)
+    assert target.isoformat()=='2026-10-26T18:00:00+01:00'
+    assert opens.astimezone(tz).isoformat()=='2026-10-19T19:00:00+02:00'
+
+
+def test_only_readonly_no_slot_outcome_can_be_rescheduled(portal):
+    from padelbot.web_runtime import JobRunner
+    _,_,store,(_,alice,_)=portal
+    runner=JobRunner(store)
+    first=store.enqueue(alice['id'],'rule',{},dedup='occurrence')
+    runner.finish(first,'done',{'waiting':True})
+    second=store.enqueue(alice['id'],'rule',{},dedup='occurrence')
+    assert first!=second
+    runner.finish(second,'unknown',{'error':'Outcome unknown'})
+    assert store.enqueue(alice['id'],'rule',{},dedup='occurrence')==second
+    third=store.enqueue(alice['id'],'rule',{},dedup='transient')
+    runner.finish(third,'failed',{'error':'HTTP read failed','safe_to_retry':True})
+    assert store.enqueue(alice['id'],'rule',{},dedup='transient')!=third
+
+
+def test_worker_rechecks_live_consent_and_suspension(portal,monkeypatch):
+    from padelbot.web_worker import current_preferences
+    _,_,store,(owner,alice,_)=portal
+    env=tenant_env(store,alice)
+    monkeypatch.setenv('PADELWEB_DB',env['PADELWEB_DB'])
+    monkeypatch.setenv('PADELWEB_USER_ID',alice['id'])
+    store.preferences(alice['id'],{'automatic_payment':True,'max_amount':20})
+    assert current_preferences()['automatic_payment'] is True
+    store.preferences(alice['id'],{'automatic_payment':False,'max_amount':0})
+    assert current_preferences()['automatic_payment'] is False
+    store.suspend(owner['id'],alice['id'],True)
+    with pytest.raises(ValueError):
+        current_preferences()
+
+
+def test_pin_failure_requires_explicit_manual_check_and_survives_failed_save(tmp_path,monkeypatch):
+    from padelbot import web_device
+    from padelbot.config import settings
+    failure=tmp_path/'failure.json';failure.write_text('{}')
+    monkeypatch.setattr(settings,'padelbot_android_failure_file',failure)
+    calls=[]
+    monkeypatch.setattr(web_device,'save_profile',lambda pin:calls.append(pin))
+    with pytest.raises(ValueError):
+        web_device.complete_profile('1234')
+    assert not calls and failure.exists()
+    def failed(pin):raise ValueError('Profile not verified')
+    monkeypatch.setattr(web_device,'save_profile',failed)
+    with pytest.raises(ValueError):
+        web_device.complete_profile('1234',True)
+    assert failure.exists()
+    monkeypatch.setattr(web_device,'save_profile',lambda pin:calls.append(pin))
+    web_device.complete_profile('1234',True)
+    assert calls==['1234'] and not failure.exists()
