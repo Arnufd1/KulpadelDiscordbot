@@ -189,6 +189,9 @@ def approve_authenticator_link(client, response, soup, authorize_url, authentica
     if urlsplit(host).scheme != "wss" or urlsplit(host).hostname != "authenticator-wss.icts.kuleuven.be":
         raise RuntimeError("Unexpected Authenticator WebSocket server.")
     action = trusted_url(urljoin(str(response.url), form.get("action", "")), authorize_url)
+    prepare = getattr(authenticate_link, "prepare", None)
+    if prepare is not None:
+        prepare()
     origin = f"{urlsplit(authorize_url).scheme}://{urlsplit(authorize_url).netloc}"
     deadline = time.monotonic() + timeout
     try:
@@ -261,6 +264,11 @@ def walk_oidc(
                 if selected_passwordless:
                     raise RuntimeError("Passwordless authentication returned to the login selector.")
                 action = trusted_url(urljoin(str(response.url), selector.get("action", "")), authorize_url)
+                prepare = getattr(authenticate_link, "prepare", None)
+                if prepare is not None:
+                    # A cold Android boot must finish before requesting the
+                    # short-lived challenge, with no emulator on HTTP-only login.
+                    prepare()
                 payload = {**form_fields(selector), "_eventId_UseNextauth": "", "__Host-rememberDevice": "true"}
                 request = client.build_request("POST", action, data=payload)
                 selected_passwordless = True

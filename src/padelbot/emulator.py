@@ -1,6 +1,7 @@
-"""Start an explicitly configured local virtual Authenticator when needed."""
+"""Start the virtual Authenticator on demand and release it after login."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import re
@@ -9,13 +10,43 @@ import subprocess
 import threading
 import time
 
+from loguru import logger
+
 from .config import settings
 
 
-_start_lock = threading.Lock()
+_start_lock = threading.RLock()
 
 
-def ensure_emulator(timeout: float = 120) -> None:
+@dataclass
+class StartedEmulator:
+    """Own only the emulator process launched for this login, never a PID file."""
+    serial: str
+    process: subprocess.Popen
+
+    def close(self) -> None:
+        from .android import run_adb
+
+        with _start_lock:
+            if self.process.poll() is not None:
+                return
+            try:
+                run_adb("emu", "kill", serial=self.serial)
+            except RuntimeError:
+                logger.warning("Virtual Android did not accept shutdown; stopping its owned process.")
+            try:
+                self.process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=5)
+            logger.info("Virtual Android stopped; its CPU and memory are released.")
+
+
+def ensure_emulator(timeout: float = 120) -> StartedEmulator | None:
     if not settings.padelbot_android_emulator_autostart:
         return
     from .android import list_devices, run_adb
@@ -30,7 +61,7 @@ def ensure_emulator(timeout: float = 120) -> None:
 
     with _start_lock:
         connected = next((d for d in list_devices() if d["serial"] == serial), None)
-        process = None
+        started = None
         if connected is None:
             sdk = Path(".tools/android").resolve()
             executable = sdk / "emulator" / ("emulator.exe" if os.name == "nt" else "emulator")
@@ -46,22 +77,36 @@ def ensure_emulator(timeout: float = 120) -> None:
             environment = {**os.environ, "ANDROID_SDK_ROOT": str(sdk), "ANDROID_AVD_HOME": str(avd_home)}
             command = [str(executable), "-avd", name, "-port", match[1],
                        "-no-window", "-no-audio", "-no-boot-anim", "-no-snapshot", "-gpu", "swiftshader_indirect"]
+            if settings.padelbot_android_emulator_memory_mb is not None:
+                command += ["-memory", str(settings.padelbot_android_emulator_memory_mb)]
+            if settings.padelbot_android_emulator_cores is not None:
+                command += ["-cores", str(settings.padelbot_android_emulator_cores)]
             with (avd_home / "autostart.log").open("ab") as output:
                 process = subprocess.Popen(command, env=environment, stdin=subprocess.DEVNULL,
                     stdout=output, stderr=subprocess.STDOUT,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0)
-            (avd_home / "emulator.pid").write_text(str(process.pid), encoding="ascii")
+            started = StartedEmulator(serial, process)
         elif connected["state"] == "unauthorized":
             raise RuntimeError("The configured virtual Android is not authorized for debugging.")
 
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if process is not None and process.poll() is not None:
-                raise RuntimeError("Virtual Android stopped before startup completed; check its local log.")
-            try:
-                if run_adb("shell", "getprop", "sys.boot_completed", serial=serial).strip() == "1":
-                    return
-            except RuntimeError:
-                pass
-            time.sleep(1)
-        raise RuntimeError("Virtual Android did not finish starting; check its local log before retrying.")
+        try:
+            if started is not None:
+                (settings.padelbot_android_emulator_home / "emulator.pid").write_text(str(started.process.pid), encoding="ascii")
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if started is not None and started.process.poll() is not None:
+                    raise RuntimeError("Virtual Android stopped before startup completed; check its local log.")
+                try:
+                    if run_adb("shell", "getprop", "sys.boot_completed", serial=serial).strip() == "1":
+                        return started
+                except RuntimeError:
+                    pass
+                time.sleep(1)
+            raise RuntimeError("Virtual Android did not finish starting; check its local log before retrying.")
+        except BaseException:
+            if started is not None:
+                try:
+                    started.close()
+                except Exception as error:
+                    logger.error("Virtual Android startup cleanup failed: {}", type(error).__name__)
+            raise

@@ -56,6 +56,21 @@ PADELBOT_ANDROID_EMULATOR_HOME=./data/emulators
 
 Neem toestelidentiteit en profiel niet over voor een ander virtueel toestel. Met autostart controleert de login eerst het expliciete lokale emulatortransport en start het geregistreerde toestel alleen wanneer het ontbreekt. Een mislukt PIN-poging blijft geblokkeerd door dezelfde failure latch als de fysieke Android-route. Deze opstelling is op Windows met WHPX getest; langdurige werking en een Linux-host moeten apart worden gecontroleerd.
 
+## Tijdelijk draaien op een kleine host
+
+De bot blijft online voor Discord, maar Android hoeft niet permanent te draaien. De login controleert eerst of HTTP volstaat. Pas wanneer de IdP een Authenticator-stap vraagt, start de bot de emulator. Bij een keuzescherm gebeurt de koude start voordat de kort geldige loginlink wordt opgevraagd. Het eigen proces blijft beschikbaar tot de OIDC-uitwisseling klaar is en wordt daarna afgesloten, ook bij een mislukte login of koude start. De geregistreerde Android-schijf blijft bewaard; er wordt geen toestel gewist. Een vooraf handmatig gestart toestel wordt hergebruikt en blijft open voor kalibratie.
+
+Voor een kleine host kunnen de tijdelijke emulatorprocessen beperkt worden:
+
+```dotenv
+PADELBOT_ANDROID_EMULATOR_MEMORY_MB=1536
+PADELBOT_ANDROID_EMULATOR_CORES=1
+```
+
+Zonder deze instellingen blijft de RAM/CPU-configuratie van de gekalibreerde AVD gelden. De huidige Windows-AVD gebruikt 2048 MB en twee cores. Google documenteert 1536 MB als ondergrens voor de [`-memory`-optie](https://developer.android.com/studio/run/emulator-commandline); de werking van de eigen KUL-app met 1536 MB en één core moet nog worden gemeten. De levenscyclus, afsluiten bij fouten en proceslimieten zijn met gesimuleerde processen getest, nog niet live op Proxmox.
+
+Voor `sigma-minipc` is het doel een minimale Linux-VM zonder desktop met ongeveer 512–768 MB voor de bot in rust en voorlopig maximaal 3072 MB voor login of checkout. Dit zijn meetdoelen, geen bewezen verbruikswaarden. Gebruik CPU-type `host`, controleer nested KVM en meet dat de emulator daadwerkelijk stopt en hostgeheugen na afloop terugkomt. [Proxmox-ballooning verdeelt geheugen op basis van hostbelasting](https://lore.proxmox.com/all/20250312151506.128311-1-f.weber@proxmox.com/t/); alleen een lage minimumwaarde instellen garandeert geen onmiddellijke teruggave. Controleer daarom ook de [ondersteuning voor free-page-reporting](https://lore.proxmox.com/all/5803a37d-7308-1e0d-89f7-fc80c9b297d8@proxmox.com/t/), waarmee de guest vrije geheugenpagina's aan de host kan teruggeven. De uiteindelijke VM-instellingen volgen na controle van de host, een koude login en een herstarttest.
+
 ## Verschil met een directe protocolclient
 
 Deze opstelling gebruikt de officiële authenticator in een virtuele Android. Een zelfstandige Python- of Go-client zonder Android is nog niet geïmplementeerd. De [nextAuth-documentatie](https://docs.nextauth.com/mobile-sdk/v2/quick-start/deep-links.html) beschrijft afzonderlijke registratie- en loginlinks; het mobiele SDK handelt de authenticatie af. Het IdP-WebSocketbericht `LOGIN` is slechts het resultaat daarvan.

@@ -171,6 +171,15 @@ def login_via_android(authenticate_link: Callable[[str], None], *, fresh: bool =
             if on_failure is not None:
                 on_failure()
             raise
+        finally:
+            close = getattr(authenticate_link, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception as error:
+                    # Never discard valid tokens or replace the original login
+                    # error with a cleanup failure. Keep it visible in the log.
+                    logger.error("Android login cleanup failed: {}", type(error).__name__)
 
 
 def silent_refresh_via_session(

@@ -32,7 +32,7 @@ De Android-route is op 8 oktober 2026 met een eigen sportaccount live getest: ac
 
 Tokens worden met Fernet versleuteld in `data/tokens.enc`. `data/storage_state.json` bevat cookies en localStorage in leesbare vorm. Beide bestanden en de sleutel blijven buiten Git. De bot bewaart geen KU Leuven-wachtwoord; de HTTP-login kan ook `KULEUVEN_USERNAME`, `KULEUVEN_PASSWORD` en `KULEUVEN_AUTH_DEVICE` uit de procesomgeving lezen.
 
-Op 9 oktober 2026 zijn registratie en automatische USC-aanmelding met de officiële app op een virtuele Android live bevestigd. Ook herstel vanaf een lege sessie met een afgesloten emulator slaagt: de bot start het toestel zonder zichtbaar venster en meldt opnieuw aan. Een fysieke gsm is voor deze opstelling niet meer nodig; de host blijft draaien. Zie [software-authenticator](docs/software-authenticator.md).
+Op 9 oktober 2026 zijn registratie en automatische USC-aanmelding met de officiële app op een virtuele Android live bevestigd. Ook herstel vanaf een lege sessie met een afgesloten emulator slaagt: de bot start het toestel zonder zichtbaar venster en meldt opnieuw aan. De code start de emulator alleen bij een echte MFA-vraag en sluit een zelf gestart toestel na de loginpoging weer af, ook bij fouten; gewone HTTP-vernieuwing heeft geen emulator nodig. Deze afsluitcyclus is met gesimuleerde processen getest; verificatie op de mini-pc volgt bij installatie. Een fysieke gsm is voor deze opstelling niet meer nodig; de host blijft draaien. Zie [software-authenticator](docs/software-authenticator.md).
 
 ## Discord
 

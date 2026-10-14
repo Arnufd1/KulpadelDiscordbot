@@ -1,9 +1,10 @@
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 
 import pytest
 
-from padelbot import android, emulator
+from padelbot import android, auth, emulator
 from padelbot.config import settings
 
 
@@ -14,6 +15,8 @@ def virtual_setup(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, 'padelbot_android_serial', 'emulator-5554')
     monkeypatch.setattr(settings, 'padelbot_android_emulator_name', 'KulPadelAuth')
     monkeypatch.setattr(settings, 'padelbot_android_emulator_home', tmp_path / 'avds')
+    monkeypatch.setattr(settings, 'padelbot_android_emulator_memory_mb', None)
+    monkeypatch.setattr(settings, 'padelbot_android_emulator_cores', None)
     executable = tmp_path / '.tools/android/emulator' / ('emulator.exe' if emulator.os.name == 'nt' else 'emulator')
     executable.parent.mkdir(parents=True)
     executable.touch()
@@ -35,7 +38,7 @@ def test_autostart_uses_headless_registered_avd_and_explicit_transport(virtual_s
         requested.append(serial)
         return '1'
     monkeypatch.setattr(android, 'run_adb', probe)
-    emulator.ensure_emulator()
+    assert isinstance(emulator.ensure_emulator(), emulator.StartedEmulator)
     assert len(starts) == 1
     command, options = starts[0]
     assert command[0] == str(virtual_setup)
@@ -52,7 +55,7 @@ def test_existing_virtual_device_is_reused_without_launching_or_resetting(virtua
         {'serial': 'emulator-5554', 'state': 'device'},
     ])
     monkeypatch.setattr(emulator.subprocess, 'Popen', lambda *args, **kwargs: pytest.fail('Duplicate emulator launch'))
-    emulator.ensure_emulator()
+    assert emulator.ensure_emulator() is None
 
 
 @pytest.mark.parametrize('serial', ['physical-phone', '192.168.0.10:5554', 'emulator-5555', 'emulator-99999'])
@@ -79,3 +82,134 @@ def test_disabled_autostart_does_not_touch_android(monkeypatch):
     monkeypatch.setattr(settings, 'padelbot_android_emulator_autostart', False)
     monkeypatch.setattr(android, 'list_devices', lambda: pytest.fail('Disabled feature queried Android'))
     emulator.ensure_emulator()
+
+
+class Process:
+    pid = 123
+
+    def __init__(self, *, stubborn=False):
+        self.returncode = None
+        self.stubborn = stubborn
+        self.actions = []
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout):
+        self.actions.append(('wait', timeout))
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired('emulator', timeout)
+        return self.returncode
+
+    def terminate(self):
+        self.actions.append('terminate')
+        if not self.stubborn:
+            self.returncode = 0
+
+    def kill(self):
+        self.actions.append('kill')
+        self.returncode = 0
+
+
+def test_small_host_can_limit_the_temporary_emulator(virtual_setup, monkeypatch):
+    monkeypatch.setattr(settings, 'padelbot_android_emulator_memory_mb', 1536)
+    monkeypatch.setattr(settings, 'padelbot_android_emulator_cores', 1)
+    commands = []
+    process = Process()
+    monkeypatch.setattr(emulator.subprocess, 'Popen', lambda command, **kwargs: commands.append(command) or process)
+    started = emulator.ensure_emulator()
+    assert started.process is process
+    assert commands[0][commands[0].index('-memory') + 1] == '1536'
+    assert commands[0][commands[0].index('-cores') + 1] == '1'
+
+
+@pytest.mark.parametrize('mode', ['graceful', 'terminate', 'kill'])
+def test_shutdown_releases_only_the_owned_process_even_when_adb_fails(monkeypatch, mode):
+    process = Process(stubborn=mode == 'kill')
+    commands = []
+    def adb(*args, serial):
+        commands.append((args, serial))
+        if mode != 'graceful':
+            raise RuntimeError('ADB unavailable')
+        process.returncode = 0
+    monkeypatch.setattr(android, 'run_adb', adb)
+    started = emulator.StartedEmulator('emulator-5554', process)
+    started.close()
+    assert commands == [(('emu', 'kill'), 'emulator-5554')]
+    assert process.returncode == 0
+    assert ('terminate' in process.actions) == (mode != 'graceful')
+    assert ('kill' in process.actions) == (mode == 'kill')
+    previous = process.actions.copy()
+    started.close()
+    assert process.actions == previous  # Repeated cleanup never targets another process.
+
+
+def test_failed_cold_boot_still_stops_the_launched_emulator(virtual_setup, monkeypatch):
+    process = Process()
+    monkeypatch.setattr(emulator.subprocess, 'Popen', lambda *a, **kw: process)
+    commands = []
+    def adb(*args, serial):
+        commands.append((args, serial))
+        process.returncode = 0
+    monkeypatch.setattr(android, 'run_adb', adb)
+    with pytest.raises(RuntimeError, match='did not finish'):
+        emulator.ensure_emulator(timeout=0)
+    assert commands == [(('emu', 'kill'), 'emulator-5554')]
+    assert process.returncode == 0
+
+
+def test_reused_http_session_does_not_boot_or_probe_android(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, 'padelbot_android_failure_file', tmp_path / 'failure')
+    monkeypatch.setattr(emulator, 'ensure_emulator', lambda: pytest.fail('HTTP-only login booted Android'))
+    monkeypatch.setattr(android, 'doctor', lambda: pytest.fail('HTTP-only login probed Android'))
+    token = object()
+    def http_login(path, **kwargs):
+        assert kwargs['use_saved_session'] is True
+        return token
+    monkeypatch.setattr(auth, '_http_login', http_login)
+    assert auth.login_via_android(android.AndroidApprover(manual=True)) is token
+
+
+@pytest.mark.parametrize('failure', [None, 'device', 'login'])
+def test_login_releases_emulator_after_exchange_and_on_failures(tmp_path, monkeypatch, failure):
+    monkeypatch.setattr(settings, 'padelbot_android_failure_file', tmp_path / 'failure')
+    events = []
+    def start():
+        events.append('start')
+        return SimpleNamespace(close=lambda: events.append('stop'))
+    monkeypatch.setattr(emulator, 'ensure_emulator', start)
+    def doctor():
+        if failure == 'device':
+            raise RuntimeError('device failed')
+        return {'serial': 'emulator-5554', 'app_version': '1'}
+    monkeypatch.setattr(android, 'doctor', doctor)
+    token = object()
+    def http_login(path, *, authenticate_link, **kwargs):
+        authenticate_link.prepare()
+        authenticate_link.prepare()  # Preparing a selector and its QR page boots once.
+        events.append('exchange')
+        assert 'stop' not in events
+        if failure == 'login':
+            raise RuntimeError('login failed')
+        return token
+    monkeypatch.setattr(auth, '_http_login', http_login)
+    if failure:
+        with pytest.raises(RuntimeError, match=failure + ' failed'):
+            auth.login_via_android(android.AndroidApprover(manual=True))
+    else:
+        assert auth.login_via_android(android.AndroidApprover(manual=True)) is token
+    assert events == (['start', 'stop'] if failure == 'device' else ['start', 'exchange', 'stop'])
+
+
+def test_cleanup_error_does_not_lose_successful_tokens_or_mask_login_error(tmp_path, monkeypatch):
+    def cleanup():
+        raise RuntimeError('shutdown failed')
+    provider = SimpleNamespace(close=cleanup)
+    token = object()
+    monkeypatch.setattr(auth, '_http_login', lambda *a, **kw: token)
+    assert auth.login_via_android(provider) is token
+    def failed_login(*a, **kw):
+        raise ValueError('original login error')
+    monkeypatch.setattr(auth, '_http_login', failed_login)
+    with pytest.raises(ValueError, match='original login error'):
+        auth.login_via_android(provider)

@@ -244,18 +244,13 @@ class AndroidApprover:
         self.manual = manual
         self.attempted_pin = False
         self.used = False
+        self.device_info = None
+        self._emulator = None
         if not manual and settings.padelbot_android_failure_file.exists():
             raise RuntimeError("An earlier Android PIN attempt failed. Check the app, then run android reset-failure.")
-        from .emulator import ensure_emulator
-        ensure_emulator()
-        self.device_info = doctor()
         self.profile = None if manual else read_profile()
         self.pin = None
         if self.profile is not None:
-            identity_key = "device_id" if self.profile.get("device_id") else "serial"
-            if (self.profile[identity_key] != self.device_info.get(identity_key)
-                    or self.profile["app_version"] != self.device_info["app_version"]):
-                raise RuntimeError("Android device or app version changed. Recalibrate before automatic approval.")
             if any(step["action"] == "pin" for step in self.profile["steps"]):
                 self.pin = AndroidPinStore(settings.padelbot_key_file, settings.padelbot_android_pin_file).load()
                 if self.pin is None:
@@ -263,6 +258,26 @@ class AndroidApprover:
                 for step in self.profile["steps"]:
                     if step["action"] == "pin" and step.get("length") and len(self.pin) != step["length"]:
                         raise RuntimeError("Stored app PIN length differs from the calibrated keypad. Run android set-pin again.")
+
+    def prepare(self) -> None:
+        """Boot Android only when the IdP actually asks for authentication."""
+        if self.device_info is not None:
+            return
+        from .emulator import ensure_emulator
+        self._emulator = ensure_emulator()
+        info = doctor()
+        if self.profile is not None:
+            identity_key = "device_id" if self.profile.get("device_id") else "serial"
+            if (self.profile[identity_key] != info.get(identity_key)
+                    or self.profile["app_version"] != info["app_version"]):
+                raise RuntimeError("Android device or app version changed. Recalibrate before automatic approval.")
+        self.device_info = info
+
+    def close(self) -> None:
+        """Release a login-owned emulator; leave manually started devices alone."""
+        if self._emulator is not None:
+            self._emulator.close()
+            self._emulator = None
 
     def _enter_keypad(self, device, step: dict) -> None:
         empty = device(packageName=PACKAGE, **step["empty_selector"])
@@ -301,6 +316,7 @@ class AndroidApprover:
         if self.used:
             raise RuntimeError("This Android login has already been attempted; no approval retry was made.")
         self.used = True
+        self.prepare()
         device = connect_device(self.device_info["serial"])
         # Repeated deep links can leave old confirmation activities underneath
         # the current one. Start this challenge with only its own app UI alive.

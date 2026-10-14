@@ -121,6 +121,13 @@ def test_profile_refuses_arbitrary_actions_and_unbounded_selectors(tmp_path, mon
 def test_passwordless_flow_binds_exact_link_and_never_submits_password(monkeypatch):
     import websocket
     events = []
+    class Provider:
+        ready = False
+        def prepare(self):
+            if not self.ready:
+                events.append("prepared")
+                self.ready = True
+        def __call__(self, link): events.append(link)
     class Socket:
         def send(self, value): events.append(value)
         def settimeout(self, value): pass
@@ -137,14 +144,15 @@ def test_passwordless_flow_binds_exact_link_and_never_submits_password(monkeypat
         assert "password" not in data and "nextauthAccountId" not in data
         if request.method == "GET": return httpx.Response(200, text=selector)
         if "_eventId_UseNextauth" in data:
+            assert events == ["prepared"]  # Cold boot finishes before creating the challenge.
             assert data["csrf_token"] == ["csrf"]
             return httpx.Response(200, text=qr)
-        assert events == ["REGISTER register server", LINK]
+        assert events == ["prepared", "REGISTER register server", LINK]
         assert data["csrf_token"] == ["qr-csrf"]
         return httpx.Response(302, headers={"Location": callback})
     with httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True) as client:
         result = idp.walk_oidc(client, ORIGIN + "/idp/profile/oidc/authorize", settings.kul_redirect_uri,
-                               {"cookies": [], "origins": []}, authenticate_link=lambda link: events.append(link))
+                               {"cookies": [], "origins": []}, authenticate_link=Provider())
     assert result == callback
     assert len(requests) == 3
     assert events[-1] == "closed"
@@ -164,7 +172,7 @@ def test_android_profile_is_bound_to_serial_and_app_version(tmp_path, monkeypatc
     monkeypatch.setattr(android, "doctor", lambda: {"serial": "different-device", "app_version": "1"})
     monkeypatch.setattr(android, "read_profile", lambda: {"serial": "known-device", "app_version": "1", "steps": [{"action": "click"}]})
     with pytest.raises(RuntimeError, match="Recalibrate"):
-        android.AndroidApprover()
+        android.AndroidApprover().prepare()
 
 
 def test_android_profile_follows_same_handset_but_rejects_different_device_id(tmp_path, monkeypatch):
@@ -172,10 +180,12 @@ def test_android_profile_follows_same_handset_but_rejects_different_device_id(tm
     info = {"serial": "wifi:new-port", "device_id": "registered-phone", "app_version": "1"}
     monkeypatch.setattr(android, "doctor", lambda: info)
     monkeypatch.setattr(android, "read_profile", lambda: {"device_id": "registered-phone", "app_version": "1", "steps": [{"action": "click"}]})
-    assert android.AndroidApprover().device_info["serial"] == "wifi:new-port"
+    approver = android.AndroidApprover()
+    approver.prepare()
+    assert approver.device_info["serial"] == "wifi:new-port"
     info["device_id"] = "different-phone"
     with pytest.raises(RuntimeError, match="Recalibrate"):
-        android.AndroidApprover()
+        android.AndroidApprover().prepare()
 
 
 def test_inspection_does_not_report_success_for_app_behind_lock_screen(tmp_path, monkeypatch):

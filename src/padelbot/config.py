@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     padelbot_android_emulator_autostart: bool = False
     padelbot_android_emulator_name: str = "KulPadelAuth"
     padelbot_android_emulator_home: Path = Path("./data/emulators")
+    padelbot_android_emulator_memory_mb: int | None = Field(default=None, ge=1536, le=8192)
+    padelbot_android_emulator_cores: int | None = Field(default=None, ge=1, le=8)
 
     discord_webhook_url: str = ""
     discord_bot_token: str = ""
