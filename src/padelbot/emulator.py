@@ -11,6 +11,7 @@ import threading
 import time
 
 from loguru import logger
+from filelock import FileLock
 
 from .config import settings
 
@@ -42,6 +43,7 @@ class StartedEmulator:
     process: subprocess.Popen
     cache_roots: tuple[Path, ...] = ()
     _closed: bool = field(default=False, init=False, repr=False)
+    lease: object | None = field(default=None, repr=False)
 
     def close(self) -> None:
         from .android import run_adb
@@ -65,10 +67,30 @@ class StartedEmulator:
                         self.process.wait(timeout=5)
             _release_file_cache(self.cache_roots)
             self._closed = True
+            if self.lease is not None:
+                self.lease.release()
             logger.info("Virtual Android stopped; its CPU and memory are released.")
 
 
 def ensure_emulator(timeout: float = 120) -> StartedEmulator | None:
+    if not settings.padelbot_android_emulator_autostart:
+        return None
+    settings.padelbot_emulator_lock_file.parent.mkdir(parents=True, exist_ok=True)
+    lease = FileLock(settings.padelbot_emulator_lock_file, timeout=600)
+    lease.acquire()
+    try:
+        started = _ensure_emulator(timeout)
+        if started is None:
+            lease.release()
+        else:
+            started.lease = lease
+        return started
+    except BaseException:
+        lease.release()
+        raise
+
+
+def _ensure_emulator(timeout: float = 120) -> StartedEmulator | None:
     if not settings.padelbot_android_emulator_autostart:
         return
     from .android import list_devices, run_adb
@@ -110,6 +132,10 @@ def ensure_emulator(timeout: float = 120) -> StartedEmulator | None:
             started = StartedEmulator(serial, process, (avd_home / f"{name}.avd", sdk))
         elif connected["state"] == "unauthorized":
             raise RuntimeError("The configured virtual Android is not authorized for debugging.")
+        elif connected["state"] == "device":
+            active_name = run_adb("emu", "avd", "name", serial=serial).splitlines()[0].strip()
+            if active_name != name:
+                raise RuntimeError("Another user's virtual Android is active; wait for its session to finish.")
 
         try:
             if started is not None:

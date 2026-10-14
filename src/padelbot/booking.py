@@ -12,6 +12,7 @@ from typing import Any, Callable
 from loguru import logger
 
 from .client import BackboneClient
+from .config import settings
 from .cart import ensure_cart_item, cleanup_slot_cart
 
 # Constants from HAR — these are stable system values, not per-user.
@@ -598,6 +599,25 @@ class BookingPriceChangedError(RuntimeError):
 
 
 def book(
+    client: BackboneClient,
+    slot: Slot,
+    *,
+    member_id: int,
+    auto_pay: bool = True,
+    me: dict | None = None,
+    label: str | None = None,
+    on_3ds_challenge: Callable[[], None] | None = None,
+    expected_amount: Decimal | None = None,
+) -> BookingResult:
+    """Serialize the complete cart/checkout transaction across Discord and web workers."""
+    from filelock import FileLock
+    settings.padelbot_rules_file.parent.mkdir(parents=True,exist_ok=True)
+    with FileLock(str(settings.padelbot_rules_file)+".booking.lock",timeout=180):
+        return _book(client,slot,member_id=member_id,auto_pay=auto_pay,me=me,label=label,
+                     on_3ds_challenge=on_3ds_challenge,expected_amount=expected_amount)
+
+
+def _book(
     client: BackboneClient,
     slot: Slot,
     *,

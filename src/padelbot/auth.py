@@ -198,7 +198,9 @@ def silent_refresh_via_session(
 
 def renew_access_token(store: TokenStore) -> str:
     """Force renewal and persist tokens under the shared process lock."""
-    with _renewal_lock:
+    from filelock import FileLock
+    store.blob_file.parent.mkdir(parents=True, exist_ok=True)
+    with _renewal_lock, FileLock(str(store.blob_file) + ".renew.lock", timeout=300):
         bundle = store.load()
         if bundle is None:
             raise RuntimeError("No tokens stored — run `padelbot login` first.")

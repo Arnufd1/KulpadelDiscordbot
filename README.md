@@ -1,6 +1,8 @@
-# KU Leuven Padel Discord Bot
+# Sigmadvisor Padel Tool
 
 Python-bot om padelvelden van KU Leuven Sport via Discord te bekijken en te reserveren, met wekelijkse regels, meldingen bij vrijgekomen slots, gedeelde reservaties en automatische betaling. De gecontroleerde authenticatie, betalingen en Linux-hosting staan hieronder beschreven.
+
+De persoonlijke webapp voor `padel.sigmadvisor.com` draait op de mini-pc en gebruikt Google-login, gescheiden gebruikersprofielen, een gedeelde emulator die op aanvraag start, en privébeheer via Tailscale. Installatie, betalingsmogelijkheden en resterende verificatie staan in [web-hosting](docs/web-hosting.md).
 
 ## Snel starten op Windows
 

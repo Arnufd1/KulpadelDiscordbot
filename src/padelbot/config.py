@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -30,6 +31,7 @@ class Settings(BaseSettings):
     padelbot_android_emulator_home: Path = Path("./data/emulators")
     padelbot_android_emulator_memory_mb: int | None = Field(default=None, ge=1536, le=8192)
     padelbot_android_emulator_cores: int | None = Field(default=None, ge=1, le=8)
+    padelbot_emulator_lock_file: Path = Path("./data/emulator.lock")
 
     discord_webhook_url: str = ""
     discord_bot_token: str = ""
@@ -64,4 +66,4 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
 
-settings = Settings()
+settings = Settings(_env_file=os.environ.get("PADELBOT_ENV_FILE", ".env") or None)

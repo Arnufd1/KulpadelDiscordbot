@@ -1,0 +1,14 @@
+[Unit]
+Description=Sigmadvisor private Tailscale admin verification
+After=network-online.target tailscaled.service
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/lib/padel-tail-proxy.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+UMask=0077
+[Install]
+WantedBy=multi-user.target

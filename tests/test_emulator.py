@@ -24,7 +24,7 @@ def virtual_setup(tmp_path, monkeypatch):
     settings.padelbot_android_emulator_home.mkdir()
     (settings.padelbot_android_emulator_home / 'KulPadelAuth.ini').write_text('path=registered-avd')
     monkeypatch.setattr(android, 'list_devices', lambda: [])
-    monkeypatch.setattr(android, 'run_adb', lambda *args, **kwargs: '1')
+    monkeypatch.setattr(android, 'run_adb', lambda *args, **kwargs: 'KulPadelAuth\nOK' if args == ('emu', 'avd', 'name') else '1')
     return executable
 
 
@@ -57,6 +57,13 @@ def test_existing_virtual_device_is_reused_without_launching_or_resetting(virtua
     ])
     monkeypatch.setattr(emulator.subprocess, 'Popen', lambda *args, **kwargs: pytest.fail('Duplicate emulator launch'))
     assert emulator.ensure_emulator() is None
+
+
+def test_other_tenants_emulator_is_never_borrowed(virtual_setup,monkeypatch):
+    monkeypatch.setattr(android,'list_devices',lambda:[{'serial':'emulator-5554','state':'device'}])
+    monkeypatch.setattr(android,'run_adb',lambda *a,**kw:'OtherTenant\nOK')
+    with pytest.raises(RuntimeError,match="Another user's"):
+        emulator.ensure_emulator()
 
 
 @pytest.mark.parametrize('serial', ['physical-phone', '192.168.0.10:5554', 'emulator-5555', 'emulator-99999'])
