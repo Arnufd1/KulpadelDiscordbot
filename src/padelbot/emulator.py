@@ -1,7 +1,7 @@
 """Start the virtual Authenticator on demand and release it after login."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import re
@@ -18,31 +18,53 @@ from .config import settings
 _start_lock = threading.RLock()
 
 
+def _release_file_cache(roots: tuple[Path, ...]) -> None:
+    """Let a Linux guest return unused Android file pages to its hypervisor."""
+    if not hasattr(os, "posix_fadvise"):
+        return
+    for root in roots:
+        for path in root.rglob("*"):
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                with path.open("rb") as stream:
+                    os.posix_fadvise(stream.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+            except OSError:
+                # This is advisory: a busy, removed or unreadable file must not
+                # turn a completed login into a failure or alter any disk data.
+                continue
+
+
 @dataclass
 class StartedEmulator:
     """Own only the emulator process launched for this login, never a PID file."""
     serial: str
     process: subprocess.Popen
+    cache_roots: tuple[Path, ...] = ()
+    _closed: bool = field(default=False, init=False, repr=False)
 
     def close(self) -> None:
         from .android import run_adb
 
         with _start_lock:
-            if self.process.poll() is not None:
+            if self._closed:
                 return
-            try:
-                run_adb("emu", "kill", serial=self.serial)
-            except RuntimeError:
-                logger.warning("Virtual Android did not accept shutdown; stopping its owned process.")
-            try:
-                self.process.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                self.process.terminate()
+            if self.process.poll() is None:
                 try:
-                    self.process.wait(timeout=5)
+                    run_adb("emu", "kill", serial=self.serial)
+                except RuntimeError:
+                    logger.warning("Virtual Android did not accept shutdown; stopping its owned process.")
+                try:
+                    self.process.wait(timeout=15)
                 except subprocess.TimeoutExpired:
-                    self.process.kill()
-                    self.process.wait(timeout=5)
+                    self.process.terminate()
+                    try:
+                        self.process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        self.process.kill()
+                        self.process.wait(timeout=5)
+            _release_file_cache(self.cache_roots)
+            self._closed = True
             logger.info("Virtual Android stopped; its CPU and memory are released.")
 
 
@@ -85,7 +107,7 @@ def ensure_emulator(timeout: float = 120) -> StartedEmulator | None:
                 process = subprocess.Popen(command, env=environment, stdin=subprocess.DEVNULL,
                     stdout=output, stderr=subprocess.STDOUT,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0)
-            started = StartedEmulator(serial, process)
+            started = StartedEmulator(serial, process, (avd_home / f"{name}.avd", sdk))
         elif connected["state"] == "unauthorized":
             raise RuntimeError("The configured virtual Android is not authorized for debugging.")
 

@@ -1,6 +1,6 @@
 # Authenticator zonder fysieke telefoon
 
-Status op 9 oktober 2026: registratie, een volledig automatische nieuwe USC-login en herstel na sessieverloop zijn live bevestigd met de officiële KUL-app in een virtuele Android. De actieve Discord-bot gebruikt deze route. De fysieke gsm is voor deze bot niet meer nodig; de host-pc en virtuele Android blijven wel nodig.
+Status op 14 oktober 2026: de Discord-bot draait in een Ubuntu-VM op Proxmox. De geregistreerde virtuele Android is vanaf de Windows-host overgezet. Een volledig nieuwe USC-login vanaf een afgesloten emulator, dezelfde KUL-account, toegang tot de API en automatisch afsluiten na de login zijn live bevestigd. De Windows-pc en fysieke gsm zijn voor deze host niet nodig. Alleen de bot blijft permanent draaien; Android start wanneer MFA nodig is.
 
 ## Wat daadwerkelijk is gecontroleerd
 
@@ -9,6 +9,7 @@ Status op 9 oktober 2026: registratie, een volledig automatische nieuwe USC-logi
 - De ongewijzigde APK is via de normale accountprocedure als extra toestel geregistreerd. Een nieuwe USC-login bevestigde zelfstandig de accountkeuze en voerde de lokaal versleutelde PIN één keer in. OIDC-uitwisseling, dezelfde accountidentiteit en toegang tot `/auth` zijn gecontroleerd.
 - Een tweede test begon met een verlopen testtoken, lege cookies/localStorage en een afgesloten emulator. De normale `renew_access_token`-route startte de emulator met `-no-window`, meldde opnieuw aan en bereikte `/auth`. De PIN-stap volgde op het laden van het geregistreerde account en het verschijnen van de juiste bevestigingsschermen.
 - Binaries staan onder `.tools/android/` en `.tools/authenticator-apk/`. De virtuele schijf en logs staan onder `data/emulators/`. Deze mappen zijn genegeerd door Git.
+- Op 14 oktober is de geregistreerde AVD offline overgezet naar dezelfde emulatorversie op Linux (37.2.12, build 16428233) en dezelfde API 35 / Google APIs / x86_64-image (revisie 9). Nested KVM is gecontroleerd. De verse login en API-controle duurden samen ongeveer 57 seconden, inclusief koude start en automatisch afsluiten. Het beschikbaarheidsoverzicht voor dag 0 t/m 5 is daarna via de echte API gecontroleerd.
 
 ## Eenmalige registratie
 
@@ -54,7 +55,7 @@ PADELBOT_ANDROID_EMULATOR_NAME=KulPadelAuth
 PADELBOT_ANDROID_EMULATOR_HOME=./data/emulators
 ```
 
-Neem toestelidentiteit en profiel niet over voor een ander virtueel toestel. Met autostart controleert de login eerst het expliciete lokale emulatortransport en start het geregistreerde toestel alleen wanneer het ontbreekt. Een mislukt PIN-poging blijft geblokkeerd door dezelfde failure latch als de fysieke Android-route. Deze opstelling is op Windows met WHPX getest; langdurige werking en een Linux-host moeten apart worden gecontroleerd.
+Neem toestelidentiteit en profiel niet over voor een ander virtueel toestel. Bij het verplaatsen van dezelfde geregistreerde AVD moet de bron afgesloten zijn en blijven userdata, encryptieschijf en relatieve qcow2-backingreferenties samen behouden. Een onnodige wijziging van die referenties kan de emulator een nieuwe gegevenslaag laten maken. Met autostart controleert de login eerst het expliciete lokale emulatortransport en start het geregistreerde toestel alleen wanneer het ontbreekt. Een mislukte PIN-poging blijft geblokkeerd door dezelfde failure latch als de fysieke Android-route. Windows met WHPX en Linux met nested KVM zijn getest; langdurige werking wordt na ingebruikname verder gevolgd.
 
 ## Tijdelijk draaien op een kleine host
 
@@ -63,13 +64,17 @@ De bot blijft online voor Discord, maar Android hoeft niet permanent te draaien.
 Voor een kleine host kunnen de tijdelijke emulatorprocessen beperkt worden:
 
 ```dotenv
-PADELBOT_ANDROID_EMULATOR_MEMORY_MB=1536
+PADELBOT_ANDROID_EMULATOR_MEMORY_MB=2560
 PADELBOT_ANDROID_EMULATOR_CORES=1
 ```
 
-Zonder deze instellingen blijft de RAM/CPU-configuratie van de gekalibreerde AVD gelden. De huidige Windows-AVD gebruikt 2048 MB en twee cores. Google documenteert 1536 MB als ondergrens voor de [`-memory`-optie](https://developer.android.com/studio/run/emulator-commandline); de werking van de eigen KUL-app met 1536 MB en één core moet nog worden gemeten. De levenscyclus, afsluiten bij fouten en proceslimieten zijn met gesimuleerde processen getest, nog niet live op Proxmox.
+Zonder deze instellingen blijft de RAM/CPU-configuratie van de gekalibreerde AVD gelden. Google documenteert 1536 MB als ondergrens voor de [`-memory`-optie](https://developer.android.com/studio/run/emulator-commandline), maar de gebruikte emulator/image verhoogt kleinere verzoeken zelf naar 2560 MB. De Linux-configuratie vraagt daarom expliciet 2560 MB en één core. De oude Windows-AVD vroeg 2048 MB en twee cores. Een VM-plafond van 3 GB bleek te laag voor de koude start met alle emulatoroverhead.
 
-Voor `sigma-minipc` is het doel een minimale Linux-VM zonder desktop met ongeveer 512–768 MB voor de bot in rust en voorlopig maximaal 3072 MB voor login of checkout. Dit zijn meetdoelen, geen bewezen verbruikswaarden. Gebruik CPU-type `host`, controleer nested KVM en meet dat de emulator daadwerkelijk stopt en hostgeheugen na afloop terugkomt. [Proxmox-ballooning verdeelt geheugen op basis van hostbelasting](https://lore.proxmox.com/all/20250312151506.128311-1-f.weber@proxmox.com/t/); alleen een lage minimumwaarde instellen garandeert geen onmiddellijke teruggave. Controleer daarom ook de [ondersteuning voor free-page-reporting](https://lore.proxmox.com/all/5803a37d-7308-1e0d-89f7-fc80c9b297d8@proxmox.com/t/), waarmee de guest vrije geheugenpagina's aan de host kan teruggeven. De uiteindelijke VM-instellingen volgen na controle van de host, een koude login en een herstarttest.
+De Proxmox-opstelling gebruikt een minimale Ubuntu Server 24.04-VM zonder desktop: CPU-type `host`, twee gedeelde vCPU's, een dun toegewezen schijf van 24 GB en 4096 MB beschikbaar guestgeheugen. `balloon=4096` houdt dat geheugen bereikbaar voor de korte Android-piek. Een lage automatische balloon-minimumwaarde bleek de emulator vóór de start te blokkeren, omdat de guest op dat moment te weinig beschikbaar geheugen zag.
+
+Het fysieke hostverbruik wordt beperkt met [free-page-reporting](https://docs.kernel.org/mm/free_page_reporting.html), dat in de QEMU-balloondevice aanstaat. [De guest kan daarmee ongebruikte pagina's aan Proxmox teruggeven](https://lore.proxmox.com/all/5803a37d-7308-1e0d-89f7-fc80c9b297d8@proxmox.com/t/). De configuratie [deploy/padelbot-memory.conf](../deploy/padelbot-memory.conf) stelt de minimale rapportageblokgrootte in op 64 KiB (`page_reporting_order=4`), zodat ook kleinere vrije blokken na Android-gebruik terugkomen. Na afsluiten adviseert de bot Linux bovendien de ongebruikte SDK- en AVD-bestandscache vrij te geven. De schijfgegevens blijven behouden.
+
+Op 14 oktober is na een VM-herstart gecontroleerd dat Discord, tokenvernieuwing, de echte API en het zesdaagse overzicht zelfstandig terugkomen, met één actieve bot en zonder draaiende emulator. In een aparte koude start/stop-cyclus piekte het fysieke host-RSS op ongeveer 3599 MiB en daalde het na afsluiten naar 757 MiB; direct na de herstart was dat ongeveer 727 MiB. Dit zijn momentopnamen, geen gegarandeerde vaste waarden. De botservice zelf gebruikte circa 60–100 MB. De Linux-testsuite bevatte 465 geslaagde tests.
 
 ## Verschil met een directe protocolclient
 

@@ -1,0 +1,31 @@
+[Unit]
+Description=KUL Padel Discord bot
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=padelbot
+Group=padelbot
+SupplementaryGroups=kvm
+WorkingDirectory=/opt/padelbot
+Environment=HOME=/var/lib/padelbot
+Environment=ANDROID_USER_HOME=/var/lib/padelbot/.android
+Environment=ANDROID_EMULATOR_FEATURES=-Vulkan
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/padelbot/.tools/playwright
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/padelbot/.venv/bin/python -m padelbot.cli discord
+Restart=always
+RestartSec=10
+TimeoutStopSec=45
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/padelbot/data /var/lib/padelbot
+
+[Install]
+WantedBy=multi-user.target

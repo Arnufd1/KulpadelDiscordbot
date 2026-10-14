@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import subprocess
 from types import SimpleNamespace
 
@@ -213,3 +214,25 @@ def test_cleanup_error_does_not_lose_successful_tokens_or_mask_login_error(tmp_p
     monkeypatch.setattr(auth, '_http_login', failed_login)
     with pytest.raises(ValueError, match='original login error'):
         auth.login_via_android(provider)
+
+
+@pytest.mark.parametrize('advice_fails', [False, True])
+def test_shutdown_releases_linux_file_cache_after_exit_without_modifying_disks(tmp_path, monkeypatch, advice_fails):
+    process = Process()
+    image = tmp_path / 'registered-disk.img'
+    original = b'registered Android state must remain unchanged'
+    image.write_bytes(original)
+    calls = []
+    def advise(fd, offset, length, advice):
+        assert process.poll() is not None, 'Never evict the running emulator\'s cache.'
+        calls.append(os.fstat(fd).st_size)
+        if advice_fails:
+            raise OSError('Advisory cache release unavailable')
+    monkeypatch.setattr(emulator.os, 'posix_fadvise', advise, raising=False)
+    monkeypatch.setattr(emulator.os, 'POSIX_FADV_DONTNEED', 4, raising=False)
+    monkeypatch.setattr(android, 'run_adb', lambda *a, **kw: setattr(process, 'returncode', 0))
+    started = emulator.StartedEmulator('emulator-5554', process, (tmp_path,))
+    started.close()
+    started.close()
+    assert calls == [len(original)]
+    assert image.read_bytes() == original

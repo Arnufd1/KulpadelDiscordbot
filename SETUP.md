@@ -97,3 +97,23 @@ cp .env.example .env
 HTTP-login en sessievernieuwing hebben geen Chromium nodig. Voor de Worldline-kaartdriver moet je de browserafhankelijkheden wel installeren. Voer de bot met een procesbeheerder zoals systemd uit vanuit de projectmap, zodat `.env` en `data/` gevonden worden.
 
 Cookies en localStorage in `data/storage_state.json` zijn niet versleuteld. Beperk toegang tot de projectmap; deel sessiebestanden, `.env`, sleutels en HAR-captures niet. Linux-gebruikers kunnen `chmod 700 data` en `chmod 600 data/* .env` toepassen. Stel op Windows toegang via bestandsrechten in.
+
+## Linux-service op Proxmox
+
+De geteste opstelling gebruikt Ubuntu Server 24.04, een eigen systeemgebruiker `padelbot` met home `/var/lib/padelbot` en aanvullend lidmaatschap van de groep `kvm`. De code, venv, Android SDK en persistente gegevens staan onder `/opt/padelbot`. `.env` en `data/` zijn alleen toegankelijk voor deze gebruiker; de bestaande master key hoort bij de versleutelde tokens, kaart en app-PIN. Het overzetten van een werkende installatie maakt geen nieuwe sleutel aan.
+
+Installeer de Python-extras `login` en `android`. Headless Chromium en zijn systeembibliotheken zijn nodig voor de kaartdriver; de geteste installatie gebruikt `PLAYWRIGHT_BROWSERS_PATH=/opt/padelbot/.tools/playwright` en `python -m playwright install --with-deps --only-shell chromium`. De Android SDK staat onder `.tools/android`, de geregistreerde AVD onder `data/emulators` en de bijbehorende ADB-sleutel onder `/var/lib/padelbot/.android`. Zie [software-authenticator](docs/software-authenticator.md) voor de gecontroleerde image en tijdelijke RAM/CPU-instellingen.
+
+Als de bestanden en gebruikersrechten klaarstaan, installeer de service vanuit de projectmap:
+
+```bash
+sudo install -m 644 deploy/padelbot.service /etc/systemd/system/padelbot.service
+sudo install -m 644 deploy/padelbot-memory.conf /etc/tmpfiles.d/padelbot-memory.conf
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/padelbot-memory.conf
+sudo systemctl daemon-reload
+sudo systemctl enable --now padelbot.service
+```
+
+De service start zonder aangemelde gebruiker en herstart bij fouten. Bij stoppen sluit systemd ook achtergebleven emulatorprocessen in dezelfde procesgroep. De bot start Android uitsluitend bij een echte MFA-stap en sluit zijn eigen emulator na die poging weer af. Gewone HTTP-vernieuwing gebruikt geen Android. De service zet Vulkan uit voor de eenvoudige Authenticator-schermen en bewaart logs in journald.
+
+Controleer met `systemctl status padelbot.service`, `journalctl -u padelbot.service -f` en een API-opvraging. Een herstarttest controleert automatisch opkomen, dezelfde opgeslagen regels en een afgesloten emulator zolang geen MFA nodig is. Schakel bij migratie de Windows-bewaker en autostart uit voordat de Linux-bot actief wordt, zodat één bot de opgeslagen boekingsregels uitvoert.
