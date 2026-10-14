@@ -50,7 +50,7 @@ def execute(kind: str, payload: dict) -> dict:
     global _reservation_started
     _reservation_started=False
     from .client import BackboneClient
-    from .booking import find_slots_window, find_slots, book
+    from .booking import find_slots_window, find_slots, book, get_product_names
     from .booking_manager import list_my_bookings
     from .checkout import slot_price
     from .rules_store import RulesStore
@@ -73,8 +73,9 @@ def execute(kind: str, payload: dict) -> dict:
                 raise ValueError("Kies een dag of periode tussen 0 en 30.")
             today = datetime.now(ZoneInfo("Europe/Brussels"))
             slots = find_slots_window(client,start_date=today+timedelta(days=start),days=end-start+1)
+            names=get_product_names(client,{s.bookable_product_id for s in slots})
             return {"slots":[{"product":s.bookable_product_id,"court":s.bookable_linked_product_id,
-                              "start":s.start_iso,"end":s.end_iso,"price":s.price} for s in slots if s.start_dt>today]}
+                              "start":s.start_iso,"end":s.end_iso,"price":s.price,'name':names.get(s.bookable_product_id,'Padel')} for s in slots if s.start_dt>today]}
         if kind == "bookings":
             return {"bookings":[{"id":b.id,"sale_id":b.sale_id,"description":b.description,
                                  "start":b.start_iso,"end":b.end_iso,"paid":b.paid_for}
@@ -97,14 +98,15 @@ def execute(kind: str, payload: dict) -> dict:
                 return {"skipped":True}
             slot = find_rule_slot(slots,rule,target.date())
         else:
-            slot = next((s for s in slots if s.start_dt==target and s.bookable_linked_product_id==int(payload["court"])),None)
+            slot = next((s for s in slots if s.start_dt==target and s.bookable_linked_product_id==int(payload["court"])
+                         and s.bookable_product_id==int(payload['product'])),None)
         if slot is None:
             if kind=='rule':
                 return {'waiting':True,'message':'Nog geen terrein vrij binnen je venster. We blijven controleren.'}
             raise ValueError("Dit tijdstip is niet meer vrij. Vernieuw de beschikbaarheid.")
         amount = slot_price(client,slot,me)
         if kind=="quote":
-            return {"amount":str(amount),"court":slot.bookable_linked_product_id,"target":slot.start_iso,
+            return {"amount":str(amount),"product":slot.bookable_product_id,"court":slot.bookable_linked_product_id,"target":slot.start_iso,
                     "payment":payment_summary(me)}
         maximum = Decimal(str(prefs.get("max_amount",0)))
         if amount>maximum or maximum<=0:

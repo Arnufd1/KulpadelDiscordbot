@@ -60,6 +60,7 @@ class PreferencesRequest(BaseModel):
 
 class BookingRequest(BaseModel):
     target: str = Field(max_length=40)
+    product: int = Field(gt=0)
     court: int = Field(gt=0)
     amount: float = Field(gt=0,le=100)
 
@@ -279,7 +280,7 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
 
     @app.post("/api/book")
     def book(body:BookingRequest,user=Depends(current)):
-        return enqueue(user,"book",body.model_dump(),f"manual:{user['id']}:{body.court}:{body.target}")
+        return enqueue(user,"book",body.model_dump(),f"manual:{user['id']}:{body.product}:{body.court}:{body.target}")
 
     @app.post("/api/quote")
     def quote(body:BookingRequest,user=Depends(current)):

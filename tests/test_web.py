@@ -157,7 +157,7 @@ def test_worker_has_no_owner_secrets_or_shared_identity(portal,monkeypatch):
 def test_booking_submissions_are_idempotent_and_queue_is_bounded(portal):
     _,client,store,(_,alice,_)=portal
     headers=sign_in(client,store,alice)
-    body={'target':'2026-10-19T18:00:00Z','court':123,'amount':12}
+    body={'target':'2026-10-19T18:00:00Z','product':100,'court':123,'amount':12}
     a=client.post('/api/book',json=body,headers=headers).json()
     b=client.post('/api/book',json=body,headers=headers).json()
     assert a==b
@@ -236,12 +236,32 @@ def test_web_booking_fails_before_reservation_without_consent_funds_or_price_mat
         def me(self):return me
     monkeypatch.setattr(client,'BackboneClient',Client)
     target=datetime(2027,1,1,18,tzinfo=timezone.utc)
-    monkeypatch.setattr(booking,'find_slots',lambda *a,**kw:[SimpleNamespace(start_dt=target,bookable_linked_product_id=123)])
+    monkeypatch.setattr(booking,'find_slots',lambda *a,**kw:[SimpleNamespace(start_dt=target,bookable_product_id=100,bookable_linked_product_id=123)])
     monkeypatch.setattr(checkout,'slot_price',lambda *a:Decimal(amount))
     monkeypatch.setattr(booking,'book',lambda *a,**kw:pytest.fail('Reservation must not be created'))
     monkeypatch.setenv('PADELWEB_PREFERENCES',json.dumps(preferences))
     with pytest.raises(ValueError):
-        web_worker.execute('book',{'target':target.isoformat(),'court':123,'amount':confirmed})
+        web_worker.execute('book',{'target':target.isoformat(),'product':100,'court':123,'amount':confirmed})
+
+
+def test_quote_identifies_court_by_both_parent_and_linked_product(monkeypatch):
+    from datetime import datetime,timezone
+    from decimal import Decimal
+    from types import SimpleNamespace
+    from padelbot import web_worker,client,booking,checkout
+    monkeypatch.setattr(web_worker,'initialise_key',lambda:None)
+    class Client:
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+        def me(self):return {'id':123,'balance':100}
+    monkeypatch.setattr(client,'BackboneClient',Client)
+    target=datetime(2027,1,1,18,tzinfo=timezone.utc)
+    slots=[SimpleNamespace(start_dt=target,start_iso=target.isoformat(),bookable_product_id=parent,bookable_linked_product_id=123) for parent in (100,200)]
+    monkeypatch.setattr(booking,'find_slots',lambda *a,**kw:slots)
+    selected=[]
+    monkeypatch.setattr(checkout,'slot_price',lambda client,slot,me:selected.append(slot.bookable_product_id) or Decimal(12))
+    result=web_worker.execute('quote',{'target':target.isoformat(),'product':200,'court':123})
+    assert selected==[200] and result['product']==200
 
 
 def test_web_scheduler_uses_rolling_168_hours_across_dst_and_keeps_current_window():
