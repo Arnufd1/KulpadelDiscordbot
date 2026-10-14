@@ -70,4 +70,6 @@ Uitrollen gebeurt met een bronarchief zonder `.env`, `data/`, SDK, virtuele omge
 
 Back-ups moeten zowel gebruikersdata als de bijbehorende afzonderlijke sleutelbestanden bevatten en privé blijven. Een Proxmox-snapshot is op dezelfde schijf geen onafhankelijke back-up. Voor een consistente Android-back-up moeten alle emulators afgesloten zijn. Bewaar relatieve qcow2-backingreferenties bij een verhuizing.
 
-Nog door een echte gebruiker te bevestigen: Google-toestemming en terugkeer op de domein-URL, volledige registratie van een nieuw eigen KUL-account en een expliciet gekozen echte boeking/betaling. Testboekingen die geld kosten worden niet als deploymentcontrole aangemaakt.
+Op 14 oktober 2026 zijn de publieke DNS-koppeling, HTTPS, HTTP-naar-HTTPS-redirect, pagina en assets op desktop/mobiel en de Google-doorverwijzing gecontroleerd. Een echte Google-aanmelding is via de publieke callback voltooid en aan het bestaande eigenaarsprofiel gekoppeld. Niet-aangemelde bezoekers krijgen geen profiel- of beheergegevens; ongeldige OAuth-state en writes vanaf een andere origin worden geweigerd.
+
+Nog door een echte gebruiker te bevestigen: de volledige Tailscale-beheerroute, registratie van een nieuw eigen KUL-account en een expliciet gekozen echte boeking/betaling. Testboekingen die geld kosten worden niet als deploymentcontrole aangemaakt.
