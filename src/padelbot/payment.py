@@ -1,17 +1,16 @@
-"""Payment methods for Delcom backbone-web-api.
-
-Endpoint-only paths:
-  - PAY_METHOD_ACCOUNT (2)        — works if balance > 0
-  - PAY_METHOD_DIRECT_DEBIT (0)   — works if directDebitSpec > 0
-  - PAY_METHOD_CREDIT_CARD (6)    — needs Worldline UI driver (worldline_driver.py)
-"""
+"""USC sale checkout, matched to the captured /sales/{id}/pay flow."""
 from __future__ import annotations
 from enum import IntEnum
+from decimal import Decimal, InvalidOperation
+import time
+import threading
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
+
+import httpx
 
 from loguru import logger
 
-from .booking import SALES_PERSON_ID, SITE_ID
 from .client import BackboneClient
 
 
@@ -26,6 +25,28 @@ class PayMethod(IntEnum):
 
 # collectStatus 2 = "scheduled / to be collected" (HAR-confirmed for credit card path)
 COLLECT_STATUS_SCHEDULED = 2
+# Observed in USC's public frontend on 2026-10-08.
+COLLECT_STATUS_COLLECTED = 0
+SALE_STATUS_DONE = 0
+PAYMENT_PROVIDER_OGONE = 8
+_payment_lock = threading.Lock()
+
+
+class PaymentStateUnknownError(RuntimeError):
+    """A payment was requested; check server state before trying again."""
+
+
+def has_pending_payment(sale: dict) -> bool:
+    # A fresh sale has an UNDECIDED (12) placeholder, which /pay replaces.
+    return any(isinstance(p, dict) and p.get("collectStatus") == COLLECT_STATUS_SCHEDULED
+               and p.get("payMethod") not in (11, 12, 255, None)
+               for p in sale.get("payments", []))
+
+
+def payment_reference(response: dict) -> str | None:
+    created = response.get("createdPayment") or {}
+    reference = created.get("reference")
+    return reference if isinstance(reference, str) and reference else None
 
 
 def has_direct_debit_mandate(me: dict[str, Any]) -> bool:
@@ -41,66 +62,140 @@ def create_payment(
     amount: float,
     method: PayMethod,
 ) -> dict[str, Any]:
-    """Create a payment record. For DIRECT_DEBIT this fully completes the
-    payment (server collects on schedule). For CREDIT_CARD, the response
-    contains a Worldline session that needs separate handling."""
-    body = {
-        "saleId": sale_id,
-        "salesPersonId": SALES_PERSON_ID,
-        "memberId": member_id,
-        "payMethod": int(method),
-        "collectStatus": COLLECT_STATUS_SCHEDULED,
-        "amount": amount,
-        "siteId": SITE_ID,
-        "posId": None,
-    }
-    logger.info("POST /payments method={} amount={} EUR sale={}", method.name, amount, sale_id)
-    return client.post("/payments", body)
+    """Start checkout once. The server supplies its own hosted payment URL.
 
-
-def build_payment_url(payment_resp: dict[str, Any], me: dict[str, Any], amount: float) -> str | None:
-    """Construct the KUL SAP-redirect URL that sends the user to Worldline.
-
-    Reverse-engineered from the SPA's `ogoneFormComponent.startPayment` (case
-    `type === "PAYMENT_URL"`). The URL:
-
-      http://www.kuleuven.be/sapredir/kredietbetaling_Detail.html?
-          ges_mededeling=400/0028/83666 (fixed KUL bank reference)
-          amount=<eur>
-          currency=EUR
-          sub=X & nieuw=X & secure=X
-          result_url=<callback host without scheme>
-          omschrijving=<payment reference>
-          bet_nm=<lastName> & bet_vn=<firstName> & bet_email=<email>
-
-    User clicks → SAP redirect → Worldline hosted checkout (session id assigned
-    on Worldline's side) → enters card → 3DS → callback.
+    Check ownership, amount and existing payments before requesting checkout.
+    Never retry a write when its outcome is unknown.
     """
-    if not isinstance(payment_resp, dict):
-        return None
-    reference = payment_resp.get("reference")
-    if not reference:
-        return None
+    with _payment_lock:
+        sale = client.get(f"/sales/{sale_id}", params={
+            "s": {"id": sale_id, "customerPersonId": member_id}, "join": "payments",
+        })
+        if (not isinstance(sale, dict) or sale.get("id") != sale_id
+                or sale.get("customerPersonId") != member_id):
+            raise RuntimeError("Sale ownership could not be confirmed")
+        try:
+            expected = Decimal(str(amount))
+            total = Decimal(str(sale.get("total")))
+            valid_amount = expected.is_finite() and expected > 0 and total == expected
+        except (InvalidOperation, ValueError, TypeError):
+            valid_amount = False
+        if not valid_amount:
+            raise RuntimeError("Sale amount changed or is invalid; no payment requested")
+        if type(sale.get("statusCode")) is not int or sale["statusCode"] not in (1, 3):
+            raise RuntimeError("Sale is already complete, cancelled, or unavailable")
+        if has_pending_payment(sale):
+            raise PaymentStateUnknownError("An existing payment is pending; check this sale before paying again")
+        body = {
+            "storedPayMethodId": None,
+            "payMethod": int(method),
+            "onSuccessRedirectUrl": "https://usc.kuleuven.cloud/sales/callback",
+            "createStoredPayMethod": False,
+            "paymentProviderType": PAYMENT_PROVIDER_OGONE,
+        }
+        logger.info("POST /sales/{}/pay method={} amount={} EUR", sale_id, method.name, amount)
+        try:
+            response = client.post(f"/sales/{sale_id}/pay", body)
+        except httpx.TransportError:
+            raise PaymentStateUnknownError("Payment request outcome is unknown; check this sale before paying again") from None
+        returned_sale = response.get("sale") if isinstance(response, dict) else None
+        if not isinstance(returned_sale, dict) or returned_sale.get("id") != sale_id:
+            raise PaymentStateUnknownError("Payment response was incomplete; check this sale before paying again")
+        adapter = response.get("userInitiatedPaymentResult")
+        if isinstance(adapter, dict) and adapter.get("bSuccess") is not True:
+            raise RuntimeError("The payment provider rejected the checkout request")
+        return response
 
-    # Result URL: scheme stripped (matches the SPA's behavior)
-    callback = "https://usc.kuleuven.cloud/sales/callback?status=success"
-    callback_no_scheme = callback.replace("https://", "").replace("http://", "")
 
-    params = [
-        ("ges_mededeling", "400/0028/83666"),
-        ("amount", str(amount)),
-        ("currency", "EUR"),
-        ("sub", "X"),
-        ("nieuw", "X"),
-        ("result_url", callback_no_scheme),
-        ("secure", "X"),
-        ("omschrijving", reference),
-        ("bet_nm", me.get("lastName") or ""),
-        ("bet_vn", me.get("firstName") or ""),
-        ("bet_email", me.get("email") or "member_without_email@example.dom"),
-    ]
-    from urllib.parse import urlencode
-    return "http://www.kuleuven.be/sapredir/kredietbetaling_Detail.html?" + urlencode(params)
+def _sale_payment_confirmed(
+    sale: Any, *, sale_id: int, amount: float, reference: str | None,
+    require_collected: bool,
+) -> bool:
+    """Check backend state, including the expected sale, amount and payment."""
+    if (not isinstance(sale, dict) or sale.get("id") != sale_id
+            or type(sale.get("statusCode")) is not int
+            or sale["statusCode"] != SALE_STATUS_DONE):
+        return False
+    try:
+        expected = Decimal(str(amount))
+        total = Decimal(str(sale.get("total")))
+        if not expected.is_finite() or expected <= 0 or total != expected:
+            return False
+        # A completed direct-debit sale can be accepted before bank collection.
+        if not require_collected:
+            return True
+        payments = sale.get("payments")
+        if not isinstance(payments, list):
+            return False
+        collected = [p for p in payments if isinstance(p, dict)
+                     and p.get("saleId") == sale_id
+                     and type(p.get("collectStatus")) is int
+                     and p["collectStatus"] == COLLECT_STATUS_COLLECTED]
+        if reference and not any(p.get("reference") == reference for p in collected):
+            return False
+        amounts = [Decimal(str(p.get("amount"))) for p in collected]
+        if any(not a.is_finite() or a < 0 for a in amounts):
+            return False
+        return sum(amounts, Decimal(0)) >= expected
+    except (InvalidOperation, ValueError, TypeError):
+        return False
+
+
+def wait_for_payment_confirmation(
+    client: BackboneClient, *, sale_id: int, member_id: int, amount: float,
+    reference: str | None = None, require_collected: bool = True,
+    timeout_s: float = 20,
+) -> bool:
+    """Poll only reads; never retry creating a payment after an uncertain result."""
+    deadline = time.monotonic() + max(0, timeout_s)
+    while True:
+        sale = client.get(f"/sales/{sale_id}", params={
+            "s": {"id": sale_id, "customerPersonId": member_id},
+            "join": "payments",
+        })
+        if _sale_payment_confirmed(sale, sale_id=sale_id, amount=amount,
+                                   reference=reference, require_collected=require_collected):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(2, remaining))
+
+
+def payment_message(result) -> str:
+    """Describe confirmed, uncertain, or unstarted checkout consistently."""
+    if result.paid:
+        return f":white_check_mark: Paid via **{result.pay_method}**."
+    if result.payment_pending:
+        return ":hourglass: Payment confirmation is pending. Check this sale in the KU Leuven Sport app before paying again."
+    if result.payment_url:
+        return f":credit_card: Complete checkout (EUR {result.amount}):\n{result.payment_url}"
+    return f":warning: Payment not completed: `{result.pay_error or 'manual checkout needed'}`. Check this sale in the KU Leuven Sport app."
+
+
+def build_payment_url(payment_resp: dict[str, Any]) -> str | None:
+    """Use the backend checkout URL; never fabricate bank references or callbacks."""
+    adapter = payment_resp.get("userInitiatedPaymentResult") if isinstance(payment_resp, dict) else None
+    if not isinstance(adapter, dict) or adapter.get("bSuccess") is not True:
+        return None
+    url = adapter.get("hostedPaymentPageUrl")
+    if not isinstance(url, str) or not url:
+        return None
+    try:
+        parsed = urlsplit(url)
+        if parsed.username is not None or parsed.password is not None or parsed.fragment:
+            raise ValueError
+        if parsed.hostname == "www.kuleuven.be" and parsed.path == "/sapredir/kredietbetaling_Detail.html":
+            if parsed.scheme not in ("http", "https") or parsed.port not in (None, 80, 443):
+                raise ValueError
+            # The backend still emits HTTP. Use HTTPS for customer/payment data.
+            return urlunsplit(("https", "www.kuleuven.be", parsed.path, parsed.query, ""))
+        if (parsed.scheme == "https" and parsed.hostname == "payment.direct.worldline-solutions.com"
+                and parsed.port in (None, 443)):
+            return url
+    except ValueError:
+        pass
+    raise RuntimeError("Checkout returned an unexpected payment origin")
 
 
 def auto_pay(

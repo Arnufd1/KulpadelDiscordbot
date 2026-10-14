@@ -7,6 +7,8 @@ import json
 import os
 from dataclasses import dataclass, asdict
 from pathlib import Path
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from cryptography.fernet import Fernet
 
@@ -24,6 +26,26 @@ class Card:
         return f"**** **** **** {last4}  exp {self.exp_month:02d}/{self.exp_year}  ({self.holder})"
 
 
+def validate_card(card: Card) -> None:
+    """Reject incomplete, mistyped or expired details without echoing them."""
+    if not card.holder.strip():
+        raise ValueError("Vul de naam van de kaarthouder in.")
+    number = card.number
+    if not number.isascii() or not number.isdigit() or not 12 <= len(number) <= 19:
+        raise ValueError("Het kaartnummer heeft geen geldig formaat.")
+    digits = [int(d) for d in number[::-1]]
+    total = sum(d if i % 2 == 0 else (2 * d - 9 if d > 4 else 2 * d) for i, d in enumerate(digits))
+    if total % 10:
+        raise ValueError("Het kaartnummer bevat waarschijnlijk een typfout.")
+    now = datetime.now(ZoneInfo("Europe/Brussels"))
+    if not 1 <= card.exp_month <= 12 or not now.year <= card.exp_year <= now.year + 30:
+        raise ValueError("De vervaldatum is ongeldig.")
+    if (card.exp_year, card.exp_month) < (now.year, now.month):
+        raise ValueError("Deze kaart is vervallen.")
+    if not card.cvv.isascii() or not card.cvv.isdigit() or len(card.cvv) not in (3, 4):
+        raise ValueError("De CVC moet uit 3 of 4 cijfers bestaan.")
+
+
 class CardStore:
     def __init__(self, key_file: Path, blob_file: Path):
         self.key_file = key_file
@@ -35,9 +57,16 @@ class CardStore:
         return Fernet(self.key_file.read_bytes())
 
     def save(self, card: Card) -> None:
+        validate_card(card)
         self.blob_file.parent.mkdir(parents=True, exist_ok=True)
         ciphertext = self._fernet().encrypt(json.dumps(asdict(card)).encode())
-        self.blob_file.write_bytes(ciphertext)
+        temporary = self.blob_file.with_suffix(self.blob_file.suffix + ".tmp")
+        try:
+            temporary.write_bytes(ciphertext)
+            os.replace(temporary, self.blob_file)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
         try:
             os.chmod(self.blob_file, 0o600)
         except (OSError, NotImplementedError):

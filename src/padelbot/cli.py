@@ -2,7 +2,7 @@
 
 Commands:
   padelbot init-key    one-time: generate the master encryption key
-  padelbot login       one-time: interactive PKCE login (get refresh_token)
+  padelbot login       interactive PKCE login (browser or HTTP)
   padelbot status      show stored token state and try a refresh
   padelbot whoami      hit /auth on the booking API to verify access works
   padelbot notify-test send a test message to Discord
@@ -10,7 +10,7 @@ Commands:
 from __future__ import annotations
 import sys
 import time
-import webbrowser
+import os
 
 import click
 import httpx
@@ -19,13 +19,11 @@ from loguru import logger
 from datetime import datetime, timezone
 
 from .auth import (
-    build_authorize_url,
-    exchange_code,
     get_access_token,
     login_via_browser,
-    parse_redirect,
-    refresh,
-    silent_refresh_via_session,
+    login_via_http,
+    login_via_android,
+    renew_access_token,
 )
 from .booking import book as book_slot, find_slot_at_time, find_slots, find_slots_window
 from .booking_manager import cancel_booking, list_my_bookings
@@ -33,7 +31,6 @@ from .card_store import Card, CardStore
 from .client import BackboneClient
 from .notify import booked as notify_booked, send as notify_send
 from .config import settings
-from .notify import send as notify_send
 from .store import TokenStore
 
 
@@ -47,6 +44,10 @@ def cli() -> None:
     logger.add(sys.stderr, level=settings.log_level)
 
 
+from .android_cli import android_cli
+cli.add_command(android_cli)
+
+
 @cli.command("init-key")
 def init_key() -> None:
     """Generate a fresh master key. Refuses to overwrite an existing one."""
@@ -57,27 +58,41 @@ def init_key() -> None:
 
 
 @cli.command()
-@click.option(
-    "--manual",
-    is_flag=True,
-    help="Manual mode: print the auth URL and prompt for the redirect URL "
-    "(use if Playwright isn't installed).",
-)
-def login(manual: bool) -> None:
+@click.option("--http", "http_mode", is_flag=True, help="Log in over HTTP without Chromium; approve MFA when requested.")
+@click.option("--android", "android_mode", is_flag=True, help="Passwordless login using the calibrated registered Android.")
+@click.option("--manual-approval", is_flag=True, help="With --android: open the exact login on the phone for initial calibration.")
+@click.option("--username", envvar="KULEUVEN_USERNAME", help="KU Leuven username (HTTP mode).")
+@click.option("--device", envvar="KULEUVEN_AUTH_DEVICE", help="Authenticator device name if several are registered.")
+def login(http_mode: bool, android_mode: bool, manual_approval: bool, username: str | None, device: str | None) -> None:
     """Interactive PKCE login. Default: Playwright captures the code automatically."""
-    if manual:
-        url, state, verifier = build_authorize_url()
-        click.echo("\n1) Open this URL in a browser (DevTools → Network → 'Preserve log' first):")
-        click.echo(f"   {url}\n")
-        click.echo("2) Sign in + tap MFA. After redirect, in DevTools find the request to")
-        click.echo("   /oidc/auth-callback?code=... and copy its full URL.\n")
+    if http_mode and android_mode:
+        raise click.UsageError("Choose --http or --android.")
+    if manual_approval and not android_mode:
+        raise click.UsageError("--manual-approval requires --android.")
+    # Fail before contacting the IdP if the encryption key has not been created.
+    if not settings.padelbot_key_file.exists():
+        raise click.ClickException("Run `padelbot init-key` before login.")
+    if android_mode:
+        from .android import AndroidApprover
         try:
-            webbrowser.open(url)
-        except Exception:
-            pass
-        callback = click.prompt("Paste the redirect URL").strip()
-        code = parse_redirect(callback, state)
-        bundle = exchange_code(code, verifier)
+            approver = AndroidApprover(manual=manual_approval)
+            if manual_approval:
+                click.echo("Opening this login on your Android. Approve it on the phone or in the mirror window.")
+            bundle = login_via_android(approver, fresh=True)
+        except (RuntimeError, httpx.HTTPError) as error:
+            raise click.ClickException(str(error)) from error
+    elif http_mode:
+        username = username or click.prompt("KU Leuven username")
+        password = os.environ.get("KULEUVEN_PASSWORD") or click.prompt("KU Leuven password", hide_input=True)
+        try:
+            bundle = login_via_http(
+                username, password, settings.padelbot_storage_file,
+                provide_totp=lambda: click.prompt("TOTP code", hide_input=True),
+                device_name=device,
+                on_approval=lambda name: click.echo(f"Approve the KU Leuven Authenticator request on {name} (120s)."),
+            )
+        except (RuntimeError, httpx.HTTPError) as error:
+            raise click.ClickException(str(error)) from error
     else:
         click.echo("Launching browser. Sign in + tap MFA on your phone — I'll catch the code automatically.")
         bundle = login_via_browser(storage_state_path=settings.padelbot_storage_file)
@@ -86,12 +101,17 @@ def login(manual: bool) -> None:
     _store().save(bundle)
     click.echo("\nTokens saved.")
     click.echo(f"  access_token expires in: {int(bundle.expires_at - time.time())}s")
-    click.echo(f"  refresh_token returned:  {'YES' if bundle.refresh_token else 'NO (autonomous mode unavailable)'}")
+    click.echo(f"  refresh_token returned:  {'YES' if bundle.refresh_token else 'NO (uses saved IdP session)'}")
     click.echo(f"  scopes granted:          {bundle.scope}")
     if not bundle.refresh_token:
+        mfa_message = (
+            "New MFA logins use the configured Android automatically."
+            if settings.padelbot_android_autologin else
+            "Configure Android autologin or run `padelbot login --http` / `padelbot login` when MFA is required."
+        )
         click.secho(
-            "\nWARNING: no refresh_token. The IdP did not grant offline_access.\n"
-            "Bot will not be able to run autonomously. Fall back to Playwright headless flow.",
+            "\nRenewal uses the saved IdP session over HTTP.\n"
+            + mfa_message,
             fg="yellow",
         )
 
@@ -108,14 +128,12 @@ def status() -> None:
     click.echo(f"access_token expires_at: {bundle.expires_at:.0f} ({int(bundle.expires_at - now)}s from now)")
     click.echo(f"refresh_token present:   {'YES' if bundle.refresh_token else 'NO'}")
     click.echo(f"scope:                   {bundle.scope}")
-    if bundle.refresh_token:
-        click.echo("\nForcing a refresh to verify...")
-        new_bundle = refresh(bundle)
-        s.save(new_bundle)
-        click.secho(
-            f"Refresh OK. New access_token expires in {int(new_bundle.expires_at - now)}s.",
-            fg="green",
-        )
+    click.echo("\nForcing a renewal to verify the saved session...")
+    try:
+        renew_access_token(s)
+    except (RuntimeError, httpx.HTTPError) as error:
+        raise click.ClickException(str(error)) from error
+    click.secho("Renewal OK.", fg="green")
 
 
 @cli.command()
@@ -145,32 +163,19 @@ def whoami() -> None:
 
 
 @cli.command("silent-refresh")
-@click.option("--show-browser", is_flag=True, help="Show the browser window (debug).")
-@click.option("--no-hint", is_flag=True, help="Skip id_token_hint (debug).")
-def silent_refresh_cmd(show_browser: bool, no_hint: bool) -> None:
-    """Try a silent renewal using the saved IdP session cookies (no MFA, no password).
-
-    Tells you whether the session is still valid. This is the test that decides
-    whether we can avoid storing your password.
-    """
+def silent_refresh_cmd() -> None:
+    """Renew the token; Android handles MFA when autologin is enabled."""
     s = _store()
-    existing = s.load()
-    hint = None if no_hint else (existing.id_token if existing else None)
     try:
-        bundle = silent_refresh_via_session(
-            settings.padelbot_storage_file,
-            id_token_hint=hint,
-            headless=not show_browser,
-        )
-    except RuntimeError as e:
+        renew_access_token(s)
+    except (RuntimeError, httpx.HTTPError) as e:
         click.secho(f"Silent refresh FAILED: {e}", fg="red")
         sys.exit(1)
-    s.save(bundle)
-    click.secho("Silent refresh OK", fg="green")
+    bundle = s.load()
+    click.secho("Session renewal OK", fg="green")
     click.echo(f"  access_token expires in: {int(bundle.expires_at - time.time())}s")
     click.echo(f"  scope:                   {bundle.scope}")
-    click.echo("\nIf you ran this many hours/days after `padelbot login` and it still")
-    click.echo("worked, the IdP session is long-lived — we can avoid password storage.")
+    click.echo("\nRenewal reuses the IdP session or invokes the configured Android when MFA is needed.")
 
 
 @cli.command("notify-test")
@@ -308,33 +313,33 @@ def book(date_str: str, time_str: str, court: int | None, label: str | None, yes
         fg="green",
     )
     notify_booked(result.description, result.booking_id or result.sale_id)
-    notify_send(
-        f":money_with_wings: **PAYMENT NEEDED** — open the KU Leuven Sport app and pay "
-        f"{result.amount or '?'} EUR for booking `{result.booking_id}` within ~15 min "
-        f"or the slot may be released."
-    )
+    from .payment import payment_message
+    message = payment_message(result)
+    click.echo(message)
+    notify_send(message)
 
 
 @cli.command("set-card")
 def set_card_cmd() -> None:
-    """Interactively prompt for credit card details and store them encrypted on the Pi.
+    """Prompt locally for card details and store them encrypted on this computer.
 
     Used as a fallback for accounts without a SEPA mandate. The bot's primary
     payment path is direct debit if your account has a mandate.
     """
-    holder = click.prompt("Card holder full name").strip()
-    number = click.prompt("Card number (16 digits, no spaces)", hide_input=False).strip().replace(" ", "")
-    if not number.isdigit() or len(number) < 12:
-        click.secho("Card number looks invalid.", fg="red")
-        sys.exit(1)
-    exp_month = click.prompt("Expiry month (1-12)", type=int)
-    exp_year = click.prompt("Expiry year (4-digit)", type=int)
-    cvv = click.prompt("CVV (3-4 digits)", hide_input=True).strip()
+    click.echo("Automatisch betalen instellen. Voer kaartgegevens alleen in dit lokale venster in.")
+    holder = click.prompt("Naam kaarthouder").strip()
+    number = click.prompt("Kaartnummer (verborgen invoer)", hide_input=True).strip().replace(" ", "").replace("-", "")
+    exp_month = click.prompt("Vervalmaand (1-12)", type=int)
+    exp_year = click.prompt("Vervaljaar (4 cijfers)", type=int)
+    cvv = click.prompt("CVC (verborgen invoer)", hide_input=True).strip()
     card = Card(holder=holder, number=number, exp_month=exp_month, exp_year=exp_year, cvv=cvv)
     store = CardStore(settings.padelbot_key_file, settings.padelbot_card_file)
-    store.save(card)
-    click.secho(f"Saved: {card.masked()}", fg="green")
-    click.echo(f"Encrypted blob at: {settings.padelbot_card_file}")
+    try:
+        store.save(card)
+    except ValueError as error:
+        raise click.ClickException(str(error)) from None
+    click.secho("Kaart versleuteld opgeslagen. De bot gebruikt ze bij je volgende boeking; herstarten is niet nodig.", fg="green")
+    click.echo("Een eventuele goedkeuring in je bank-app blijft nodig.")
 
 
 @cli.command("clear-card")

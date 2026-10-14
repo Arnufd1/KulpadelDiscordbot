@@ -1,12 +1,12 @@
 """SQLite store for recurring weekly booking rules + booking history.
 
-A `rule` is "every <weekday> at <HH:MM> Brussels time, book a padel slot."
+A `rule` books one slot each week at a fixed time or within a Brussels-time window.
 The scheduler reads enabled rules and races to /sales at the slot-open moment.
 """
 from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS rules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     day_of_week INTEGER NOT NULL,        -- 0=Mon ... 6=Sun
     time_local TEXT NOT NULL,            -- "HH:MM" Brussels
+    end_time_local TEXT,                 -- inclusive latest start time, NULL = fixed time
     enabled INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     notes TEXT
@@ -51,9 +52,15 @@ class Rule:
     time_local: str
     enabled: bool
     notes: str | None
+    end_time_local: str | None = None
+
+    def time_label(self) -> str:
+        if self.end_time_local and self.end_time_local != self.time_local:
+            return f"{self.time_local}–{self.end_time_local}"
+        return self.time_local
 
     def label(self) -> str:
-        return f"{WEEKDAY_NAMES[self.day_of_week]} {self.time_local}"
+        return f"{WEEKDAY_NAMES[self.day_of_week]} {self.time_label()}"
 
 
 @dataclass
@@ -82,17 +89,26 @@ class RulesStore:
     def _init_schema(self) -> None:
         with self._conn() as c:
             c.executescript(SCHEMA)
+            columns = {row["name"] for row in c.execute("PRAGMA table_info(rules)")}
+            if "end_time_local" not in columns:
+                c.execute("ALTER TABLE rules ADD COLUMN end_time_local TEXT")
 
     # --- rules ---
 
-    def add_rule(self, day_of_week: int, time_local: str, notes: str | None = None) -> Rule:
+    def add_rule(self, day_of_week: int, time_local: str, notes: str | None = None,
+                 *, end_time_local: str | None = None) -> Rule:
         if not (0 <= day_of_week <= 6):
             raise ValueError("day_of_week must be 0..6 (Mon..Sun)")
+        for stamp in (time_local, end_time_local):
+            if stamp is not None and datetime.strptime(stamp, "%H:%M").strftime("%H:%M") != stamp:
+                raise ValueError("time must be HH:MM")
+        if end_time_local is not None and end_time_local < time_local:
+            raise ValueError("end time must be at or after start time")
         with self._conn() as c:
             cur = c.execute(
-                "INSERT INTO rules (day_of_week, time_local, enabled, created_at, notes) "
-                "VALUES (?, ?, 1, ?, ?)",
-                (day_of_week, time_local, datetime.utcnow().isoformat(), notes),
+                "INSERT INTO rules (day_of_week, time_local, end_time_local, enabled, created_at, notes) "
+                "VALUES (?, ?, ?, 1, ?, ?)",
+                (day_of_week, time_local, end_time_local, datetime.utcnow().isoformat(), notes),
             )
             rule_id = cur.lastrowid
         return self.get_rule(rule_id)  # type: ignore[arg-type]
@@ -137,6 +153,20 @@ class RulesStore:
                 (rule_id, datetime.utcnow().isoformat(), 1 if success else 0,
                  sale_id, booking_id, target_slot_iso, error),
             )
+
+    def has_booking_for_day(self, rule_id: int, target_day: date) -> bool:
+        """A completed attempt or created reservation fulfils this weekly occurrence.
+
+        Scheduler and watcher history stores target_slot_iso in Brussels time.
+        Keep this guard across restarts, even if another start time becomes free.
+        """
+        with self._conn() as c:
+            return c.execute(
+                "SELECT 1 FROM history WHERE rule_id=? "
+                "AND (success=1 OR booking_id IS NOT NULL) "
+                "AND substr(target_slot_iso, 1, 10)=? LIMIT 1",
+                (rule_id, target_day.isoformat()),
+            ).fetchone() is not None
 
     # --- key/value (Discord state, etc.) ---
 
@@ -192,6 +222,7 @@ def _row_to_rule(r: sqlite3.Row) -> Rule:
         time_local=r["time_local"],
         enabled=bool(r["enabled"]),
         notes=r["notes"],
+        end_time_local=r["end_time_local"],
     )
 
 

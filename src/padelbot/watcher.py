@@ -11,10 +11,11 @@ from zoneinfo import ZoneInfo
 
 from loguru import logger
 
-from .booking import Slot, find_slot_at_time, find_slots
+from .booking import Slot, find_slots
 from .client import BackboneClient
 from .config import settings
 from .rules_store import Rule, RulesStore
+from .scheduler import find_rule_slot
 
 
 @dataclass
@@ -34,12 +35,13 @@ def _next_n_occurrences(rule: Rule, n: int) -> list[datetime]:
     tz = _local_tz()
     now = datetime.now(tz)
     hh, mm = (int(x) for x in rule.time_local.split(":"))
+    end_hh, end_mm = (int(x) for x in (rule.end_time_local or rule.time_local).split(":"))
 
     out: list[datetime] = []
     base = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
     days_ahead = (rule.day_of_week - base.weekday()) % 7
     target = base + timedelta(days=days_ahead)
-    if target <= now:
+    if target.replace(hour=end_hh, minute=end_mm) <= now:
         target = target + timedelta(days=7)
     for _ in range(n):
         if target - now > timedelta(days=settings.padel_opens_days_ahead):
@@ -57,17 +59,15 @@ def check_rule_now(client: BackboneClient, rule: Rule) -> WatchHit | None:
         return None
     target = targets[0]
     slots = find_slots(client, target_date=datetime.combine(target.date(), datetime.min.time()))
-    found = find_slot_at_time(slots, target.strftime("%H:%M"))
+    found = find_rule_slot(slots, rule, target.date())
     if found is None:
         return None
-    if found.raw.get("isAvailable") is False:
-        return None
-    return WatchHit(rule=rule, target_slot_local=target, slot=found)
+    return WatchHit(rule=rule, target_slot_local=found.start_dt.astimezone(_local_tz()), slot=found)
 
 
 async def run_watcher(
     store: RulesStore,
-    on_hit: Callable[[WatchHit], Awaitable[None]],
+    on_hit: Callable[[WatchHit], Awaitable[bool | None]],
     *,
     poll_interval_s: float = 300.0,    # default 5 min
 ) -> None:
@@ -75,7 +75,7 @@ async def run_watcher(
     next occurrence and call `on_hit` if it's now bookable. The bot's caller
     decides whether to auto-book or just alert."""
     logger.info("Watcher started (poll {}s).", poll_interval_s)
-    seen: set[tuple[int, str]] = set()  # (rule_id, target_iso) — avoid spamming
+    seen: set[tuple[int, str]] = set()  # (rule_id, local day) — avoid spamming
     while True:
         try:
             rules = store.list_rules(enabled_only=True)
@@ -88,11 +88,13 @@ async def run_watcher(
                     continue
                 if hit is None:
                     continue
-                key = (r.id, hit.target_slot_local.isoformat())
-                if key in seen:
+                key = (r.id, hit.target_slot_local.date().isoformat())
+                if key in seen or store.has_booking_for_day(r.id, hit.target_slot_local.date()):
                     continue
-                seen.add(key)
-                await on_hit(hit)
+                # A slot that disappears before booking must not stop the
+                # interval's watcher from trying a later free start time.
+                if await on_hit(hit) is not False:
+                    seen.add(key)
             await asyncio.sleep(poll_interval_s)
         except asyncio.CancelledError:
             logger.info("Watcher stopping.")

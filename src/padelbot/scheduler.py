@@ -11,7 +11,7 @@ The booking call itself is run in a thread so we don't block the event loop.
 from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, time as dtime, timedelta
+from datetime import date, datetime, time as dtime, timedelta
 from typing import Callable, Awaitable
 from zoneinfo import ZoneInfo
 
@@ -21,7 +21,6 @@ from .booking import (
     BookingResult,
     Slot,
     book as do_book,
-    find_slot_at_time,
     find_slots,
 )
 from .client import BackboneClient
@@ -38,6 +37,21 @@ class FireSpec:
 
 def _local_tz() -> ZoneInfo:
     return ZoneInfo(settings.padel_local_tz)
+
+
+def find_rule_slot(slots: list[Slot], rule: Rule, target_day: date, *, now: datetime | None = None) -> Slot | None:
+    """Choose the earliest future start within the inclusive local-time window."""
+    tz = _local_tz()
+    now = now or datetime.now(tz)
+    start = datetime.strptime(rule.time_local, "%H:%M").time()
+    end = datetime.strptime(rule.end_time_local or rule.time_local, "%H:%M").time()
+    matches = []
+    for slot in slots:
+        local = slot.start_dt.astimezone(tz)
+        if (local.date() == target_day and start <= local.time() <= end
+                and slot.start_dt > now and slot.raw.get("isAvailable") is not False):
+            matches.append(slot)
+    return min(matches, key=lambda s: (s.start_dt, s.bookable_product_id, s.bookable_linked_product_id), default=None)
 
 
 def compute_next_fire(rule: Rule, *, now: datetime | None = None) -> FireSpec:
@@ -68,21 +82,19 @@ def compute_next_fire(rule: Rule, *, now: datetime | None = None) -> FireSpec:
 def _fire_one_rule(spec: FireSpec) -> tuple[bool, BookingResult | None, str | None]:
     """Synchronous booking attempt — runs in a thread."""
     target_date = spec.target_slot_local.date()
-    target_time = spec.target_slot_local.strftime("%H:%M")
     tz = _local_tz()
-    # tz_offset_hours used by find_slot_at_time — current Brussels offset (incl. DST)
-    offset = int(spec.target_slot_local.utcoffset().total_seconds() // 3600)  # type: ignore[union-attr]
 
     with BackboneClient() as client:
         me = client.me()
-        from datetime import datetime as _dt
-        slots = find_slots(client, target_date=_dt.combine(target_date, dtime()))
-        slot = find_slot_at_time(slots, target_time, tz_offset_hours=offset)
+        slots = find_slots(client, target_date=datetime.combine(target_date, dtime(), tz))
+        slot = find_rule_slot(slots, spec.rule, target_date)
         if slot is None:
             available = ", ".join(
-                f"{(s.start_dt.hour + offset) % 24:02d}:{s.start_dt.minute:02d}" for s in slots
+                s.start_dt.astimezone(tz).strftime("%H:%M") for s in slots
             )
-            return False, None, f"No slot at {target_time}. Available: {available or '(none)'}"
+            return False, None, f"No slot within {spec.rule.time_label()}. Available: {available or '(none)'}"
+        # History and notifications must identify the actual chosen start.
+        spec.target_slot_local = slot.start_dt.astimezone(tz)
         # Use the rule's `notes` as the booking label (visible in purchase history)
         label = (spec.rule.notes or None)
         result = do_book(client, slot, member_id=me["id"], me=me, label=label)
@@ -94,9 +106,11 @@ async def run_scheduler(
     on_attempt: Callable[[FireSpec, bool, BookingResult | None, str | None], Awaitable[None]],
     *,
     poll_interval_s: float = 30.0,  # how often we recompute next-fire when far away
+    booking_lock: asyncio.Lock | None = None,
 ) -> None:
     """Long-running asyncio task. `on_attempt` is the callback for Discord notifications."""
     logger.info("Scheduler started.")
+    booking_lock = booking_lock or asyncio.Lock()
     while True:
         try:
             rules = store.list_rules(enabled_only=True)
@@ -106,6 +120,9 @@ async def run_scheduler(
             specs = [compute_next_fire(r) for r in rules]
             specs.sort(key=lambda s: s.fire_at)
             next_spec = specs[0]
+            # Capture the whole opening before attempting any bookings. Recomputing
+            # after the first attempt would move its peers to the following week.
+            due_specs = [spec for spec in specs if spec.fire_at == next_spec.fire_at]
             tz = _local_tz()
             delay = (next_spec.fire_at - datetime.now(tz)).total_seconds()
             if delay > poll_interval_s:
@@ -123,24 +140,35 @@ async def run_scheduler(
                 logger.info("Sleeping {:.3f}s until fire moment for rule {}",
                             delay, next_spec.rule.label())
                 await asyncio.sleep(delay)
-            logger.info("FIRING rule {} for slot {}",
-                        next_spec.rule.label(),
-                        next_spec.target_slot_local.isoformat())
-            try:
-                ok, result, err = await asyncio.to_thread(_fire_one_rule, next_spec)
-            except Exception as e:
-                ok, result, err = False, None, f"{type(e).__name__}: {e}"
-                logger.exception("Booking attempt crashed")
-            store.record(
-                rule_id=next_spec.rule.id,
-                success=ok,
-                sale_id=(result.sale_id if result else None),
-                booking_id=(result.booking_id if result else None),
-                target_slot_iso=next_spec.target_slot_local.isoformat(),
-                error=err,
-            )
-            await on_attempt(next_spec, ok, result, err)
-            # Avoid tight-looping if multiple rules share a fire moment
+            for spec in due_specs:
+                async with booking_lock:
+                    # Rules may have changed or been fulfilled by the watcher.
+                    current_rule = store.get_rule(spec.rule.id)
+                    if current_rule is None or not current_rule.enabled:
+                        continue
+                    if (current_rule.day_of_week, current_rule.time_local, current_rule.end_time_local) != (
+                            spec.rule.day_of_week, spec.rule.time_local, spec.rule.end_time_local):
+                        continue
+                    if store.has_booking_for_day(spec.rule.id, spec.target_slot_local.date()):
+                        continue
+                    logger.info("FIRING rule {} for slot {}", spec.rule.label(), spec.target_slot_local.isoformat())
+                    try:
+                        ok, result, err = await asyncio.to_thread(_fire_one_rule, spec)
+                    except Exception as e:
+                        ok, result, err = False, None, f"{type(e).__name__}: {e}"
+                        logger.exception("Booking attempt crashed")
+                    store.record(
+                        rule_id=spec.rule.id,
+                        success=ok,
+                        sale_id=(result.sale_id if result else None),
+                        booking_id=(result.booking_id if result else None),
+                        target_slot_iso=spec.target_slot_local.isoformat(),
+                        error=err,
+                    )
+                try:
+                    await on_attempt(spec, ok, result, err)
+                except Exception:
+                    logger.exception("Booking notification failed for rule {}", spec.rule.id)
             await asyncio.sleep(2)
         except asyncio.CancelledError:
             logger.info("Scheduler stopping.")

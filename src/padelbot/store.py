@@ -7,6 +7,7 @@ unlock anything).
 """
 import json
 import os
+import tempfile
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from cryptography.fernet import Fernet
@@ -55,7 +56,14 @@ class TokenStore:
     def save(self, bundle: TokenBundle) -> None:
         self.blob_file.parent.mkdir(parents=True, exist_ok=True)
         ciphertext = self._fernet().encrypt(bundle.to_json().encode())
-        self.blob_file.write_bytes(ciphertext)
+        fd, temporary = tempfile.mkstemp(dir=self.blob_file.parent, prefix=".tokens-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as output:
+                output.write(ciphertext)
+            os.replace(temporary, self.blob_file)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
         try:
             os.chmod(self.blob_file, 0o600)
         except (OSError, NotImplementedError):

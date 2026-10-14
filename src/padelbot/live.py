@@ -1,33 +1,16 @@
-"""Discord live-updating messages for slots and bookings, plus interactive views.
-
-The slots message uses a persistent View with 7 day-buttons (Mon..Sun, by
-weekday — labels updated each render to show the actual date). Clicking a
-button sends an ephemeral select menu with up to 25 (time, court) options for
-that day. Selecting one triggers the booking + DM confirmation.
-"""
+"""Legacy live channel embeds and persistent buttons opening the current UI."""
 from __future__ import annotations
-import asyncio
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import discord
-from loguru import logger
 
-from .booking import (
-    BookingResult,
-    Slot,
-    book as do_book,
-    find_slot_at_time,
-    find_slots_window,
-    get_product_names,
-)
-from .booking_manager import list_my_bookings
-from .client import BackboneClient
+from .booking import Slot
 from .config import settings
+from . import weather
 
 
 GREEN = "\x1b[1;32m"
-GRAY = "\x1b[2;30m"
 DIM = "\x1b[2;37m"
 RESET = "\x1b[0m"
 
@@ -50,13 +33,7 @@ def render_slots_embed(
     my_booking_days: set[str] | None = None,
     my_bookings_count: int = 0,
 ) -> discord.Embed:
-    """One embed field per day with the bookable courts.
-
-    Days where the user already has a booking are HIDDEN (KUL blocks
-    another booking that day). When the user has hit the weekly quota
-    (`my_bookings_count >= WEEKLY_BOOKING_QUOTA`), no slots are shown
-    and the embed just explains the situation.
-    """
+    """One field per day with free courts and the member's booking markers."""
     tz = _tz()
     today = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
     my_booking_days = my_booking_days or set()
@@ -83,6 +60,7 @@ def render_slots_embed(
     embed = discord.Embed(title="🎾 Padel — next 8 days", color=0x377dff, timestamp=datetime.now(tz))
 
     total_slots = 0
+    forecast = weather.peek_forecast()
     # Reverse order: latest day at top, today at bottom.
     for offset in reversed(range(num_days)):
         d = today + timedelta(days=offset)
@@ -115,7 +93,8 @@ def render_slots_embed(
             if len(value) > 1020:
                 value = value[:1015] + "\n```"
 
-        embed.add_field(name=f"{day_label} — {n_open}{tag}", value=value, inline=False)
+        badge = forecast.day_badge(d.date()) if forecast else ""
+        embed.add_field(name=f"{day_label} — {n_open}{tag}{' · ' + badge if badge else ''}", value=value, inline=False)
 
     refresh_min = max(1, settings.padelbot_slots_refresh_s // 60)
     legend = "  ".join(f"{col_label(c)}={court_names.get(c, str(c))}" for c in courts_sorted)
@@ -123,6 +102,8 @@ def render_slots_embed(
     footer = f"{total_slots} open · {quota_str} · {legend} · refresh every {refresh_min} min · click day to book"
     if member_name:
         footer = f"{member_name} · " + footer
+    if forecast:
+        footer += " · " + weather.CREDIT
     embed.set_footer(text=footer[:2000])
     return embed
 
@@ -141,12 +122,14 @@ def render_bookings_embed(my_bookings, court_names: dict[int, str], member_name:
         return embed
 
     lines = []
+    forecast = weather.peek_forecast()
     for b in my_bookings[:25]:
         local = b.start_dt.astimezone(tz)
         court = court_names.get(b.raw.get("productId"), "?")
         paid = "PAID" if b.paid_for else "UNPAID"
+        badge = forecast.badge(local) if forecast else ""
         lines.append(
-            f"{GREEN}{local:%a %d %b  %H:%M}  {court}{RESET}\n"
+            f"{GREEN}{local:%a %d %b  %H:%M}  {court}{'  ' + badge if badge else ''}{RESET}\n"
             f"{DIM}#{b.id}  sale {b.sale_id}  {paid}{RESET}"
         )
     body = "```ansi\n" + "\n\n".join(lines) + "\n```"
@@ -196,209 +179,12 @@ class _DayButton(discord.ui.Button):
             )
             return
 
-        # Recompute target date at click-time (in case the message is stale)
-        offset = self._offset
-        target = _today_local_date() + timedelta(days=offset)
-
+        from .discord_ui import DaySlotsView
+        target = _today_local_date() + timedelta(days=self._offset)
         await interaction.response.defer(thinking=True, ephemeral=True)
         try:
-            options, court_names, grid_text = await asyncio.to_thread(_collect_day_options, target)
-        except Exception as e:
-            await interaction.followup.send(f":x: API error: `{type(e).__name__}: {e}`", ephemeral=True)
+            view = await DaySlotsView.load(self.owner_id, target)
+        except Exception:
+            await interaction.followup.send("Beschikbaarheid ophalen mislukt. Probeer opnieuw.", ephemeral=True)
             return
-
-        if not options:
-            await interaction.followup.send(
-                f"No available slots on {target:%a %d %b}.\n\n{grid_text}",
-                ephemeral=True,
-            )
-            return
-
-        # Two-step: first pick a time. Build a unique list of times.
-        # The court selection comes after.
-        unique_times = sorted({o[0] for o in options})
-        view = _SelectTimeView(target, options, court_names, unique_times, self.owner_id)
-        await interaction.followup.send(
-            f"**{target:%a %d %b}** — pick a time, then a court.\n{grid_text}",
-            view=view,
-            ephemeral=True,
-        )
-
-
-def _collect_day_options(target: datetime) -> tuple[list[tuple[str, str, int, str]], dict[int, str], str]:
-    """Returns ((HH:MM, court_name, parent_id, label), ...) sorted by time then court,
-    court_names dict, and a rendered ANSI grid string for visual reference."""
-    with BackboneClient() as c:
-        slots = find_slots_window(c, start_date=target, days=1)
-        court_ids = {s.bookable_product_id for s in slots}
-        names = get_product_names(c, court_ids)
-    tz = _tz()
-    options: list[tuple[str, str, int, str]] = []
-    for s in slots:
-        local = s.start_dt.astimezone(tz)
-        court = names.get(s.bookable_product_id, f"Court {s.bookable_product_id}")
-        time_str = local.strftime("%H:%M")
-        label = f"{time_str}  {court}"
-        options.append((time_str, court, s.bookable_product_id, label))
-    # Sort by time first, then by court name — keeps all courts at a time grouped.
-    options.sort(key=lambda x: (x[0], x[1]))
-
-    # Build a small ANSI grid for visual reference (just this one day).
-    by_t: dict[str, set[int]] = {}
-    for s in slots:
-        local = s.start_dt.astimezone(tz)
-        by_t.setdefault(local.strftime("%H:%M"), set()).add(s.bookable_product_id)
-    courts_sorted = sorted(court_ids, key=lambda c: names.get(c, str(c)))
-
-    def col_label(cid: int) -> str:
-        n = names.get(cid, f"#{cid}")
-        if n.lower().startswith("padel"):
-            rest = n[5:].strip()
-            return f"P{rest}" if rest else "P?"
-        return n[:4]
-
-    if by_t:
-        rows = []
-        for t in sorted(by_t.keys()):
-            cells = "  ".join(
-                (f"{GREEN}{col_label(c)}{RESET}" if c in by_t[t] else f"{GRAY}{col_label(c)}{RESET}")
-                for c in courts_sorted
-            )
-            rows.append(f"{t}  {cells}")
-        grid_text = "```ansi\n" + "\n".join(rows) + "\n```"
-    else:
-        grid_text = ""
-
-    return options[:25], names, grid_text
-
-
-class _SelectTimeView(discord.ui.View):
-    """Step 1: pick a time. Up to 25 unique times — well within Discord's limit."""
-    def __init__(self, target_day: datetime, options, court_names, unique_times, owner_id: int):
-        super().__init__(timeout=300)
-        self.add_item(_SelectTimeMenu(target_day, options, court_names, unique_times, owner_id))
-
-
-class _SelectTimeMenu(discord.ui.Select):
-    def __init__(self, target_day: datetime, options, court_names, unique_times, owner_id: int):
-        # Count courts per time so user sees "11:30 (3 courts)"
-        by_time: dict[str, list[tuple[str, int]]] = {}
-        for time_str, court, parent_id, _label in options:
-            by_time.setdefault(time_str, []).append((court, parent_id))
-        opts = []
-        for t in unique_times[:25]:
-            n_courts = len(by_time[t])
-            opts.append(discord.SelectOption(
-                label=f"{t}  ({n_courts} court{'s' if n_courts != 1 else ''})",
-                value=t,
-            ))
-        super().__init__(
-            placeholder="Pick a time",
-            min_values=1, max_values=1,
-            options=opts,
-        )
-        self.target_day = target_day
-        self.options_data = options
-        self.court_names = court_names
-        self.owner_id = owner_id
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(":no_entry_sign:", ephemeral=True)
-            return
-        chosen_time = self.values[0]
-        # Filter to courts available at that time
-        court_opts = [
-            (court, parent_id)
-            for (time_str, court, parent_id, _l) in self.options_data
-            if time_str == chosen_time
-        ]
-        view = _SelectCourtView(self.target_day, chosen_time, court_opts, self.owner_id)
-        await interaction.response.send_message(
-            f"**{self.target_day:%a %d %b} {chosen_time}** — pick a court:",
-            view=view, ephemeral=True,
-        )
-
-
-class _SelectCourtView(discord.ui.View):
-    """Step 2: pick a court at the chosen time."""
-    def __init__(self, target_day: datetime, time_str: str, court_opts, owner_id: int):
-        super().__init__(timeout=300)
-        self.add_item(_SelectCourtMenu(target_day, time_str, court_opts, owner_id))
-
-
-class _SelectCourtMenu(discord.ui.Select):
-    def __init__(self, target_day: datetime, time_str: str, court_opts, owner_id: int):
-        opts = [
-            discord.SelectOption(label=court[:100], value=f"{parent_id}")
-            for (court, parent_id) in court_opts[:25]
-        ]
-        super().__init__(placeholder=f"Pick a court for {time_str}", options=opts)
-        self.target_day = target_day
-        self.time_str = time_str
-        self.owner_id = owner_id
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(":no_entry_sign:", ephemeral=True)
-            return
-        await interaction.response.defer(thinking=True, ephemeral=True)
-        parent_id = int(self.values[0])
-        time_str = self.time_str
-
-        def _book_now() -> tuple[bool, BookingResult | None, str | None]:
-            try:
-                with BackboneClient() as c:
-                    me = c.me()
-                    slots = find_slots_window(c, start_date=self.target_day, days=1)
-                    names = get_product_names(c, {s.bookable_product_id for s in slots})
-                    target_name = names.get(parent_id, "")
-                    slot = find_slot_at_time(slots, time_str, court=target_name, court_names=names)
-                    if not slot:
-                        return False, None, f"Slot {time_str} on {target_name} no longer available."
-                    res = do_book(c, slot, member_id=me["id"], me=me)
-                return True, res, None
-            except Exception as e:
-                return False, None, f"{type(e).__name__}: {e}"
-
-        ok, res, err = await asyncio.to_thread(_book_now)
-        if ok and res:
-            if res.paid:
-                paid_line = f":white_check_mark: Paid via **{res.pay_method}**."
-            elif res.payment_url:
-                # Was a card stored? If yes, the driver ran and failed (show error).
-                # If no card stored, prompt user to run set-card for full autonomy.
-                from .worldline_driver import load_card as _lc
-                if _lc() is None:
-                    paid_line = (
-                        f":credit_card: **Click to pay** (€{res.amount}, 60-min window):\n"
-                        f"{res.payment_url}\n"
-                        f"-# Run `padelbot set-card` on the Pi to enable headless auto-pay."
-                    )
-                else:
-                    paid_line = (
-                        f":warning: Headless auto-pay FAILED — fall back to clicking:\n"
-                        f"{res.payment_url}\n"
-                        f"-# Driver error: `{res.pay_error or 'unknown'}` — diagnostics in `data/worldline_diag/`."
-                    )
-            else:
-                paid_line = (
-                    f":hourglass: Pay manually in the KU Leuven Sport app within 60 min.\n"
-                    f"(Auto-pay said: `{res.pay_error or 'no method available'}`)"
-                )
-            await interaction.followup.send(
-                f":tennis: **Booked!** {res.description}\n"
-                f"sale `{res.sale_id}` booking `{res.booking_id}` `{res.amount} EUR`\n"
-                f"{paid_line}",
-                ephemeral=True,
-            )
-            # Refresh live messages immediately so the user sees the change.
-            client = interaction.client
-            for coro_name in ("_refresh_slots_message", "_refresh_bookings_message"):
-                fn = getattr(client, coro_name, None)
-                if fn:
-                    asyncio.create_task(fn())
-        else:
-            await interaction.followup.send(
-                f":x: Booking failed: `{err}`", ephemeral=True
-            )
+        await interaction.followup.send(embed=view.embed(), view=view, ephemeral=True)

@@ -1,9 +1,4 @@
-"""List + cancel existing bookings via backbone-web-api.
-
-The /bookings GET shape is HAR-confirmed. The cancel endpoint is best-guess
-based on REST conventions; we'll learn the real shape the first time the
-user runs `/cancel` (the API will return a clear 404/405 if wrong).
-"""
+"""List own bookings and cancel reservations using the USC frontend API."""
 from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -107,33 +102,41 @@ def cancel_booking(
     booking_id: int,
     member_id: int,
 ) -> dict[str, Any]:
-    """Best-effort cancel. Endpoint is guessed; if wrong we'll see a clear API
-    error and adjust. Common Delcom REST conventions try DELETE first,
-    then PATCH."""
-    # The SPA likely calls DELETE /participations/<id> (cancel your own seat)
-    # or DELETE /bookings/<id> (cancel the whole booking — only if you're owner).
-    # Try the participations approach first (less destructive).
-    parts_out = client.get(
-        "/participations",
-        params={"s": {"memberId": member_id, "bookingId": booking_id}},
-    )
-    parts = parts_out.get("data", parts_out) if isinstance(parts_out, dict) else parts_out
-    if parts:
-        part_id = parts[0]["id"]
-        logger.info("Cancelling participation id={} for booking={}", part_id, booking_id)
-        # Try DELETE
+    """Cancel the own reservation's sale, as USC's booking details modal does.
+
+    Paid sales may create a credit sale. A combined purchase must be handled
+    in USC so cancelling one booking cannot cancel other purchased items.
+    Never fall back to another write after an uncertain response.
+    """
+    mine = list_my_bookings(client, member_id=member_id, upcoming_only=True)
+    booking = next((b for b in mine if b.id == booking_id), None)
+    if booking is None or not booking.sale_id:
+        raise RuntimeError("Deze reservatie is niet meer beschikbaar in je eigen boekingen.")
+    sale_id = booking.sale_id
+    response = client.get(f"/sales/{sale_id}", params={
+        "s": {"id": sale_id, "customerPersonId": member_id},
+    })
+    sale = response.get("data", response)
+    if sale.get("id") != sale_id or sale.get("customerPersonId") != member_id:
+        raise RuntimeError("De aankoop hoort niet bij het aangemelde account.")
+    items_out = client.get(f"/sales/{sale_id}/sale-items", params={"join": "booking"})
+    items = items_out.get("data", []) if isinstance(items_out, dict) else items_out
+    if not items or any((it.get("bookingId") or (it.get("booking") or {}).get("id")) != booking_id for it in items):
+        raise RuntimeError("Deze reservatie hoort bij een gecombineerde aankoop. Annuleer ze via KU Leuven Sport.")
+    logger.info("Cancelling own sale id={} for booking={}", sale_id, booking_id)
+    response = client.patch(f"/sales/{sale_id}", {"statusCode": 2})
+    sale = response.get("data", response)
+    if sale.get("id") != sale_id or not (sale.get("statusCode") == 2 or sale.get("creditSales")):
+        raise RuntimeError("Annulering nog niet bevestigd. Vernieuw je boekingen voor je opnieuw probeert.")
+    if any(b.id == booking_id for b in list_my_bookings(client, member_id=member_id, upcoming_only=True)):
+        raise RuntimeError("Annulering verwerkt, maar de reservatie staat nog in het overzicht. Vernieuw je boekingen.")
+    if booking.raw.get("productId") and booking.raw.get("linkedProductId"):
+        from .booking import Slot
+        from .cart import cleanup_slot_cart
+        slot = Slot(int(booking.raw["productId"]), int(booking.raw["linkedProductId"]),
+                    booking.start_iso, booking.end_iso, None, {})
         try:
-            return client._http.delete(  # type: ignore[attr-defined]
-                f"/participations/{part_id}",
-                headers=client._headers(),  # type: ignore[attr-defined]
-            ).raise_for_status() or {"deleted": True, "participationId": part_id}
-        except Exception as e:
-            logger.warning("DELETE /participations/{} failed: {}; trying PATCH status=2", part_id, e)
-            r = client._http.patch(  # type: ignore[attr-defined]
-                f"/participations/{part_id}",
-                json={"status": 2},
-                headers=client._headers(write=True),  # type: ignore[attr-defined]
-            )
-            r.raise_for_status()
-            return r.json()
-    raise RuntimeError(f"No participation found for booking {booking_id}")
+            cleanup_slot_cart(client, slot, member_id)
+        except Exception as error:
+            logger.warning("Cancelled booking cart cleanup failed: {}", type(error).__name__)
+    return response

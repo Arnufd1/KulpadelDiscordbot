@@ -98,6 +98,20 @@ class BackboneClient:
             self._raise(r, f"POST {path}")
         return r.json()
 
+    def patch(self, path: str, body: dict) -> Any:
+        self._maybe_resolve_role_id()
+        r = self._http.patch(path, json=body, headers=self._headers(write=True))
+        if r.status_code >= 400:
+            self._raise(r, f"PATCH {path}")
+        return r.json() if r.content else {}
+
+    def delete(self, path: str) -> Any:
+        self._maybe_resolve_role_id()
+        r = self._http.delete(path, headers=self._headers())
+        if r.status_code >= 400:
+            self._raise(r, f"DELETE {path}")
+        return r.json() if r.content else {}
+
     def close(self) -> None:
         self._http.close()
 

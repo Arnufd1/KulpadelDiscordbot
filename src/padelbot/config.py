@@ -18,6 +18,16 @@ class Settings(BaseSettings):
     padelbot_token_file: Path = Path("./data/tokens.enc")
     padelbot_storage_file: Path = Path("./data/storage_state.json")
     padelbot_card_file: Path = Path("./data/card.enc")
+    padelbot_android_adb: Path | None = None
+    padelbot_android_serial: str = ""
+    padelbot_android_device_id: str = ""
+    padelbot_android_profile_file: Path = Path("./data/android_profile.json")
+    padelbot_android_pin_file: Path = Path("./data/android_pin.enc")
+    padelbot_android_failure_file: Path = Path("./data/android_autologin_failure.json")
+    padelbot_android_autologin: bool = False
+    padelbot_android_emulator_autostart: bool = False
+    padelbot_android_emulator_name: str = "KulPadelAuth"
+    padelbot_android_emulator_home: Path = Path("./data/emulators")
 
     discord_webhook_url: str = ""
     discord_bot_token: str = ""
@@ -31,9 +41,8 @@ class Settings(BaseSettings):
     padel_fire_offset_ms: int = 200    # fire this many ms before slot opens
     padel_local_tz: str = "Europe/Brussels"
 
-    # Keep the IdP session warm: call silent-refresh every N seconds.
-    # Default 25 min — well under typical Shibboleth idle timeout (30-60 min).
-    padelbot_keepalive_interval_s: int = 1500
+    # Periodic HTTP renewal; does not extend an absolute IdP/MFA lifetime.
+    padelbot_keepalive_interval_s: int = Field(default=1500, ge=60)
 
     # Credit card for the headless Worldline driver. .env is gitignored.
     # Alternative: `padelbot set-card` stores them encrypted in data/card.enc.

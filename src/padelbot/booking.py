@@ -1,17 +1,18 @@
-"""Padel slot discovery + reservation.
+"""Padel availability, cart/sale reservation and optional verified payment.
 
-Mapped from the real purchase HAR. Two-step booking (cart + sale) reserves the
-slot. /payments is left to the user — the bot pings Discord with a "go pay
-within N minutes" message.
+The rental frontend combines schedules with overlapping reservations on the
+court and dependent resources; isAvailable alone is not sufficient.
 """
 from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from decimal import Decimal, InvalidOperation
+from typing import Any, Callable
 
 from loguru import logger
 
 from .client import BackboneClient
+from .cart import ensure_cart_item, cleanup_slot_cart
 
 # Constants from HAR — these are stable system values, not per-user.
 SALES_PERSON_ID = 148113   # self-service system user
@@ -34,7 +35,7 @@ class Slot:
 
     @property
     def start_dt(self) -> datetime:
-        return datetime.strptime(self.start_iso[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        return datetime.fromisoformat(_timestamp_key(self.start_iso))
 
     def label(self) -> str:
         d = self.start_dt
@@ -147,6 +148,8 @@ def find_slots(
 
     parent_ids = sorted({int(r["bookableProductId"]) for r in (raw_slots or []) if r.get("bookableProductId")})
     booked = _booked_keys(client, parent_ids=parent_ids, start_utc=day_start_utc, end_utc=day_end_utc)
+    now_utc = datetime.now(timezone.utc)
+    booking_horizon = now_utc + timedelta(hours=168)
 
     slots: list[Slot] = []
     seen: set[tuple[str, int]] = set()
@@ -157,11 +160,16 @@ def find_slots(
         end = r.get("endDate") or r.get("end")
         if not (sid_parent and sid_linked and start and end):
             continue
-        # Trust isAvailable — that's the real "can I book this" signal,
-        # same one the KU Leuven app uses.
+        # isAvailable also remains true for occupied courts. Cross-reference
+        # fully booked reservations, retaining group sessions with free places.
         if r.get("isAvailable") is False:
             continue
-        key = (start, int(sid_parent))
+        if _is_occupied(booked, int(sid_parent), start, end):
+            continue
+        slot_start = datetime.fromisoformat(_timestamp_key(start))
+        if not now_utc < slot_start <= booking_horizon:
+            continue
+        key = (_timestamp_key(start), int(sid_parent))
         if key in seen:
             continue
         seen.add(key)
@@ -210,15 +218,12 @@ def find_slots_window(
     out = client.get("/products/bookable-slots", params={"s": s_filter})
     raw_slots = out.get("data", out) if isinstance(out, dict) else out
 
-    # Source of truth for availability is the `isAvailable` field on each
-    # bookable-slots row — that's what the real KU Leuven app uses. Cross-
-    # referencing /bookings was over-aggressive (filtered group slots where
-    # joining is still allowed). We still query bookings to power the
-    # "is gym open today" signal for the holiday warning.
+    # The slots API describes the schedule, including occupied courts marked
+    # isAvailable=true. Exclude full reservations using their parent court IDs.
     parent_ids = sorted({int(r["bookableProductId"]) for r in (raw_slots or []) if r.get("bookableProductId")})
     booked = _booked_keys(client, parent_ids=parent_ids, start_utc=start_utc, end_utc=end_utc)
     days_with_bookings: set[str] = set()
-    for _pid, sd in booked:
+    for _pid, sd, _ed in booked:
         try:
             dt = datetime.strptime(sd[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).astimezone(tz)
             days_with_bookings.add(dt.strftime("%Y-%m-%d"))
@@ -233,7 +238,8 @@ def find_slots_window(
 
     # API enforces "168 hours ahead" booking horizon from NOW. Filter to avoid
     # surfacing slots that would 403 on /cart-items.
-    booking_horizon = datetime.now(timezone.utc) + timedelta(hours=168)
+    now_utc = datetime.now(timezone.utc)
+    booking_horizon = now_utc + timedelta(hours=168)
 
     slots: list[Slot] = []
     seen: set[tuple[str, int]] = set()
@@ -244,18 +250,15 @@ def find_slots_window(
         end = r.get("endDate") or r.get("end")
         if not (sid_parent and sid_linked and start and end):
             continue
-        # Trust isAvailable — that's the real "can I book this" signal,
-        # same one the KU Leuven app uses.
         if r.get("isAvailable") is False:
             continue
-        # Beyond 168h booking horizon — would 403 on /cart-items
-        try:
-            slot_start = datetime.strptime(start[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
-            if slot_start > booking_horizon:
-                continue
-        except ValueError:
-            pass
-        key = (start, int(sid_parent))
+        if _is_occupied(booked, int(sid_parent), start, end):
+            continue
+        # Past starts and slots outside the opening window cannot be booked.
+        slot_start = datetime.fromisoformat(_timestamp_key(start))
+        if not now_utc < slot_start <= booking_horizon:
+            continue
+        key = (_timestamp_key(start), int(sid_parent))
         if key in seen:
             continue
         seen.add(key)
@@ -366,37 +369,71 @@ def _site_closed_days(
     return closed
 
 
+def _timestamp_key(value: str) -> str:
+    """Compare the same instant regardless of ISO fraction/UTC notation."""
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def _is_occupied(booked: set[tuple[int, str, str]], parent_id: int, start: str, end: str) -> bool:
+    start_key, end_key = _timestamp_key(start), _timestamp_key(end)
+    return any(pid == parent_id and booked_start <= end_key and booked_end >= start_key
+               for pid, booked_start, booked_end in booked)
+
+
 def _booked_keys(
     client: BackboneClient,
     *,
     parent_ids: list[int],
     start_utc: datetime,
     end_utc: datetime,
-) -> set[tuple[int, str]]:
-    """Returns the set of (productId, startDate-iso-Z) tuples that are already
-    booked in [start_utc, end_utc]. The bookable-slots endpoint always claims
-    `isAvailable: true` regardless of bookings — must cross-reference here."""
+) -> set[tuple[int, str, str]]:
+    """Occupied intervals for courts, including shared dependent resources.
+
+    USC's rental view resolves dependant-product-links and excludes any
+    overlapping booking. isAvailable=true alone does not imply a free court.
+    """
     if not parent_ids:
         return set()
+    resources = {pid: {pid} for pid in parent_ids}
+    links_out = client.get("/products/dependant-product-links")
+    links = links_out.get("data", []) if isinstance(links_out, dict) else links_out
+    for link in links or []:
+        if link.get("parentId") in resources and link.get("childId"):
+            resources[link["parentId"]].add(int(link["childId"]))
+    query_ids = sorted({resource for ids in resources.values() for resource in ids})
 
     def _iso_z(d: datetime) -> str:
         return d.strftime("%Y-%m-%dT%H:%M:%S.") + f"{d.microsecond // 1000:03d}Z"
 
-    out = client.get(
-        "/bookings",
-        params={
-            "s": {
-                "productId": {"$in": parent_ids},
-                "startDate": {"$gte": _iso_z(start_utc)},
-                "endDate":   {"$lte": _iso_z(end_utc)},
-                "status": {"$ne": 2},  # exclude cancelled
-            },
-            "limit": 500,
+    params = {
+        "s": {
+            "productId": {"$in": query_ids},
+            # Match the rental frontend's padding for bookings at day edges.
+            "startDate": {"$gte": _iso_z(start_utc - timedelta(hours=2))},
+            "endDate": {"$lte": _iso_z(end_utc + timedelta(hours=2))},
+            "status": {"$ne": 2},
         },
-    )
-    data = out.get("data", out) if isinstance(out, dict) else out
-    booked: set[tuple[int, str]] = set()
+        "limit": 500,
+        "page": 1,
+    }
+    data = []
+    while True:
+        out = client.get("/bookings", params=params)
+        batch = out.get("data", out) if isinstance(out, dict) else out
+        data.extend(batch or [])
+        total = out.get("total") if isinstance(out, dict) else None
+        if total is None or len(data) >= total:
+            break
+        if not batch:
+            raise RuntimeError("De bezette velden konden niet volledig opgehaald worden.")
+        params = {**params, "page": params["page"] + 1}
+    booked: set[tuple[int, str, str]] = set()
     for b in data or []:
+        if b.get("status") == 2:
+            continue
         pid = b.get("productId")
         sd = b.get("startDate")
         if pid is None or not sd:
@@ -406,7 +443,11 @@ def _booked_keys(
         avail = b.get("availableParticipantCount")
         if avail is not None and avail > 0:
             continue
-        booked.add((int(pid), sd))
+        start_key = _timestamp_key(sd)
+        end_key = _timestamp_key(b.get("endDate") or sd)
+        for parent_id, ids in resources.items():
+            if int(pid) in ids:
+                booked.add((parent_id, start_key, end_key))
     return booked
 
 
@@ -481,20 +522,20 @@ def _slot_params(slot: Slot, *, label: str | None = None) -> dict:
     }
 
 
-def add_to_cart(client: BackboneClient, slot: Slot, member_id: int, *, label: str | None = None) -> dict:
+def add_to_cart(client: BackboneClient, slot: Slot, member_id: int, *, label: str | None = None, customer_category: int = 1) -> dict:
     body = {
         "type": "product",
         "productId": slot.bookable_product_id,
         "amount": 1,
         "params": _slot_params(slot, label=label),
-        "category": 1,
+        "category": customer_category,
         "siteId": SITE_ID,
         "memberId": member_id,
     }
-    return client.post("/cart-items", body)
+    return ensure_cart_item(client, slot, member_id, body, category=customer_category, label=label)
 
 
-def create_sale(client: BackboneClient, slot: Slot, member_id: int, *, label: str | None = None) -> dict:
+def create_sale(client: BackboneClient, slot: Slot, member_id: int, *, label: str | None = None, customer_category: int = 1) -> dict:
     """Reserves the slot. Response includes the sale id and (after a follow-up) the booking id."""
     body = {
         "siteId": SITE_ID,
@@ -510,7 +551,7 @@ def create_sale(client: BackboneClient, slot: Slot, member_id: int, *, label: st
                 "courseId": None,
                 "quantity": 1,
                 "params": _slot_params(slot, label=label),
-                "customerCategory": 1,
+                "customerCategory": customer_category,
                 "siteId": SITE_ID,
             }
         ],
@@ -547,6 +588,13 @@ class BookingResult:
     pay_method: str | None = None
     pay_error: str | None = None
     payment_url: str | None = None  # Worldline checkout link if CREDIT_CARD path
+    payment_pending: bool = False  # payment attempted; avoid another payment until checked
+
+
+class BookingPriceChangedError(RuntimeError):
+    def __init__(self, result: BookingResult):
+        super().__init__("KUL wijzigde het bedrag; er is geen betaling gestart.")
+        self.result = result
 
 
 def book(
@@ -557,6 +605,8 @@ def book(
     auto_pay: bool = True,
     me: dict | None = None,
     label: str | None = None,
+    on_3ds_challenge: Callable[[], None] | None = None,
+    expected_amount: Decimal | None = None,
 ) -> BookingResult:
     """Cart → sale → payment (optional).
 
@@ -567,10 +617,18 @@ def book(
     `label` is stored as `primaryPurchaseMessage` (free-text booking note like
     "for Sara & Tom"). Visible in the purchase history.
     """
+    if expected_amount is not None:
+        try:
+            expected_amount = Decimal(str(expected_amount))
+            if not expected_amount.is_finite() or expected_amount <= 0:
+                raise ValueError()
+        except (InvalidOperation, ValueError, TypeError):
+            raise ValueError("Het bevestigde bedrag is ongeldig; er is niets geboekt.") from None
+    category = int(me.get("category") or 0) if me is not None and "category" in me else 1
     logger.info("Adding to cart: {}{}", slot.label(), f" [{label}]" if label else "")
-    add_to_cart(client, slot, member_id, label=label)
+    cart_item = add_to_cart(client, slot, member_id, label=label, customer_category=category)
     logger.info("Creating sale (this reserves the slot)...")
-    sale = create_sale(client, slot, member_id, label=label)
+    sale = create_sale(client, slot, member_id, label=label, customer_category=category)
     sale_id = sale.get("id") or sale.get("data", {}).get("id")
     if not sale_id:
         raise RuntimeError(f"No sale id in response: {sale!r}")
@@ -586,31 +644,59 @@ def book(
         slot=slot,
     )
 
+    if expected_amount is not None:
+        try:
+            actual_amount = Decimal(str(amount))
+            amount_matches = actual_amount.is_finite() and actual_amount == expected_amount
+        except (InvalidOperation, ValueError, TypeError):
+            amount_matches = False
+        if not amount_matches:
+            raise BookingPriceChangedError(result)
+
+    if cart_item:
+        try:
+            cleanup_slot_cart(client, slot, member_id)
+        except Exception as error:
+            # The reservation already exists. Do not report a failed booking or
+            # skip payment merely because cart cleanup needs another read later.
+            logger.warning("Reserved slot cart cleanup failed: {}", type(error).__name__)
+
     # NOTE: `paidFor: True` on a freshly-created booking is a 60-min
     # provisional hold flag, NOT confirmation of payment. The booking auto-
-    # cancels at the 60-min mark without an actual /payments POST.
-    # So always attempt auto_pay; only the /payments success means paid.
+    # expires without an actual payment; the backend confirms completion.
+    # Payment creation and checkout redirects also need backend confirmation.
     if auto_pay and amount and not result.paid:
         try:
-            from .payment import auto_pay as _auto_pay, build_payment_url, PayMethod
+            from .payment import (auto_pay as _auto_pay, build_payment_url, PayMethod,
+                                  wait_for_payment_confirmation, payment_reference,
+                                  PaymentStateUnknownError)
             if me is None:
                 me = client.me()
             method, resp = _auto_pay(client, sale_id=int(sale_id), member_id=member_id, amount=float(amount), me=me)
             result.pay_method = method.name
             if method == PayMethod.CREDIT_CARD:
-                url = build_payment_url(resp, me, float(amount))
-                logger.info("Built payment URL: {}", url)
+                url = build_payment_url(resp)
+                logger.info("Built checkout link for sale {}", sale_id)
                 result.payment_url = url
                 # If a card is stored, drive the Worldline page headlessly.
                 from .worldline_driver import load_card, pay_via_worldline
                 card = load_card()
                 if card and url:
                     logger.info("Driving Worldline checkout headlessly...")
-                    drv = pay_via_worldline(payment_url=url, card=card, headless=True)
-                    if drv.success:
-                        result.paid = True
-                        result.pay_method = "CREDIT_CARD (auto)"
-                        logger.info("Worldline driver SUCCESS: {}", drv.final_url)
+                    drv = pay_via_worldline(payment_url=url, card=card, headless=True,
+                                            on_3ds_challenge=on_3ds_challenge)
+                    if drv.success or drv.submitted:
+                        result.payment_pending = True
+                        result.paid = wait_for_payment_confirmation(
+                            client, sale_id=int(sale_id), member_id=member_id,
+                            amount=float(amount), reference=payment_reference(resp),
+                        )
+                        if result.paid:
+                            result.payment_pending = False
+                            result.pay_method = "CREDIT_CARD (auto)"
+                            logger.info("Backend confirmed payment for sale {}", sale_id)
+                        else:
+                            result.pay_error = drv.error or "Checkout attempted; payment confirmation is pending. Check the sale before paying again."
                     else:
                         result.pay_error = drv.error or "worldline driver failed"
                         logger.warning("Worldline driver FAILED: {}", drv.error)
@@ -620,8 +706,19 @@ def book(
                         logger.info("No card stored; surfacing payment URL only.")
                     result.paid = False
             else:
-                result.paid = True
+                result.payment_pending = True
+                result.paid = wait_for_payment_confirmation(
+                    client, sale_id=int(sale_id), member_id=member_id,
+                    amount=float(amount), reference=payment_reference(resp),
+                    require_collected=method != PayMethod.DIRECT_DEBIT,
+                )
+                if not result.paid:
+                    result.pay_error = "Payment requested; confirmation is pending. Check the sale before paying again."
+                else:
+                    result.payment_pending = False
         except Exception as e:
+            if isinstance(e, PaymentStateUnknownError):
+                result.payment_pending = True
             result.pay_error = str(e)
             logger.warning("auto_pay failed (booking still reserved): {}", e)
 

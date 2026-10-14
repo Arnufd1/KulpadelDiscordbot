@@ -3,11 +3,14 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+.pytest_cache/
+.tools/
 .uv/
 *.pyc
 
 # Project secrets and state
 .env
+.env.*.tmp
 data/
 logs/
 *.log
@@ -23,6 +26,7 @@ card.enc
 # HAR files contain auth tokens, card numbers, cookies — keep local only
 *.har
 har/
+hars etc/
 
 # Build artifacts
 *.egg-info/
