@@ -13,6 +13,8 @@ import subprocess
 import sys
 import time
 from urllib.parse import urlsplit
+import xml.etree.ElementTree as ET
+from loguru import logger
 
 
 def registration_link(link: str) -> str:
@@ -103,6 +105,65 @@ def complete_profile(pin:str,checked:bool=False):
         settings.padelbot_android_failure_file.unlink(missing_ok=True)
 
 
+def enrollment_phase(xml: str) -> str:
+    """Return only a known stage, never account names or PIN contents."""
+    from .android import PACKAGE
+    nodes=list(ET.fromstring(xml).iter('node'))
+    ids={n.get('resource-id','') for n in nodes if n.get('package')==PACKAGE}
+    texts={n.get('text','') for n in nodes if n.get('package')==PACKAGE}
+    if 'Enter a new PIN code (1/2)' in texts:return 'pin_create'
+    if 'Confirm your new PIN (2/2)' in texts:return 'pin_confirm'
+    if texts & {'PIN mismatch, try again …','Please pick a more hard to guess PIN.'}:return 'pin_rejected'
+    if 'For additional protection, some accounts require a second authentication factor (PIN).\n\nPlease set a PIN for the app.' in texts:return 'pin_intro'
+    if texts & {'Is it you trying to sign in?','Select account to log in:'}:return 'login_qr'
+    if PACKAGE+':id/account' in ids:return 'registered'
+    if PACKAGE+':id/initialise' in ids:return 'needs_registration'
+    return 'waiting'
+
+
+def prepare_enrollment(device):
+    """Advance only the known new-PIN introduction, never a sign-in request."""
+    from .android import PACKAGE
+    phase=enrollment_phase(device.dump_hierarchy())
+    if phase=='pin_intro':
+        button=device(resourceId=PACKAGE+':id/positive_button',text='NEXT')
+        if button.count==1 and button.exists:
+            button.click()
+            phase=enrollment_phase(device.dump_hierarchy())
+    return phase
+
+
+def create_enrollment_pin(device,pin):
+    """One guarded create/confirm attempt. Never enter a PIN on a login screen."""
+    from .android import PACKAGE
+    if not re.fullmatch(r'[0-9]{4}',pin):raise ValueError('Kies een PIN van vier cijfers.')
+    if enrollment_phase(device.dump_hierarchy())!='pin_create':
+        raise ValueError('KUL vraagt nog niet om een nieuwe PIN. Er is geen PIN ingevoerd.')
+    for phase in ['pin_create','pin_confirm']:
+        deadline=time.monotonic()+12
+        while enrollment_phase(device.dump_hierarchy())!=phase:
+            current=enrollment_phase(device.dump_hierarchy())
+            if current=='pin_rejected':raise ValueError('KUL weigert deze PIN. Kies een minder voorspelbare PIN.')
+            if current not in {'waiting','pin_create','pin_confirm'} or time.monotonic()>=deadline:
+                raise ValueError('De PIN-stap is veranderd. Controleer de voortgang voordat je opnieuw probeert.')
+            time.sleep(.2)
+        if device(resourceId=PACKAGE+':id/pin_input_not_set').count!=4:
+            raise ValueError('De PIN-invoer is niet leeg. Er is geen PIN ingevoerd.')
+        for digit in pin:
+            if enrollment_phase(device.dump_hierarchy())!=phase:
+                raise ValueError('Het PIN-scherm is veranderd. Er is niet verder ingevoerd.')
+            button=device(resourceId=PACKAGE+':id/button'+digit,text=digit)
+            if button.count!=1 or not button.exists:raise ValueError('Het PIN-toetsenbord is veranderd.')
+            button.click()
+    deadline=time.monotonic()+30
+    while True:
+        phase=enrollment_phase(device.dump_hierarchy())
+        if phase=='registered':return {'phase':phase}
+        if phase=='pin_rejected':raise ValueError('KUL weigert deze PIN. Kies een minder voorspelbare PIN.')
+        if time.monotonic()>=deadline:raise ValueError('KUL heeft de registratie nog niet bevestigd. Controleer de voortgang; de PIN wordt niet opnieuw ingevoerd.')
+        time.sleep(.3)
+
+
 def child_main():
     from filelock import FileLock
     from .android import run_adb, find_adb, PACKAGE, doctor
@@ -110,23 +171,29 @@ def child_main():
     from .emulator import ensure_emulator
     signal.signal(signal.SIGTERM,lambda *_:sys.exit(1))
     lease = None
+    stage='provision'
     identity_lock=FileLock(str(settings.padelbot_token_file)+'.renew.lock',timeout=600)
     try:
         # Match auth renewal's lock order: identity first, then the shared emulator.
         # A PIN changed interactively must be saved before another approver reads it.
         identity_lock.acquire()
         provision()
+        stage='boot'
         lease = ensure_emulator()
         if lease is None:
             raise ValueError("Het toestel is elders geopend; sluit die sessie eerst.")
         installed = run_adb("shell","pm","list","packages",PACKAGE,serial=settings.padelbot_android_serial)
+        stage='install'
         if f"package:{PACKAGE}" not in installed.splitlines():
             apk = Path(".tools/authenticator-apk/official-2.1.16.apk").resolve()
             if not apk.is_file():
                 raise ValueError("De officiële Authenticator-installatie ontbreekt op de server.")
             run_adb("install",str(apk),serial=settings.padelbot_android_serial)
         from .android import connect_device
+        stage='verify_app'
+        if doctor()['app_version']!='2.1.16':raise ValueError('Deze Authenticator-versie wordt nog niet ondersteund.')
         device=connect_device()
+        stage='open_app'
         device.app_start(PACKAGE,wait=True)
         # First launch initialises nextAuth. Avoid presenting a black transition screen.
         device(packageName=PACKAGE).wait(timeout=30)
@@ -151,6 +218,10 @@ def child_main():
                 elif action == "back":
                     run_adb("shell","input","keyevent","4",serial=settings.padelbot_android_serial)
                     answer = {}
+                elif action == 'status':
+                    answer={'phase':prepare_enrollment(device)}
+                elif action == 'setup_pin':
+                    answer=create_enrollment_pin(device,str(request['pin']))
                 elif action == "link":
                     link=registration_link(str(request["link"]))
                     run_adb("shell","am","start","-a","android.intent.action.VIEW","-d",link,"-p",PACKAGE,
@@ -166,8 +237,9 @@ def child_main():
                 print(json.dumps({"error":str(error)}),flush=True)
             except Exception:
                 print(json.dumps({"error":"Toestelactie mislukt. Controleer het scherm."}),flush=True)
-    except BaseException:
-        print(json.dumps({"error":"Het virtuele toestel kon niet starten. Probeer later opnieuw."}),flush=True)
+    except BaseException as error:
+        print(json.dumps({"error":"Het virtuele toestel kon niet starten. Probeer opnieuw of meld deze fout.",
+                          'stage':stage,'error_type':type(error).__name__}),flush=True)
     finally:
         try:
             if lease:
@@ -184,6 +256,43 @@ class DeviceManager:
         self.started = 0
         self.touched = 0
         self.lock = asyncio.Lock()
+        self.lifecycle_lock=asyncio.Lock()
+        self.startup_task=None
+        self.startup_result={}
+        self.enrollment_owner=None
+
+    async def begin(self,user):
+        async with self.lifecycle_lock:
+            return await self._begin(user)
+
+    async def _begin(self,user):
+        # This endpoint must return before Cloudflare's request timeout on a cold boot.
+        if self.startup_task and not self.startup_task.done():
+            if self.enrollment_owner!=user['id']:raise ValueError('Iemand koppelt momenteel een toestel. Probeer het later opnieuw.')
+            return {'state':'starting','ready':False}
+        if self.process and self.process.returncode is None:
+            if self.user_id!=user['id']:raise ValueError('Iemand koppelt momenteel een toestel. Probeer het later opnieuw.')
+            return {'state':'ready','ready':True}
+        self.enrollment_owner=user['id'];self.startup_result={}
+        self.store.audit(user['id'],'device_start_requested')
+        async def launch():
+            try:self.startup_result=await self.start(user)
+            except asyncio.CancelledError:raise
+            except Exception:self.startup_result={'error':'Het toestel kon niet starten. Probeer opnieuw.'}
+            self.store.audit(user['id'],'device_start_failed' if self.startup_result.get('error') else 'device_ready')
+            if self.startup_result.get('error'):
+                logger.warning('Enrollment start failed profile={} stage={} type={}',user['id'],self.startup_result.get('stage','startup'),self.startup_result.get('error_type','unknown'))
+            else:logger.info('Enrollment device ready profile={}',user['id'])
+        self.startup_task=asyncio.create_task(launch())
+        return {'state':'starting','ready':False}
+
+    async def status(self,user_id):
+        if self.enrollment_owner!=user_id:return {'state':'idle','ready':False}
+        self.touched=time.monotonic()
+        if self.startup_task and not self.startup_task.done():return {'state':'starting','ready':False}
+        if self.startup_result.get('error'):return {'state':'failed','ready':False,**self.startup_result}
+        if not self.process or self.process.returncode is not None:return {'state':'idle','ready':False}
+        return {'state':'ready','ready':True,**await self.command(user_id,{'action':'status'})}
 
     async def start(self,user:dict):
         from .web_runtime import tenant_env
@@ -216,12 +325,17 @@ class DeviceManager:
             self.process.stdin.write(json.dumps(command).encode()+b"\n")
             await self.process.stdin.drain()
             try:
-                result = json.loads(await asyncio.wait_for(self.process.stdout.readline(),timeout=45))
+                result = json.loads(await asyncio.wait_for(self.process.stdout.readline(),timeout=75 if command['action']=='setup_pin' else 45))
             except BaseException:
                 await self._stop()
                 raise
             if command["action"] == "finish" and result.get("saved"):
+                self.store.audit(user_id,'device_profile_saved')
+                logger.info('Enrollment profile saved profile={}',user_id)
                 await self._stop()
+            elif command['action'] in {'link','setup_pin'}:
+                self.store.audit(user_id,'device_'+command['action']+('_failed' if result.get('error') else '_sent'))
+                logger.info('Enrollment action={} failed={} profile={}',command['action'],bool(result.get('error')),user_id)
             return result
 
     async def _stop(self):
@@ -236,8 +350,16 @@ class DeviceManager:
         self.user_id = None
 
     async def close(self):
+        async with self.lifecycle_lock:
+            await self._close()
+
+    async def _close(self):
+        if self.startup_task and not self.startup_task.done():
+            self.startup_task.cancel()
+            await asyncio.gather(self.startup_task,return_exceptions=True)
         async with self.lock:
             await self._stop()
+            self.enrollment_owner=None
 
     async def reap(self):
         while True:

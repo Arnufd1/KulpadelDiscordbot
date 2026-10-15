@@ -69,7 +69,7 @@ class BookingRequest(BaseModel):
 
 
 class DeviceRequest(BaseModel):
-    action: str = Field(pattern=r"^(screen|tap|back|link|finish|stop)$")
+    action: str = Field(pattern=r"^(screen|tap|back|link|setup_pin|finish|stop)$")
     x: int = Field(default=0,ge=0,lt=480)
     y: int = Field(default=0,ge=0,lt=800)
     link: str = Field(default="",max_length=2048)
@@ -138,6 +138,7 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
     app = FastAPI(title="Sigmadvisor Padel",lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
     app.state.store, app.state.config = store,config
     app.state.cards, app.state.community = cards,community
+    app.state.devices=devices
     hosts = {urlsplit(config.public_url).hostname,urlsplit(config.tail_url).hostname,"localhost","127.0.0.1","192.168.0.220"}
     app.add_middleware(TrustedHostMiddleware,allowed_hosts=sorted(h for h in hosts if h))
     attempts = {}
@@ -452,12 +453,16 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
 
     @app.post("/api/device/start")
     async def device_start(user=Depends(current)):
-        return await devices.start(user)
+        return await devices.begin(user)
+
+    @app.get('/api/device/status')
+    async def device_status(user=Depends(current)):
+        return await devices.status(user['id'])
 
     @app.post("/api/device/control")
     async def device_control(body:DeviceRequest,user=Depends(current)):
         if body.action=="stop":
-            if devices.user_id!=user["id"]:
+            if devices.enrollment_owner!=user['id'] and devices.user_id!=user["id"]:
                 raise HTTPException(404,"Geen eigen toestelsessie.")
             await devices.close()
             return {"ok":True}

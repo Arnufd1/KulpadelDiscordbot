@@ -22,6 +22,14 @@ De webapp draait naast de bestaande Discord-bot in VM 140 (`padelbot`, Ubuntu 24
 
 De VM heeft 4 GB beschikbaar guestgeheugen voor korte Android-pieken. Free-page-reporting en het vrijgeven van Android-bestandscache laten ongebruikt fysiek hostgeheugen terugkomen. Er staat geen emulator permanent aan en er komt geen VM per gebruiker.
 
+## KUL koppelen
+
+Instellingen bevat een wizard met drie stappen: KUL-accountbeheer openen, de registratie-QR van een nieuw toestel toevoegen (afbeelding kiezen of vanuit het klembord plakken), en een PIN kiezen. Een registratielink is een alternatief. De gewone QR voor aanmelden maakt geen nieuw toestel; bij een herkenbaar aanmeldscherm vraagt de wizard om een registratie-QR.
+
+Het toestel start via een korte POST en een persoonlijke status-API, zodat een koude Android-start geen lange open HTTP-aanvraag vereist. Andere gebruikers kunnen de sessie niet overnemen of de status ervan lezen. De bekende nieuwe-PIN-schermen worden elk eenmaal ingevuld en bevestigd; bestaande accounts, onbekende schermen en aanmeldschermen krijgen geen automatische PIN-invoer. De bestaande PIN-foutblokkering blijft behouden. Pas na een werkelijk geregistreerd account worden profiel/PIN bewaard en wordt een aparte KUL-login uitgevoerd. De interface meldt succes nadat die login slaagt. De handmatige toestelbediening staat onder een optioneel uitklapvak.
+
+Auditregels bevatten alleen de fase (start aangevraagd, toestel klaar/mislukt, registratie verzonden, PIN-setup en profiel bewaard), zonder QR-link, PIN of tokens. De PIN wordt na verzenden uit het formulier gewist. Een gebruiker moet de officiele KUL-registratie nog zelf bevestigen met het bestaande toestel; de website verzamelt geen KUL-wachtwoord.
+
 ## Google en domein
 
 Maak een OAuth-client van type **Web application**, met redirect-URI:
