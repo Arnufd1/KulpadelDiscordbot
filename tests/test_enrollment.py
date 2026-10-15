@@ -7,7 +7,7 @@ import xml.etree.ElementTree as ET
 import pytest
 from test_web import portal,sign_in
 from padelbot.android import PACKAGE
-from padelbot.web_device import DeviceManager,enrollment_phase,create_enrollment_pin
+from padelbot.web_device import DeviceManager,enrollment_phase,create_enrollment_pin,prepare_enrollment,submit_enrollment_pin
 
 
 def qr_image(payload):
@@ -102,6 +102,57 @@ class PinDevice:
                 self.current=[]
                 self.title='Confirm your new PIN (2/2)' if self.title=='Enter a new PIN code (1/2)' else 'registered'
         return SimpleNamespace(count=0 if self.bad_key else 1,exists=True,click=click)
+
+
+class EnrollPinDevice(PinDevice):
+    def __init__(self,rounds=1):super().__init__('Create new account');self.rounds=rounds;self.rejected=False
+    def dump_hierarchy(self):
+        if self.title=='registered':return xml(account=True)
+        root=ET.fromstring(xml(self.title))
+        for name in ['activity_second_factor','pin']:
+            ET.SubElement(root,'node',{'package':PACKAGE,'resource-id':PACKAGE+':id/'+name})
+        if self.rejected:ET.SubElement(root,'node',{'package':PACKAGE,'resource-id':PACKAGE+':id/pin_error','text':'Wrong PIN'})
+        return ET.tostring(root,encoding='unicode')
+    def __call__(self,resourceId,text=None):
+        if resourceId.endswith(':id/pin_input_not_set'):return SimpleNamespace(count=4-len(self.current))
+        assert resourceId==PACKAGE+':id/button'+text
+        def click():
+            self.inputs.append(text);self.current.append(text)
+            if len(self.current)==4:
+                self.current=[]
+                if len(self.inputs)==4*self.rounds:self.title='registered'
+        return SimpleNamespace(count=1,exists=True,click=click)
+
+
+def test_observed_kul_account_confirmation_is_distinct_from_login():
+    root=ET.fromstring(xml('Create new account'))
+    ET.SubElement(root,'node',{'package':PACKAGE,'text':'KU Leuven'})
+    ET.SubElement(root,'node',{'package':PACKAGE,'resource-id':PACKAGE+':id/activity_confirm'})
+    assert enrollment_phase(ET.tostring(root,encoding='unicode'))=='enroll_intro'
+    root[1].set('text','Another provider')
+    assert enrollment_phase(ET.tostring(root,encoding='unicode'))=='waiting'
+    assert enrollment_phase(EnrollPinDevice().dump_hierarchy())=='enroll_pin'
+
+
+def test_enrollment_pin_enters_once_and_waits_for_explicit_confirmation():
+    device=EnrollPinDevice(rounds=2)
+    assert submit_enrollment_pin(device,'7392')=={'phase':'enroll_pin','confirm':True}
+    assert ''.join(device.inputs)=='7392'
+    assert submit_enrollment_pin(device,'7392')=={'phase':'registered'}
+    assert ''.join(device.inputs)=='73927392'
+
+
+def test_enrollment_pin_never_retries_rejected_or_partly_entered_pin():
+    device=EnrollPinDevice();device.rejected=True
+    with pytest.raises(ValueError):submit_enrollment_pin(device,'7392')
+    assert not device.inputs
+    device=EnrollPinDevice();device.current=['7']
+    with pytest.raises(ValueError):submit_enrollment_pin(device,'7392')
+    assert not device.inputs
+    for title in ['Is it you trying to sign in?','Select account to log in:','Unrecognised screen']:
+        device=PinDevice(title)
+        with pytest.raises(ValueError):submit_enrollment_pin(device,'7392')
+        assert not device.inputs
 
 
 def test_pin_setup_enters_once_in_create_and_confirm_only():

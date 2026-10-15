@@ -154,6 +154,10 @@ def enrollment_phase(xml: str) -> str:
     if 'Confirm your new PIN (2/2)' in texts:return 'pin_confirm'
     if texts & {'PIN mismatch, try again …','Please pick a more hard to guess PIN.'}:return 'pin_rejected'
     if 'For additional protection, some accounts require a second authentication factor (PIN).\n\nPlease set a PIN for the app.' in texts:return 'pin_intro'
+    if {'Create new account','KU Leuven'}<=texts and PACKAGE+':id/activity_confirm' in ids:return 'enroll_intro'
+    if 'Create new account' in texts and {PACKAGE+':id/activity_second_factor',PACKAGE+':id/pin'}<=ids:
+        if any(n.get('text','').strip() for n in nodes if n.get('resource-id')==PACKAGE+':id/pin_error'):return 'pin_rejected'
+        return 'enroll_pin'
     if texts & {'Is it you trying to sign in?','Select account to log in:'}:return 'login_qr'
     if PACKAGE+':id/account' in ids:return 'registered'
     if PACKAGE+':id/initialise' in ids:return 'needs_registration'
@@ -164,7 +168,7 @@ def prepare_enrollment(device):
     """Advance only the known new-PIN introduction, never a sign-in request."""
     from .android import PACKAGE
     phase=enrollment_phase(device.dump_hierarchy())
-    if phase=='pin_intro':
+    if phase in {'enroll_intro','pin_intro'}:
         button=device(resourceId=PACKAGE+':id/positive_button',text='NEXT')
         if button.count==1 and button.exists:
             button.click()
@@ -201,6 +205,29 @@ def create_enrollment_pin(device,pin):
         if phase=='pin_rejected':raise ValueError('KUL weigert deze PIN. Kies een minder voorspelbare PIN.')
         if time.monotonic()>=deadline:raise ValueError('KUL heeft de registratie nog niet bevestigd. Controleer de voortgang; de PIN wordt niet opnieuw ingevoerd.')
         time.sleep(.3)
+
+
+def submit_enrollment_pin(device,pin):
+    """One explicit PIN submission on the account-enrolment screen only."""
+    from .android import PACKAGE
+    if not re.fullmatch(r'[0-9]{4}',pin):raise ValueError('Gebruik vier cijfers.')
+    phase=enrollment_phase(device.dump_hierarchy())
+    if phase not in {'enroll_pin','pin_confirm'}:raise ValueError('Het toestel vraagt nu niet om een registratie-PIN.')
+    if device(resourceId=PACKAGE+':id/pin_input_not_set').count!=4:raise ValueError('De PIN-invoer is niet leeg. Controleer het toestel.')
+    for digit in pin:
+        if enrollment_phase(device.dump_hierarchy())!=phase:raise ValueError('Het PIN-scherm is veranderd. Er is niet verder ingevoerd.')
+        button=device(resourceId=PACKAGE+':id/button'+digit,text=digit)
+        if button.count!=1 or not button.exists:raise ValueError('Het PIN-toetsenbord is veranderd.')
+        button.click()
+    started=time.monotonic()
+    while True:
+        current=enrollment_phase(device.dump_hierarchy())
+        if current=='registered':return {'phase':current}
+        if current=='pin_rejected':raise ValueError('De PIN is niet aanvaard. Controleer het toestel voordat je opnieuw probeert.')
+        if current in {'enroll_pin','pin_confirm'} and time.monotonic()-started>=1 and device(resourceId=PACKAGE+':id/pin_input_not_set').count==4:
+            return {'phase':current,'confirm':True}
+        if time.monotonic()-started>20:raise ValueError('De registratie is nog niet bevestigd. Controleer het toestel; de PIN wordt niet opnieuw ingevoerd.')
+        time.sleep(.2)
 
 
 def child_main():
@@ -260,7 +287,8 @@ def child_main():
                 elif action == 'status':
                     answer={'phase':prepare_enrollment(device)}
                 elif action == 'setup_pin':
-                    answer=create_enrollment_pin(device,str(request['pin']))
+                    phase=enrollment_phase(device.dump_hierarchy())
+                    answer=(submit_enrollment_pin if phase in {'enroll_pin','pin_confirm'} else create_enrollment_pin)(device,str(request['pin']))
                 elif action == "link":
                     link=registration_link(str(request["link"]))
                     run_adb("shell","am","start","-a","android.intent.action.VIEW","-d",link,"-p",PACKAGE,
