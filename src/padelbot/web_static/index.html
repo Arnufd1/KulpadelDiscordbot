@@ -57,17 +57,18 @@
     </section>
     <section data-pair-step="2" hidden>
       <h3>Neem de registratie-QR over</h3>
-      <p>Maak een screenshot van de QR bij <strong>Toestel toevoegen</strong>. Plak hem hier of kies een afbeelding.</p>
+      <p>Ga bij <strong>Toestel toevoegen</strong> verder tot de registratie-QR verschijnt. Plak of upload een screenshot; wij zoeken de code in de afbeelding.</p>
       <div class="qr-options">
         <button id="paste-qr" class="qr-paste-target" type="button" aria-keyshortcuts="Control+V Meta+V"><strong>Screenshot plakken</strong><span>Klik hier en druk Ctrl+V</span></button>
         <div class="qr-file-option"><button id="upload-qr" class="button light" type="button">Afbeelding uploaden</button><span>PNG, JPG of WebP</span><input id="device-qr" type="file" accept="image/png,image/jpeg,image/webp" hidden></div>
       </div>
       <p class="help qr-desktop-hint">Knipprogramma: Win+Shift+S, selecteer de QR en druk hier Ctrl+V.</p>
       <p id="qr-feedback" class="qr-feedback" role="status" aria-live="polite"></p>
-      <p class="help">Gebruik de QR voor een nieuw toestel. Een gewone aanmeld-QR koppelt geen account.</p>
+      <p class="help">Een volledige gsm-screenshot mag ook. Gebruik de registratie-QR, niet de download-QR voor Google Play of de App Store.</p>
       <details class="pair-alternative"><summary>Ik heb een registratielink</summary><form id="link-form"><label>Registratielink<input id="device-link" type="url" placeholder="https://icts.kuleuven.be/apps/authenticator/..." required></label><button id="send-device-link" class="button light" disabled>Registratielink gebruiken</button></form></details>
       <button id="pair-back" class="text-button" type="button">Terug naar KUL openen</button>
     </section>
+    <figure id="qr-preview" class="qr-preview" hidden><img id="qr-preview-image" alt="Jouw toegevoegde screenshot met QR-code"><figcaption><span id="qr-preview-state">Afbeelding toegevoegd</span><button id="remove-qr" class="text-button" type="button">Verwijderen</button></figcaption></figure>
     <section data-pair-step="3" hidden>
       <h3 id="pair-pin-title">Kies een PIN</h3>
       <p id="pair-pin-help">Kies vier cijfers voor dit virtuele toestel. Wij stellen de PIN in en testen daarna de KUL-login.</p>

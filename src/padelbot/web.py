@@ -78,7 +78,7 @@ class DeviceRequest(BaseModel):
 
 
 class QRRequest(BaseModel):
-    image: str = Field(max_length=2_800_000)
+    image: str = Field(max_length=10_666_668)
 
 
 class CardRequest(BaseModel):
@@ -173,7 +173,7 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
             if not hmac.compare_digest(session["csrf"],request.headers.get("x-csrf-token","")):
                 return JSONResponse({"detail":"Vernieuw de pagina en probeer opnieuw."},status_code=403)
             length = request.headers.get("content-length")
-            limit=2_800_100 if request.url.path=="/api/device/qr" else 16384
+            limit=10_666_800 if request.url.path=="/api/device/qr" else 16384
             if length and (not length.isdigit() or int(length)>limit):
                 return JSONResponse({"detail":"Aanvraag te groot."},status_code=413)
             body=bytearray()

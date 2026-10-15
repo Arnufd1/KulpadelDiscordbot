@@ -44,7 +44,41 @@ def test_qr_errors_distinguish_unreadable_missing_multiple_and_wrong_codes():
     image=Image.new('RGB',(first.width+second.width+60,max(first.height,second.height)+40),'white')
     image.paste(first,(20,20));image.paste(second,(first.width+40,20))
     with pytest.raises(ValueError,match='meerdere QR-codes'):decode_registration_qr(encoded_image(image))
-    with pytest.raises(ValueError,match='te groot'):decode_registration_qr(base64.b64encode(b'X'*2_000_001).decode())
+    with pytest.raises(ValueError,match='te groot'):decode_registration_qr(base64.b64encode(b'X'*8_000_001).decode())
+
+
+@pytest.mark.parametrize('rotation',[0,90])
+def test_full_phone_screenshot_finds_kul_among_text_and_unrelated_qrs(rotation):
+    from PIL import Image,ImageDraw
+    from padelbot.web_device import decode_registration_qr
+    image=Image.new('RGB',(1440,3200),'#e4e8eb');draw=ImageDraw.Draw(image)
+    for top in range(60,3100,180):
+        draw.rounded_rectangle((30,top,1410,top+140),radius=20,fill='white')
+        draw.text((70,top+20),'KU Leuven account - registered devices - add device',fill='black')
+    image.paste(qr_image('https://play.google.com/store/apps/details?id=example.app'),(70,400))
+    image.paste(qr_image('https://example.test/unrelated'),(900,1000))
+    payload=bytes(range(128));image.paste(qr_image(payload),(850,2500))
+    expected='https://icts.kuleuven.be/apps/authenticator/'+base64.urlsafe_b64encode(payload).decode().rstrip('=')
+    assert decode_registration_qr(encoded_image(image.rotate(rotation,expand=True)))==expected
+
+
+def test_download_qr_has_actionable_feedback_and_no_payload_echo():
+    from padelbot.web_device import decode_registration_qr
+    for link in ['https://play.google.com/store/apps/details?id=example.app','https://apps.apple.com/app/id123456789']:
+        with pytest.raises(ValueError,match='download-QR') as error:decode_registration_qr(encoded_image(qr_image(link)))
+        assert 'Volgende' in str(error.value) and link not in str(error.value)
+
+
+def test_distinct_kul_qrs_are_ambiguous_but_duplicate_same_qr_is_safe():
+    from PIL import Image
+    from padelbot.web_device import decode_registration_qr
+    first=qr_image('https://icts.kuleuven.be/apps/authenticator/TestCodeOne')
+    second=qr_image('https://icts.kuleuven.be/apps/authenticator/TestCodeTwo')
+    image=Image.new('RGB',(first.width+second.width+60,max(first.height,second.height)+40),'white')
+    image.paste(first,(20,20));image.paste(second,(first.width+40,20))
+    with pytest.raises(ValueError,match='meerdere KUL-registratiecodes'):decode_registration_qr(encoded_image(image))
+    image.paste(first,(first.width+40,20))
+    assert decode_registration_qr(encoded_image(image))=='https://icts.kuleuven.be/apps/authenticator/TestCodeOne'
 
 
 def xml(title='',account=False,initial=False):

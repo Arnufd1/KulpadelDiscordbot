@@ -33,25 +33,52 @@ def decode_registration_qr(encoded: str) -> str:
         raw=base64.b64decode(encoded,validate=True)
     except Exception:
         raise ValueError('Dit is geen geldige afbeelding. Plak een screenshot of kies een PNG-, JPG- of WebP-bestand.') from None
-    if len(raw)>2_000_000:raise ValueError('De afbeelding is te groot. Maak een uitsnede van de QR-code (maximaal 2 MB).')
+    if len(raw)>8_000_000:raise ValueError('De afbeelding is te groot. Gebruik een screenshot van maximaal 8 MB.')
     try:
         with Image.open(io.BytesIO(raw)) as image:
-            if image.width*image.height>4_000_000:raise ValueError('size')
-            rgb=image.convert('RGB')
+            if image.width*image.height>16_000_000:raise ValueError('size')
+            rgb=ImageOps.exif_transpose(image).convert('RGB')
     except Exception:
         raise ValueError('De afbeelding kan niet worden gelezen. Maak een uitsnede rond de QR-code en probeer opnieuw.') from None
-    codes=zxingcpp.read_barcodes(rgb,formats=zxingcpp.BarcodeFormat.QRCode)
-    if not codes:codes=zxingcpp.read_barcodes(ImageOps.expand(rgb,border=24,fill='white'),formats=zxingcpp.BarcodeFormat.QRCode)
-    if not codes:raise ValueError('Geen QR-code gevonden. Neem de volledige code mee, met een witte rand eromheen.')
-    if len(codes)!=1:raise ValueError('Er staan meerdere QR-codes in de afbeelding. Maak een uitsnede met alleen de registratie-QR.')
-    payload=bytes(codes[0].bytes)
+    # Search the full screenshot first; UI, text and unrelated QR codes may
+    # surround the registration code. Overlapping crops help smaller codes.
+    rgb.thumbnail((4096,4096),Image.Resampling.LANCZOS)
+    seen=set();valid=set();download=False
+    def scan(image):
+        nonlocal download
+        for code in zxingcpp.read_barcodes(ImageOps.expand(image,border=24,fill='white'),formats=zxingcpp.BarcodeFormat.QRCode):
+            payload=bytes(code.bytes)
+            if payload in seen:continue
+            seen.add(payload)
+            link=_registration_payload(payload)
+            if link:valid.add(link)
+            else:
+                try:download|=urlsplit(payload.decode('ascii')).hostname in {'play.google.com','apps.apple.com','itunes.apple.com'}
+                except (UnicodeDecodeError,ValueError):pass
+        if len(valid)>1:raise ValueError('Er staan meerdere KUL-registratiecodes in de afbeelding. Kies een screenshot met één registratiecode.')
+    scan(rgb)
+    if not valid:
+        scan(ImageOps.autocontrast(ImageOps.grayscale(rgb)))
+    if not valid and max(rgb.size)>1600:
+        def origins(length):return sorted({0,max(0,(length-1600)//2),max(0,length-1600)})
+        for top in origins(rgb.height):
+            for left in origins(rgb.width):
+                scan(rgb.crop((left,top,min(left+1600,rgb.width),min(top+1600,rgb.height))))
+    if valid:return next(iter(valid))
+    if download:raise ValueError('Dit is de download-QR voor de app. Klik in KUL-accountbeheer op Volgende tot de registratie-QR verschijnt en voeg die afbeelding toe.')
+    if not seen:raise ValueError('Geen QR-code gevonden. Zorg dat de volledige QR zichtbaar en scherp is; de rest van je screenshot mag blijven staan.')
+    if len(seen)>1:raise ValueError('Er staan meerdere QR-codes in de afbeelding, maar geen KUL-registratiecode. Ga bij Toestel toevoegen verder tot de registratie-QR verschijnt.')
+    raise ValueError('De QR is gelezen, maar bevat geen KUL-registratiecode. Gebruik Toestel toevoegen in KUL-accountbeheer.')
+
+
+def _registration_payload(payload:bytes) -> str|None:
     # nextAuth enrolment QRs are binary. Its documented deep link is the same
     # raw bytes encoded as unpadded URL-safe base64, under the official app URL.
     # Plain URLs still go through the exact KUL host/path allowlist.
     if payload and all(32<=byte<=126 or byte in {9,10,13} for byte in payload):
         try:return registration_link(payload.decode('ascii').strip())
-        except ValueError:raise ValueError('De QR is gelezen, maar bevat geen KUL-registratiecode. Gebruik Toestel toevoegen in KUL-accountbeheer.') from None
-    if not 16<=len(payload)<=1024:raise ValueError('De QR bevat geen ondersteunde KUL-code. Gebruik de registratie-QR uit KUL-accountbeheer.')
+        except ValueError:return None
+    if not 16<=len(payload)<=1024:return None
     token=base64.urlsafe_b64encode(payload).decode('ascii').rstrip('=')
     return registration_link('https://icts.kuleuven.be/apps/authenticator/'+token)
 
