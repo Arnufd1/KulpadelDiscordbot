@@ -49,15 +49,15 @@
     <ol class="pair-steps" aria-label="Koppelstappen"><li data-pair-marker="1" aria-current="step">1. KUL openen</li><li data-pair-marker="2">2. QR toevoegen</li><li data-pair-marker="3">3. Afronden</li></ol>
     <p id="pair-progress" class="pair-progress" role="status">Je persoonlijke toestel wordt klaargezet.</p>
     <section data-pair-step="1">
-      <h3>Voeg een nieuw toestel toe</h3>
-      <p>Open KUL-accountbeheer en meld je aan met je eigen telefoon. Kies bij je authenticatortoestellen <strong>Nieuw toestel toevoegen</strong>.</p>
+      <h3>Toestel toevoegen</h3>
+      <p>Open KUL-accountbeheer en meld je aan met je eigen telefoon. Kies bij je authenticatortoestellen <strong>Toestel toevoegen</strong>.</p>
       <a id="open-kul-registration" class="button dark" href="https://account.kuleuven.be/mfa" target="_blank" rel="noopener">Open KUL-accountbeheer &nearr;</a>
       <p class="help">Je bestaande telefoon blijft gekoppeld. Je voegt hier je persoonlijke toestel voor de padeltool toe.</p>
       <button id="pair-next" class="button light" type="button">De registratie-QR is zichtbaar &rarr;</button>
     </section>
     <section data-pair-step="2" hidden>
       <h3>Neem de registratie-QR over</h3>
-      <p>Maak een screenshot van de QR bij <strong>Nieuw toestel toevoegen</strong>. Kies de afbeelding hieronder of plak hem met Ctrl+V.</p>
+      <p>Maak een screenshot van de QR bij <strong>Toestel toevoegen</strong>. Kies de afbeelding hieronder of plak hem met Ctrl+V.</p>
       <label class="qr-upload" for="device-qr">Registratie-QR toevoegen<input id="device-qr" type="file" accept="image/png,image/jpeg,image/webp" disabled></label>
       <p class="help">Gebruik de QR voor een nieuw toestel. Een gewone aanmeld-QR koppelt geen account.</p>
       <details class="pair-alternative"><summary>Ik heb een registratielink</summary><form id="link-form"><label>Registratielink<input id="device-link" type="url" placeholder="https://icts.kuleuven.be/apps/authenticator/..." required></label><button id="send-device-link" class="button light" disabled>Registratielink gebruiken</button></form></details>
