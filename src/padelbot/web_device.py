@@ -27,21 +27,33 @@ def registration_link(link: str) -> str:
 
 def decode_registration_qr(encoded: str) -> str:
     import io
-    from PIL import Image
+    from PIL import Image,ImageOps
     import zxingcpp
     try:
         raw=base64.b64decode(encoded,validate=True)
-        if len(raw)>2_000_000:
-            raise ValueError()
-        with Image.open(io.BytesIO(raw)) as image:
-            if image.width*image.height>4_000_000:
-                raise ValueError()
-            codes=zxingcpp.read_barcodes(image.convert('RGB'),formats=zxingcpp.BarcodeFormat.QRCode)
-            if len(codes)!=1:
-                raise ValueError()
-            return registration_link(codes[0].text)
     except Exception:
-        raise ValueError("Geen geldige KUL-registratie-QR-code gevonden. Upload één duidelijke QR-code uit KUL-accountbeheer.") from None
+        raise ValueError('Dit is geen geldige afbeelding. Plak een screenshot of kies een PNG-, JPG- of WebP-bestand.') from None
+    if len(raw)>2_000_000:raise ValueError('De afbeelding is te groot. Maak een uitsnede van de QR-code (maximaal 2 MB).')
+    try:
+        with Image.open(io.BytesIO(raw)) as image:
+            if image.width*image.height>4_000_000:raise ValueError('size')
+            rgb=image.convert('RGB')
+    except Exception:
+        raise ValueError('De afbeelding kan niet worden gelezen. Maak een uitsnede rond de QR-code en probeer opnieuw.') from None
+    codes=zxingcpp.read_barcodes(rgb,formats=zxingcpp.BarcodeFormat.QRCode)
+    if not codes:codes=zxingcpp.read_barcodes(ImageOps.expand(rgb,border=24,fill='white'),formats=zxingcpp.BarcodeFormat.QRCode)
+    if not codes:raise ValueError('Geen QR-code gevonden. Neem de volledige code mee, met een witte rand eromheen.')
+    if len(codes)!=1:raise ValueError('Er staan meerdere QR-codes in de afbeelding. Maak een uitsnede met alleen de registratie-QR.')
+    payload=bytes(codes[0].bytes)
+    # nextAuth enrolment QRs are binary. Its documented deep link is the same
+    # raw bytes encoded as unpadded URL-safe base64, under the official app URL.
+    # Plain URLs still go through the exact KUL host/path allowlist.
+    if payload and all(32<=byte<=126 or byte in {9,10,13} for byte in payload):
+        try:return registration_link(payload.decode('ascii').strip())
+        except ValueError:raise ValueError('De QR is gelezen, maar bevat geen KUL-registratiecode. Gebruik Toestel toevoegen in KUL-accountbeheer.') from None
+    if not 16<=len(payload)<=1024:raise ValueError('De QR bevat geen ondersteunde KUL-code. Gebruik de registratie-QR uit KUL-accountbeheer.')
+    token=base64.urlsafe_b64encode(payload).decode('ascii').rstrip('=')
+    return registration_link('https://icts.kuleuven.be/apps/authenticator/'+token)
 
 
 def provision():

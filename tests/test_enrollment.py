@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import io
 import json
 from types import SimpleNamespace
 import xml.etree.ElementTree as ET
@@ -6,6 +8,43 @@ import pytest
 from test_web import portal,sign_in
 from padelbot.android import PACKAGE
 from padelbot.web_device import DeviceManager,enrollment_phase,create_enrollment_pin
+
+
+def qr_image(payload):
+    from PIL import Image
+    import zxingcpp
+    bitmap=memoryview(zxingcpp.write_barcode(zxingcpp.BarcodeFormat.QRCode,payload,300,300))
+    return Image.frombytes('L',(bitmap.shape[1],bitmap.shape[0]),bitmap.tobytes())
+
+
+def encoded_image(image):
+    stream=io.BytesIO();image.save(stream,format='PNG')
+    return base64.b64encode(stream.getvalue()).decode('ascii')
+
+
+def test_binary_nextauth_qr_preserves_raw_bytes_in_official_deep_link():
+    from padelbot.web_device import decode_registration_qr
+    payload=bytes(range(256))
+    link=decode_registration_qr(encoded_image(qr_image(payload)))
+    assert link=='https://icts.kuleuven.be/apps/authenticator/'+base64.urlsafe_b64encode(payload).decode().rstrip('=')
+    token=link.rsplit('/',1)[1]
+    assert base64.urlsafe_b64decode(token+'='*(-len(token)%4))==payload
+
+
+def test_qr_errors_distinguish_unreadable_missing_multiple_and_wrong_codes():
+    from PIL import Image
+    from padelbot.web_device import decode_registration_qr
+    with pytest.raises(ValueError,match='geldige afbeelding'):decode_registration_qr('not base64')
+    with pytest.raises(ValueError,match='kan niet worden gelezen'):decode_registration_qr(base64.b64encode(b'not an image').decode())
+    with pytest.raises(ValueError,match='Geen QR-code gevonden'):decode_registration_qr(encoded_image(Image.new('RGB',(320,320),'white')))
+    wrong='https://example.test/not-kul'
+    with pytest.raises(ValueError,match='QR is gelezen') as error:decode_registration_qr(encoded_image(qr_image(wrong)))
+    assert wrong not in str(error.value)
+    first=qr_image('https://example.test/one');second=qr_image('https://example.test/two')
+    image=Image.new('RGB',(first.width+second.width+60,max(first.height,second.height)+40),'white')
+    image.paste(first,(20,20));image.paste(second,(first.width+40,20))
+    with pytest.raises(ValueError,match='meerdere QR-codes'):decode_registration_qr(encoded_image(image))
+    with pytest.raises(ValueError,match='te groot'):decode_registration_qr(base64.b64encode(b'X'*2_000_001).decode())
 
 
 def xml(title='',account=False,initial=False):
