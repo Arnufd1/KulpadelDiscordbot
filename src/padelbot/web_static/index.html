@@ -60,7 +60,7 @@
       <h3>Toestel toevoegen</h3>
       <p>Open KUL-accountbeheer en meld je aan met je eigen telefoon. Kies bij je authenticatortoestellen <strong>Toestel toevoegen</strong>.</p>
       <a id="open-kul-registration" class="button dark" href="https://account.kuleuven.be/mfa" target="_blank" rel="noopener">Open KUL-accountbeheer &nearr;</a>
-      <p class="help">Je bestaande telefoon blijft gekoppeld. Je voegt hier je persoonlijke toestel voor de padeltool toe.</p>
+      <p class="help">Je voegt het toestel <strong>padelreservering-auth</strong> toe.</p>
       <button id="pair-next" class="button light" type="button">De registratie-QR is zichtbaar &rarr;</button>
     </section>
     <section data-pair-step="2" hidden>
@@ -79,15 +79,14 @@
     <figure id="qr-preview" class="qr-preview" hidden><img id="qr-preview-image" alt="Jouw toegevoegde screenshot met QR-code"><figcaption><span id="qr-preview-state">Afbeelding toegevoegd</span><button id="remove-qr" class="text-button" type="button">Verwijderen</button></figcaption></figure>
     <section data-pair-step="3" hidden>
       <h3 id="pair-pin-title">Kies een PIN</h3>
-      <p id="pair-pin-help">Kies vier cijfers voor dit virtuele toestel. Wij stellen de PIN in en testen daarna de KUL-login.</p>
-      <form id="pin-form"><label>PIN voor dit toestel<input id="device-pin" type="password" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" autocomplete="new-password" required disabled></label><label id="pin-check-label" class="checkbox" hidden><input id="pin-checked" type="checkbox"> Ik heb de bestaande PIN handmatig op dit toestel gecontroleerd.</label><button id="finish-device" class="button dark" disabled>Koppelen en testen</button></form>
+      <p id="pair-pin-help">Gebruik vier cijfers voor padelreservering-auth.</p>
+      <form id="pin-form"><label for="device-pin">PIN</label><div class="pin-input"><input id="device-pin" type="password" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" autocomplete="new-password" required disabled><button class="pin-eye" type="button" data-pin-toggle="device-pin" aria-label="PIN tonen" aria-pressed="false"></button></div><label for="device-pin-confirm">PIN bevestigen</label><div class="pin-input"><input id="device-pin-confirm" type="password" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" autocomplete="new-password" required disabled><button class="pin-eye" type="button" data-pin-toggle="device-pin-confirm" aria-label="PIN bevestiging tonen" aria-pressed="false"></button></div><button id="finish-device" class="button dark" disabled>Koppelen</button></form>
       <button id="pair-new-qr" class="text-button" type="button">Een andere registratie-QR gebruiken</button>
     </section>
-    <section id="pair-complete" hidden><h3 id="pair-complete-title">KUL gekoppeld</h3><p id="pair-complete-text"></p><button id="pair-check-login" class="button light" type="button" hidden>Controle vernieuwen</button></section>
+    <section id="pair-complete" hidden><h3 id="pair-complete-title">Gekoppeld</h3><p id="pair-complete-text"></p><button id="pair-check-login" class="button light" type="button" hidden>Controle vernieuwen</button></section>
     <p id="device-message" class="pair-message" role="alert"></p>
     <button id="retry-device" class="button light" type="button" hidden>Toestel opnieuw starten</button>
     <button id="close-device-footer" class="button light pair-close" type="button">Sluiten</button>
-    <details id="device-advanced" class="pair-alternative"><summary>Toestelscherm bekijken</summary><div class="phone"><img id="device-screen" alt="Jouw persoonlijke virtuele KUL Authenticator" width="480" height="800" hidden><span id="device-loading">Het toestel wordt klaargezet.</span></div><button id="device-back" class="text-button" type="button">Terug op toestel</button></details>
   </dialog>
   <noscript>Schakel JavaScript in om je profiel en boekingen te beheren.</noscript>
 </body></html>

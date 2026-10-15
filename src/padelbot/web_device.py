@@ -9,7 +9,6 @@ from pathlib import Path
 import re
 import signal
 import shutil
-import subprocess
 import sys
 import time
 from urllib.parse import urlsplit
@@ -89,13 +88,21 @@ def provision():
     name = settings.padelbot_android_emulator_name
     avd = home / (name+".avd")
     if (home / (name+".ini")).exists():
+        config=avd/'config.ini'
+        if config.is_file():
+            text=config.read_text()
+            lines=[line for line in text.splitlines() if not line.startswith('avd.ini.displayname=')]
+            updated='\n'.join(lines+['avd.ini.displayname=padelreservering-auth'])+'\n'
+            if updated!=text:
+                pending=config.with_suffix('.ini.tmp')
+                pending.write_text(updated);pending.chmod(0o600);pending.replace(config)
         return
     if shutil.disk_usage(home.parent).free < 6*1024**3:
         raise ValueError("Er is momenteel onvoldoende opslagruimte voor een nieuw toestel. Neem contact op met de beheerder.")
     avd.mkdir(parents=True,exist_ok=True,mode=0o700)
     # Fresh userdata comes from the vendor image. No registered account is cloned.
     (home/(name+".ini")).write_text(f"avd.ini.encoding=UTF-8\npath={avd}\ntarget=android-35\n")
-    config = {"AvdId":name,"avd.ini.displayname":"Sigmadvisor private authenticator","abi.type":"x86_64",
+    config = {"AvdId":name,"avd.ini.displayname":"padelreservering-auth","abi.type":"x86_64",
               "hw.cpu.arch":"x86_64","hw.cpu.ncore":"1","hw.ramSize":"2560","hw.lcd.width":"480",
               "hw.lcd.height":"800","hw.lcd.density":"240","hw.keyboard":"yes","hw.mainKeys":"no",
               "hw.gpu.enabled":"yes","hw.gpu.mode":"swiftshader_indirect","hw.camera.back":"none",
@@ -116,11 +123,9 @@ def save_profile(pin: str):
     if info["app_version"] != "2.1.16":
         raise ValueError("Deze appversie moet eerst door de beheerder worden gecontroleerd.")
     device = connect_device()
-    device.app_start(PACKAGE)
-    if not device(packageName=PACKAGE,resourceId=PACKAGE+":id/account").wait(timeout=15):
-        raise ValueError("Registreer eerst je KUL-account in dit virtuele toestel.")
+    verify_saved_account(device)
     initial = initialise_key()
-    profile = {"version":1,"serial":info["serial"],"device_id":info["device_id"],"app_version":info["app_version"],
+    profile = {"version":1,"enrollment_verified":True,"name":"padelreservering-auth","serial":info["serial"],"device_id":info["device_id"],"app_version":info["app_version"],
                "startup_guard":{"resourceId":PACKAGE+":id/account"},"steps":[
                    {"action":"click","selector":{"resourceId":PACKAGE+":id/positive_button","text":"NEXT"},
                     "guard":{"resourceId":PACKAGE+":id/title","text":"Select account to log in:"}},
@@ -138,7 +143,7 @@ def complete_profile(pin:str,checked:bool=False):
     from .config import settings
     failed=settings.padelbot_android_failure_file.exists()
     if failed and checked is not True:
-        raise ValueError('Controleer eerst de PIN handmatig op dit toestel en bevestig dat hieronder.')
+        raise ValueError('De PIN is geblokkeerd na een mislukte poging. Neem contact op met de beheerder.')
     save_profile(pin)
     if failed and checked is True:
         settings.padelbot_android_failure_file.unlink(missing_ok=True)
@@ -159,9 +164,31 @@ def enrollment_phase(xml: str) -> str:
         if any(n.get('text','').strip() for n in nodes if n.get('resource-id')==PACKAGE+':id/pin_error'):return 'pin_rejected'
         return 'enroll_pin'
     if texts & {'Is it you trying to sign in?','Select account to log in:'}:return 'login_qr'
-    if PACKAGE+':id/account' in ids:return 'registered'
+    # Enrollment/login activities also contain an account label. Only the
+    # home screen's saved account proves that enrollment has completed.
+    if {PACKAGE+':id/activity_main',PACKAGE+':id/account'}<=ids:return 'registered'
     if PACKAGE+':id/initialise' in ids:return 'needs_registration'
     return 'waiting'
+
+
+def verify_saved_account(device):
+    """Require a saved home-screen account, including after an app restart."""
+    from .android import PACKAGE,run_adb
+    from .config import settings
+    def wait_registered():
+        deadline=time.monotonic()+20
+        while enrollment_phase(device.dump_hierarchy())!='registered':
+            if time.monotonic()>=deadline:
+                raise ValueError('KUL heeft het account nog niet op dit toestel bewaard. Voeg opnieuw een registratie-QR toe.')
+            time.sleep(.3)
+    wait_registered()
+    # Let the Activity/SDK finish committing before proving process persistence.
+    device.press('home')
+    time.sleep(1)
+    run_adb('shell','sync',serial=settings.padelbot_android_serial)
+    device.app_stop(PACKAGE)
+    device.app_start(PACKAGE,wait=True)
+    wait_registered()
 
 
 def prepare_enrollment(device):
@@ -230,9 +257,23 @@ def submit_enrollment_pin(device,pin):
         time.sleep(.2)
 
 
+def setup_enrollment_pin(device,pin,confirm_pin):
+    """One user-confirmed create/confirm operation; never replay a login PIN."""
+    if not re.fullmatch(r'[0-9]{4}',pin) or pin!=confirm_pin:
+        raise ValueError('Vul tweemaal dezelfde PIN van vier cijfers in.')
+    phase=enrollment_phase(device.dump_hierarchy())
+    if phase=='pin_create':return create_enrollment_pin(device,pin)
+    result=submit_enrollment_pin(device,pin)
+    if result.get('confirm') and phase=='enroll_pin':
+        result=submit_enrollment_pin(device,confirm_pin)
+    if result.get('confirm'):
+        raise ValueError('KUL heeft de PIN nog niet bevestigd. De PIN wordt niet opnieuw ingevoerd.')
+    return result
+
+
 def child_main():
     from filelock import FileLock
-    from .android import run_adb, find_adb, PACKAGE, doctor
+    from .android import run_adb, PACKAGE, doctor
     from .config import settings
     from .emulator import ensure_emulator
     signal.signal(signal.SIGTERM,lambda *_:sys.exit(1))
@@ -259,6 +300,7 @@ def child_main():
         stage='verify_app'
         if doctor()['app_version']!='2.1.16':raise ValueError('Deze Authenticator-versie wordt nog niet ondersteund.')
         device=connect_device()
+        run_adb('shell','settings','put','global','device_name','padelreservering-auth',serial=settings.padelbot_android_serial)
         stage='open_app'
         device.app_start(PACKAGE,wait=True)
         # First launch initialises nextAuth. Avoid presenting a black transition screen.
@@ -271,31 +313,17 @@ def child_main():
                 if action == "stop":
                     print("{}",flush=True)
                     break
-                elif action == "screen":
-                    result = subprocess.run([str(find_adb()),"-s",settings.padelbot_android_serial,"exec-out","screencap","-p"],
-                                            capture_output=True,timeout=15,check=True)
-                    answer = {"image":base64.b64encode(result.stdout).decode()}
-                elif action == "tap":
-                    x,y = int(request["x"]),int(request["y"])
-                    if not (0<=x<480 and 0<=y<800):
-                        raise ValueError("Ongeldige schermpositie.")
-                    run_adb("shell","input","tap",str(x),str(y),serial=settings.padelbot_android_serial)
-                    answer = {}
-                elif action == "back":
-                    run_adb("shell","input","keyevent","4",serial=settings.padelbot_android_serial)
-                    answer = {}
                 elif action == 'status':
                     answer={'phase':prepare_enrollment(device)}
                 elif action == 'setup_pin':
-                    phase=enrollment_phase(device.dump_hierarchy())
-                    answer=(submit_enrollment_pin if phase in {'enroll_pin','pin_confirm'} else create_enrollment_pin)(device,str(request['pin']))
+                    answer=setup_enrollment_pin(device,str(request['pin']),str(request.get('confirm_pin','')))
                 elif action == "link":
                     link=registration_link(str(request["link"]))
                     run_adb("shell","am","start","-a","android.intent.action.VIEW","-d",link,"-p",PACKAGE,
                             serial=settings.padelbot_android_serial)
                     answer = {}
                 elif action == "finish":
-                    complete_profile(str(request["pin"]),request.get('checked') is True)
+                    complete_profile(str(request["pin"]))
                     answer = {"saved":True}
                 else:
                     raise ValueError("Onbekende actie.")
@@ -303,7 +331,7 @@ def child_main():
             except ValueError as error:
                 print(json.dumps({"error":str(error)}),flush=True)
             except Exception:
-                print(json.dumps({"error":"Toestelactie mislukt. Controleer het scherm."}),flush=True)
+                print(json.dumps({"error":"Koppelen mislukt. Probeer opnieuw of neem contact op met de beheerder."}),flush=True)
     except BaseException as error:
         print(json.dumps({"error":"Het virtuele toestel kon niet starten. Probeer opnieuw of meld deze fout.",
                           'stage':stage,'error_type':type(error).__name__}),flush=True)
@@ -387,8 +415,7 @@ class DeviceManager:
         async with self.lock:
             if user_id!=self.user_id or not self.process or self.process.returncode is not None:
                 raise ValueError("Start eerst je eigen toestel.")
-            if command["action"]!="screen":
-                self.touched = time.monotonic()
+            self.touched = time.monotonic()
             self.process.stdin.write(json.dumps(command).encode()+b"\n")
             await self.process.stdin.drain()
             try:

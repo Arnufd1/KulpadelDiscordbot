@@ -69,12 +69,11 @@ class BookingRequest(BaseModel):
 
 
 class DeviceRequest(BaseModel):
-    action: str = Field(pattern=r"^(screen|tap|back|link|setup_pin|finish|stop)$")
-    x: int = Field(default=0,ge=0,lt=480)
-    y: int = Field(default=0,ge=0,lt=800)
+    model_config = ConfigDict(extra='forbid')
+    action: str = Field(pattern=r"^(link|setup_pin|finish|stop)$")
     link: str = Field(default="",max_length=2048)
     pin: str = Field(default="",max_length=12)
-    checked: bool = False
+    confirm_pin: str = Field(default="",max_length=12)
 
 
 class QRRequest(BaseModel):
@@ -273,9 +272,13 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
     @app.get("/api/me")
     def me(request:Request,user=Depends(current)):
         env = tenant_env(store,user)
+        connected=Path(env['PADELBOT_TOKEN_FILE']).exists()
+        profile=Path(env['PADELBOT_ANDROID_PROFILE_FILE'])
+        try:verified=json.loads(profile.read_text()).get('enrollment_verified') is True
+        except (OSError,ValueError,AttributeError):verified=False
         return {"id":user["id"],"name":user["name"],"email":user["email"],"owner":bool(user["owner"]),
             "admin":bool(user["owner"] and request.state.session["admin_until"]>time.time()),"csrf":request.state.session["csrf"],
-            "connected":Path(env["PADELBOT_TOKEN_FILE"]).exists(),"device_ready":Path(env["PADELBOT_ANDROID_PROFILE_FILE"]).exists(),
+            "connected":connected,"device_ready":profile.exists() and (verified or connected),
             "needs_attention":Path(env["PADELBOT_ANDROID_FAILURE_FILE"]).exists(),
             "discord_linked":community.hub.linked(user['id']),
             "preferences":store.preferences(user["id"])}

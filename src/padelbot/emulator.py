@@ -53,6 +53,10 @@ class StartedEmulator:
                 return
             if self.process.poll() is None:
                 try:
+                    run_adb('shell', 'sync', serial=self.serial)
+                except RuntimeError:
+                    logger.warning('Virtual Android could not flush storage before shutdown.')
+                try:
                     run_adb("emu", "kill", serial=self.serial)
                 except RuntimeError:
                     logger.warning("Virtual Android did not accept shutdown; stopping its owned process.")

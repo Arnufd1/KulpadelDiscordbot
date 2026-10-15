@@ -139,11 +139,11 @@ def test_shutdown_releases_only_the_owned_process_even_when_adb_fails(monkeypatc
         commands.append((args, serial))
         if mode != 'graceful':
             raise RuntimeError('ADB unavailable')
-        process.returncode = 0
+        if args == ('emu', 'kill'):process.returncode = 0
     monkeypatch.setattr(android, 'run_adb', adb)
     started = emulator.StartedEmulator('emulator-5554', process)
     started.close()
-    assert commands == [(('emu', 'kill'), 'emulator-5554')]
+    assert commands == [(('shell', 'sync'), 'emulator-5554'), (('emu', 'kill'), 'emulator-5554')]
     assert process.returncode == 0
     assert ('terminate' in process.actions) == (mode != 'graceful')
     assert ('kill' in process.actions) == (mode == 'kill')
@@ -158,11 +158,11 @@ def test_failed_cold_boot_still_stops_the_launched_emulator(virtual_setup, monke
     commands = []
     def adb(*args, serial):
         commands.append((args, serial))
-        process.returncode = 0
+        if args == ('emu', 'kill'):process.returncode = 0
     monkeypatch.setattr(android, 'run_adb', adb)
     with pytest.raises(RuntimeError, match='did not finish'):
         emulator.ensure_emulator(timeout=0)
-    assert commands == [(('emu', 'kill'), 'emulator-5554')]
+    assert commands == [(('shell', 'sync'), 'emulator-5554'), (('emu', 'kill'), 'emulator-5554')]
     assert process.returncode == 0
 
 

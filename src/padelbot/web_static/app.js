@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-let me = null, activePage = 'slots', booking = null, deviceTimer = null, deviceBusy = false, communityFilter = 'all';
+let me = null, activePage = 'slots', booking = null, deviceTimer = null, communityFilter = 'all';
 const days = ['Maandag','Dinsdag','Woensdag','Donderdag','Vrijdag','Zaterdag','Zondag'];
 const titles = {slots:'Beschikbaarheid',bookings:'Mijn boekingen',online:'Online boekingen',rules:'Autobooking',settings:'Instellingen',admin:'Beheer'};
 const date = iso => new Date(iso).toLocaleDateString('nl-BE',{timeZone:'Europe/Brussels',weekday:'long',day:'numeric',month:'long'});
@@ -14,7 +14,7 @@ async function guarded(fn){try{await fn();}catch(e){if($('device-dialog').open)$
 async function waitForJob(job_id,text='KUL controleren...',timeoutMs=740000){message(text,false,true);const deadline=Date.now()+timeoutMs;for(let i=0;Date.now()<deadline;i++){await new Promise(r=>setTimeout(r,Math.min(2000,Math.max(1,deadline-Date.now()))));if(Date.now()>=deadline)break;const job=await api('/api/jobs/'+job_id,'GET',undefined,Math.min(30000,Math.max(1,deadline-Date.now())));if(job.status==='done'){message('');return job.result;}if(['failed','unknown','cancelled'].includes(job.status))throw new Error(job.result?.error||'De taak kon niet worden afgerond.');if(i===8)message('Nog even geduld. De KUL-login wordt gecontroleerd.',false,true);}const error=new Error('De controle loopt nog. Je kunt de voortgang opnieuw ophalen.');error.pending=true;throw error;}
 async function task(path,body={},text='Even ophalen bij KU Leuven Sport...'){message(text,false,true);const queued=await api(path,'POST',body);if(!queued.job_id){message('');return queued;}return waitForJob(queued.job_id,text);}
 function empty(container,title,text){container.replaceChildren();const box=el('div','empty');box.append(el('span','empty-icon','◫'),el('h3','',title),el('p','',text));container.append(box);}
-function applyMe(){ $('profile-name').textContent=me.name;$('avatar').textContent=me.name.charAt(0).toUpperCase();$('admin-nav').hidden=me.owner!==true;$('app').classList.toggle('owner',me.owner===true);$('discord-status').textContent=me.discord_linked?'Gekoppeld':'Niet gekoppeld';$('link-discord').hidden=!!me.discord_linked;if(me.discord_linked)$('discord-link-code').hidden=true;$('setup-banner').hidden=me.connected;$('connection-dot').classList.toggle('connected',me.connected);$('connection-label').textContent=me.connected?'KUL-account gekoppeld':'Account koppelen';$('device-state').textContent=me.device_ready?'Gekoppeld':'Niet gekoppeld';$('start-device').hidden=false;$('start-device').textContent=me.device_ready?'Toestel beheren':'KUL koppelen';$('pin-check-label').hidden=!me.needs_attention;if(me.needs_attention)$('device-state').textContent='Controleer je toestel en PIN voordat je een nieuwe login toestaat.';$('auto-pay').checked=!!me.preferences.automatic_payment;$('max-amount').value=me.preferences.max_amount||0;}
+function applyMe(){ $('profile-name').textContent=me.name;$('avatar').textContent=me.name.charAt(0).toUpperCase();$('admin-nav').hidden=me.owner!==true;$('app').classList.toggle('owner',me.owner===true);$('discord-status').textContent=me.discord_linked?'Gekoppeld':'Niet gekoppeld';$('link-discord').hidden=!!me.discord_linked;if(me.discord_linked)$('discord-link-code').hidden=true;$('setup-banner').hidden=me.connected;$('connection-dot').classList.toggle('connected',me.connected);$('connection-label').textContent=me.connected?'KUL-account gekoppeld':'Account koppelen';$('device-state').textContent=me.device_ready?'Gekoppeld':'Niet gekoppeld';$('start-device').hidden=false;$('start-device').textContent=me.device_ready?'Toestel beheren':'KUL koppelen';if(me.needs_attention)$('device-state').textContent='Neem contact op met de beheerder om de koppeling te herstellen.';$('auto-pay').checked=!!me.preferences.automatic_payment;$('max-amount').value=me.preferences.max_amount||0;}
 async function loadMe(){me=await api('/api/me');applyMe();}
 async function showPage(page){if(!titles[page]||(page==='admin'&&me?.owner!==true))page='slots';activePage=page;$('setup-banner').hidden=me.connected||page==='settings'||page==='online';for(const s of document.querySelectorAll('.page'))s.hidden=s.id!=='page-'+page;for(const b of document.querySelectorAll('nav [data-page]'))b.classList.toggle('active',b.dataset.page===page);$('page-title').textContent=titles[page];history.replaceState(null,'','#'+page);message('');if(page==='rules')await loadRules();if(page==='settings')await Promise.all([activity(),loadCard()]);if(page==='online')await refreshOnline();if(page==='admin')await loadAdmin();if(page==='bookings'&&!$('bookings').children.length)empty($('bookings'),'Geen boekingen geladen','Vernieuw om je komende boekingen op te halen.');}
 async function slots(){const start=Number($('range-start').value),end=Number($('range-end').value);const data=await task('/api/slots',{start,end});const groups=new Map();for(const slot of data.slots){const key=date(slot.start);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(slot);}if(!groups.size){empty($('slots'),'Even geen vrije terreinen','Probeer een andere dag of kom later nog eens kijken.');$('slot-summary').textContent='Geen vrije terreinen';return;}$('slots').replaceChildren();$('slot-summary').textContent=data.slots.length+' vrije terreinen · DAG '+start+' T/M '+end;for(const [key,items] of groups){const row=el('div','slot-day');const label=el('div','slot-date',key.split(' ')[0]);label.append(el('strong','',key.split(' ').slice(1).join(' ')));const options=el('div','slot-options');for(const slot of items){const b=el('button','slot');b.append(el('strong','',clock(slot.start)+' – '+clock(slot.end)),el('small','',(slot.name||'Padel')+' · Bekijk prijs →'));b.addEventListener('click',()=>guarded(()=>quote(slot)));options.append(b);}row.append(label,options);$('slots').append(row);}}
@@ -35,16 +35,20 @@ async function loadRules(){const data=await api('/api/rules');if(!data.rules.len
 async function activity(){const data=await api('/api/history');$('activity').replaceChildren();const names={slots:'Beschikbaarheid ophalen',login:'KUL-account koppelen',account:'Account controleren',bookings:'Boekingen ophalen',rule:'Automatische boeking',book:'Boeking uitvoeren',quote:'Prijs controleren',community_join:'Deelnemen aan match',draft_refresh:'Draft controleren',draft_release:'Draft opruimen'};const states={queued:'In de wachtrij',running:'Bezig',done:'Klaar',failed:'Aandacht nodig',unknown:'Controleer bij KUL',cancelled:'Geannuleerd'};if(!data.jobs.length){$('activity').append(el('p','help','Nog geen activiteit.'));return;}for(const j of data.jobs){const row=el('div','activity-row');const info=el('div','',names[j.kind]||j.kind);if(j.result?.error)info.append(el('small','',j.result.error));else if(j.result?.message)info.append(el('small','',j.result.message));row.append(info,el('span','',states[j.status]||j.status));$('activity').append(row);}}
 async function checkAccount(){const result=await task('/api/actions/'+(me.connected?'account':'login'),{},'Je persoonlijke KUL-koppeling controleren…');await loadMe();const p=result.payment;$('payment-state').replaceChildren(el('p','help','KUL-saldo: '+euro(p.balance)+' · Domiciliëring: '+(p.direct_debit?'gekoppeld':'niet gekoppeld')));message('Je KUL-account is verbonden.');}
 async function loadAdmin(){if(me?.owner!==true)return;$('admin-gate').hidden=me.admin;if(!me.admin){$('admin-users').replaceChildren();return;}const data=await api('/api/admin/users');const container=$('admin-users');container.replaceChildren(el('div','section-label',data.users.length+' PROFIELEN · TOESTEL '+(data.device_active?'ACTIEF':'IN RUST')));for(const u of data.users){const row=el('div','list-item');const info=el('div');info.append(el('h3','',u.name),el('p','user-email',u.email),el('small','',(u.connected?'KUL gekoppeld':'Nog niet gekoppeld')+' · '+u.rules+' regels'+(u.owner?' · Beheerder':'')));row.append(info);if(!u.owner){const toggle=el('button','button light',u.suspended?'Hervatten':'Pauzeren');toggle.addEventListener('click',()=>guarded(async()=>{await api('/api/admin/users/'+u.id+'/toggle','POST',{});await loadAdmin();}));row.append(toggle);}container.append(row);}}
-let pairPhase='waiting',pairReady=false,pairPolling=false,pairSaving=false,pairSubmitted=false,pairStepNumber=1,pairFinished=false,pendingRegistrationFile=null,registrationSending=false,registrationEpoch=0,registrationPreviewSequence=0,pairPinConfirm=false,pairLoginJob=null;
-function pairButton(busy=false,label='Koppelen en testen'){const button=$('finish-device');button.disabled=busy||!pairReady||pairFinished;button.textContent=label;button.setAttribute('aria-busy',String(busy));}
+let pairPhase='waiting',pairReady=false,pairPolling=false,pairSaving=false,pairSubmitted=false,pairStepNumber=1,pairFinished=false,pendingRegistrationFile=null,registrationSending=false,registrationEpoch=0,registrationPreviewSequence=0,pairStateError=false,pairLoginJob=null;
+if(!$('device-pin-confirm')){const label=el('label','','PIN bevestigen'),input=el('input');input.id='device-pin-confirm';input.type='password';input.inputMode='numeric';input.pattern='[0-9]{4}';input.maxLength=4;input.autocomplete='new-password';input.required=true;input.disabled=true;label.append(input);$('finish-device').before(label);}
+$('device-advanced')?.remove();$('pin-check-label')?.remove();
+const eyeIcon='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>';
+for(const id of ['device-pin','device-pin-confirm']){const input=$(id);if(!document.querySelector('[data-pin-toggle="'+id+'"]')){const wrapper=el('div','pin-input'),button=el('button','pin-eye');input.before(wrapper);wrapper.append(input,button);button.type='button';button.dataset.pinToggle=id;}const button=document.querySelector('[data-pin-toggle="'+id+'"]');button.innerHTML=eyeIcon;button.setAttribute('aria-label',id==='device-pin'?'PIN tonen':'PIN bevestiging tonen');button.setAttribute('aria-pressed','false');button.addEventListener('click',()=>{const visible=input.type==='password';input.type=visible?'text':'password';button.setAttribute('aria-pressed',String(visible));button.setAttribute('aria-label',(id==='device-pin'?'PIN':'PIN bevestiging')+(visible?' verbergen':' tonen'));});}
+function clearPairPins(){for(const id of ['device-pin','device-pin-confirm']){$(id).value='';$(id).type='password';const button=document.querySelector('[data-pin-toggle="'+id+'"]');button.setAttribute('aria-pressed','false');button.setAttribute('aria-label',(id==='device-pin'?'PIN':'PIN bevestiging')+' tonen');}}
+function pairButton(busy=false,label='Koppelen'){const button=$('finish-device');button.disabled=busy||!pairReady||pairFinished;button.textContent=label;button.setAttribute('aria-busy',String(busy));}
 function clearRegistrationPreview(){registrationPreviewSequence++;pendingRegistrationFile=null;$('qr-preview').hidden=true;$('qr-preview-image').removeAttribute('src');$('qr-preview-state').textContent='';$('device-qr').value='';}
 function pairStep(step){pairStepNumber=step;document.querySelectorAll('[data-pair-step]').forEach(x=>x.hidden=Number(x.dataset.pairStep)!==step);document.querySelectorAll('[data-pair-marker]').forEach(x=>{if(Number(x.dataset.pairMarker)===step)x.setAttribute('aria-current','step');else x.removeAttribute('aria-current');});}
 async function deviceCommand(action,extra={}){return api('/api/device/control','POST',{action,...extra},90000);}
-async function screen(){if(deviceBusy||!pairReady||!$('device-dialog').open)return;deviceBusy=true;try{const r=await deviceCommand('screen');$('device-screen').src='data:image/png;base64,'+r.image;$('device-screen').hidden=false;$('device-loading').hidden=true;}finally{deviceBusy=false;}}
 async function pollEnrollment(){
  if(pairPolling||pairSaving||pairFinished||!$('device-dialog').open)return;pairPolling=true;const epoch=registrationEpoch;
  try{
-  const result=await api('/api/device/status');if(epoch!==registrationEpoch||!$('device-dialog').open)return;pairReady=result.ready===true;
+  const result=await api('/api/device/status');if(epoch!==registrationEpoch||pairSaving||!$('device-dialog').open)return;pairReady=result.ready===true;
   $('device-qr').disabled=registrationSending||pairSaving;$('upload-qr').disabled=registrationSending||pairSaving;$('paste-qr').disabled=registrationSending||pairSaving;$('send-device-link').disabled=!pairReady||registrationSending||pairSaving;
   if(result.state==='failed')throw new Error(result.error||'Het toestel kon niet starten.');
   if(result.state==='idle')throw new Error('De koppelsessie is afgelopen. Start het toestel opnieuw.');
@@ -52,26 +56,24 @@ async function pollEnrollment(){
   if(!pairReady){$('pair-progress').textContent='Je persoonlijke toestel start. Open ondertussen KUL-accountbeheer. Dit kan ongeveer een minuut duren.';return;}
   if(pendingRegistrationFile&&!registrationSending){try{await flushRegistration();}catch(error){$('device-message').textContent=error.message;}return;}
   pairPhase=result.phase||'waiting';
-  const prompts={enroll_intro:'KUL-registratie voorbereiden...',enroll_pin:'Vul de toestel-PIN in.',needs_registration:'Toestel klaar. Voeg bij stap 2 de registratie-QR van KUL toe.',waiting:pairSubmitted?'Registratie verstuurd. Bevestig zo nodig op je eigen telefoon; we wachten op KUL.':'Toestel klaar. Volg de stappen om KUL te koppelen.',pin_create:'KUL vraagt om een nieuwe PIN. Je kunt nu afronden.',pin_confirm:'Bevestig de PIN op het toestelscherm. Daarna kun je die hieronder bewaren.',registered:'Toestel geregistreerd. Bewaar de PIN en test de KUL-login.',pin_rejected:'KUL weigert deze PIN. Bekijk het toestelscherm en kies een minder voorspelbare PIN.',login_qr:'Dit is een aanmeld-QR. Gebruik in KUL-accountbeheer Toestel toevoegen.'};
-  $('pair-progress').textContent=pairPinConfirm?'Bevestig je PIN.':(prompts[pairPhase]||prompts.waiting);
+  const prompts={enroll_intro:'KUL-registratie voorbereiden...',enroll_pin:'Vul de toestel-PIN in.',needs_registration:'Toestel klaar. Voeg bij stap 2 de registratie-QR van KUL toe.',waiting:pairSubmitted?'Registratie verstuurd. Bevestig zo nodig op je eigen telefoon; we wachten op KUL.':'Toestel klaar. Volg de stappen om KUL te koppelen.',pin_create:'KUL vraagt om een nieuwe PIN. Je kunt nu afronden.',pin_confirm:'Vul de PIN en bevestiging in.',registered:'Rond de koppeling af.',pin_rejected:'KUL weigert deze PIN. Kies een minder voorspelbare PIN.',login_qr:'Dit is een aanmeld-QR. Gebruik in KUL-accountbeheer Toestel toevoegen.'};
+  $('pair-progress').textContent=prompts[pairPhase]||prompts.waiting;
   const canFinish=['pin_create','pin_confirm','enroll_pin','registered'].includes(pairPhase);
-  $('device-pin').disabled=!pairSubmitted&&!canFinish;pairButton(false,pairPinConfirm?'PIN bevestigen':'Koppelen en testen');
-  $('pin-check-label').hidden=!me.needs_attention;
-  if(canFinish){pairStep(3);$('pair-pin-title').textContent=pairPinConfirm||pairPhase==='pin_confirm'?'Bevestig je PIN':pairPhase==='pin_create'?'Kies een PIN':'Toestel-PIN';$('pair-pin-help').textContent=pairPinConfirm?'Voer dezelfde PIN opnieuw in.':'Gebruik vier cijfers voor dit toestel.';}
+  $('device-pin').disabled=$('device-pin-confirm').disabled=!pairSubmitted&&!canFinish;pairButton();
+  if(canFinish){pairStep(3);$('pair-pin-title').textContent=pairPhase==='pin_create'?'Kies een PIN':'Toestel-PIN';$('pair-pin-help').textContent='Gebruik vier cijfers voor padelreservering-auth.';if(pairStateError){$('device-message').textContent='';pairStateError=false;}}
   if(pairPhase==='login_qr'){pairStep(2);pairSubmitted=false;}
-  if($('device-advanced').open)await screen();
  }catch(error){if(epoch!==registrationEpoch)return;pairReady=false;pairButton();$('pair-progress').textContent=error.message;$('device-message').textContent=error.message;$('retry-device').hidden=false;clearInterval(deviceTimer);$('retry-device').scrollIntoView({block:'nearest'});}
  finally{if(epoch===registrationEpoch)pairPolling=false;}
 }
 async function startDevice(){
- pairPinConfirm=false;pairSaving=false;pairPolling=false;pairLoginJob=null;$('pair-check-login').hidden=true;pairButton();
- clearInterval(deviceTimer);registrationEpoch++;clearRegistrationPreview();registrationSending=false;pairFinished=false;$('pair-complete').hidden=true;$('qr-feedback').textContent='';pairReady=false;pairSubmitted=false;pairPhase='waiting';pairStep(1);$('pin-checked').checked=false;$('device-pin').value='';$('device-message').textContent='';$('retry-device').hidden=true;$('device-screen').hidden=true;$('device-loading').hidden=false;$('device-advanced').open=false;$('device-qr').disabled=false;$('upload-qr').disabled=false;$('paste-qr').disabled=false;$('send-device-link').disabled=true;$('device-pin').disabled=true;$('finish-device').disabled=true;
+ pairStateError=false;pairSaving=false;pairPolling=false;pairLoginJob=null;$('pair-check-login').hidden=true;pairButton();
+ clearInterval(deviceTimer);registrationEpoch++;clearRegistrationPreview();registrationSending=false;pairFinished=false;$('pair-complete').hidden=true;$('qr-feedback').textContent='';pairReady=false;pairSubmitted=false;pairPhase='waiting';pairStep(1);clearPairPins();$('device-message').textContent='';$('retry-device').hidden=true;$('device-qr').disabled=false;$('upload-qr').disabled=false;$('paste-qr').disabled=false;$('send-device-link').disabled=true;$('device-pin').disabled=$('device-pin-confirm').disabled=true;$('finish-device').disabled=true;
  if(!$('device-dialog').open)$('device-dialog').showModal();
  $('pair-progress').textContent='Je persoonlijke toestel wordt klaargezet...';
  const epoch=registrationEpoch;
  try{await api('/api/device/start','POST',{});if(epoch!==registrationEpoch||!$('device-dialog').open)return;await pollEnrollment();deviceTimer=setInterval(pollEnrollment,2000);}catch(error){if(epoch!==registrationEpoch)return;$('device-message').textContent=error.message;$('retry-device').hidden=false;}
 }
-async function closeDevice(){registrationEpoch++;pairSaving=false;pairPolling=false;pairButton();clearRegistrationPreview();clearInterval(deviceTimer);deviceTimer=null;$('device-pin').value='';$('device-link').value='';$('device-screen').removeAttribute('src');$('device-dialog').close();try{await deviceCommand('stop');}catch{}}
+async function closeDevice(){registrationEpoch++;pairSaving=false;pairPolling=false;pairButton();clearRegistrationPreview();clearInterval(deviceTimer);deviceTimer=null;clearPairPins();$('device-link').value='';$('device-dialog').close();try{await deviceCommand('stop');}catch{}}
 function clipboardImage(data){for(const file of Array.from(data?.files||[]))if(file.type.startsWith('image/'))return file;for(const item of Array.from(data?.items||[])){if(item.kind==='file'&&item.type.startsWith('image/')){const file=item.getAsFile();if(file)return file;}}return null;}
 async function sendRegistration(file){
  if(pairSaving||registrationSending)throw new Error('De vorige afbeelding wordt nog verwerkt.');
@@ -90,35 +92,40 @@ async function flushRegistration(){
   if(epoch!==registrationEpoch||!$('device-dialog').open)return;
   await api('/api/device/qr','POST',{image:encoded});
   if(epoch!==registrationEpoch||!$('device-dialog').open)return;
-  $('qr-feedback').textContent='QR-code ontvangen.';$('qr-preview-state').textContent='QR-code gevonden en verstuurd';pairSubmitted=true;$('device-pin').disabled=false;pairButton();$('device-message').textContent='';$('pair-progress').textContent='Registratie verstuurd. We wachten op KUL.';pairStep(3);await pollEnrollment();
+  $('qr-feedback').textContent='QR-code ontvangen.';$('qr-preview-state').textContent='QR-code gevonden en verstuurd';pairSubmitted=true;$('device-pin').disabled=$('device-pin-confirm').disabled=false;pairButton();$('device-message').textContent='';$('pair-progress').textContent='Registratie verstuurd. We wachten op KUL.';pairStep(3);await pollEnrollment();
  }catch(error){if(epoch!==registrationEpoch)return;$('qr-feedback').textContent='';$('qr-preview-state').textContent='Afbeelding niet verwerkt';throw error;}
  finally{if(epoch===registrationEpoch){registrationSending=false;$('device-qr').value='';$('device-qr').disabled=false;$('upload-qr').disabled=false;$('paste-qr').disabled=false;$('remove-qr').disabled=false;}}
 }
 async function finishEnrollment(event){
- event.preventDefault();if(pairSaving||pairFinished)return;pairSaving=true;const epoch=registrationEpoch;pairButton(true,'PIN controleren...');
+ event.preventDefault();if(pairSaving||pairFinished)return;
+ const pin=$('device-pin').value,confirmation=$('device-pin-confirm').value;
+ if(!/^[0-9]{4}$/.test(pin)||pin!==confirmation){$('device-message').textContent='Vul tweemaal dezelfde PIN van vier cijfers in.';$('device-pin-confirm').focus();return;}
+ pairSaving=true;pairStateError=false;const epoch=registrationEpoch;pairButton(true,'Koppelen...');
  try{
-  const pin=$('device-pin').value;$('device-pin').value='';$('device-message').textContent='';$('pair-progress').textContent='PIN instellen en de registratie controleren...';
-  const state=await api('/api/device/status');if(epoch!==registrationEpoch)return;
+  $('device-message').textContent='';$('pair-progress').textContent='Registratie afronden...';
+  let state=await api('/api/device/status');
+  const deadline=Date.now()+5000;
+  while(state.ready&&['waiting','needs_registration'].includes(state.phase)&&Date.now()<deadline){await new Promise(resolve=>setTimeout(resolve,600));if(epoch!==registrationEpoch)return;state=await api('/api/device/status');}
+  if(epoch!==registrationEpoch)return;
   if(!state.ready)throw new Error('De koppelsessie is afgelopen. Start het toestel opnieuw.');
   pairPhase=state.phase||'waiting';
   if(!['pin_create','pin_confirm','enroll_pin','registered'].includes(pairPhase)){
-   if(pairPhase==='needs_registration'){pairStep(2);throw new Error('Voeg een nieuwe registratie-QR toe. Het toestel vraagt nog niet om een PIN.');}
-   throw new Error(pairPhase==='pin_rejected'?'De PIN is niet aanvaard. Controleer het toestel.':'KUL vraagt nog niet om een PIN. Controleer de registratie of voeg een nieuwe QR toe.');
+   pairStateError=true;throw new Error(pairPhase==='pin_rejected'?'KUL heeft de PIN niet aanvaard.':'KUL verwerkt de registratie nog. Probeer opnieuw zodra de PIN-stap klaar is.');
   }
-  if(['pin_create','pin_confirm','enroll_pin'].includes(pairPhase)){const setup=await deviceCommand('setup_pin',{pin});if(epoch!==registrationEpoch)return;if(setup.confirm){pairPinConfirm=true;$('pair-progress').textContent='Bevestig je PIN.';return;}}
-  pairButton(true,'Toestel bewaren...');
-  const result=await deviceCommand('finish',{pin,checked:$('pin-checked').checked});if(!result.saved)throw new Error('KUL heeft de registratie nog niet bevestigd.');
+  if(pairPhase!=='registered'){await deviceCommand('setup_pin',{pin,confirm_pin:confirmation});if(epoch!==registrationEpoch)return;}
+  pairButton(true,'Registratie bewaren...');
+  const result=await deviceCommand('finish',{pin});if(!result.saved)throw new Error('KUL heeft de registratie nog niet bevestigd.');
   if(epoch!==registrationEpoch)return;clearInterval(deviceTimer);pairFinished=true;pairLoginJob=result.job_id;document.querySelectorAll('[data-pair-step]').forEach(section=>section.hidden=true);$('pair-complete').hidden=false;
-  await checkPairLogin();
+  $('pair-progress').textContent='Gekoppeld';$('pair-complete-title').textContent='Gekoppeld';$('pair-complete-text').textContent='padelreservering-auth';message('Je KUL-account is gekoppeld.');
+  void checkPairLogin();
  }catch(error){if(epoch!==registrationEpoch)return;throw error;}
- finally{if(epoch===registrationEpoch){pairSaving=false;pairButton(false,pairPinConfirm?'PIN bevestigen':'Koppelen en testen');if($('device-dialog').open&&!pairFinished)await pollEnrollment();}}
+ finally{if(epoch===registrationEpoch){clearPairPins();pairSaving=false;pairButton();if($('device-dialog').open&&!pairFinished)await pollEnrollment();}}
 }
 async function checkPairLogin(timeoutMs=120000){
  if(!pairLoginJob)return;const epoch=registrationEpoch,button=$('pair-check-login');button.hidden=true;button.disabled=true;
- $('pair-progress').textContent='KUL-login testen...';$('pair-complete-title').textContent='KUL-login testen';$('pair-complete-text').textContent='Je toestel is bewaard. De login wordt gecontroleerd.';
- try{await waitForJob(pairLoginJob,'KUL-login testen...',timeoutMs);if(epoch!==registrationEpoch)return;message('Je KUL-account is gekoppeld.');$('pair-progress').textContent='Je KUL-account is gekoppeld.';$('pair-complete-title').textContent='KUL gekoppeld';$('pair-complete-text').textContent='De login is gelukt.';pairLoginJob=null;}
- catch(error){if(epoch!==registrationEpoch)return;message(error.message,!error.pending);$('pair-progress').textContent=error.pending?'KUL-login loopt nog.':'KUL-login niet afgerond.';$('pair-complete-title').textContent=error.pending?'Controle loopt nog':'Controle nodig';$('pair-complete-text').textContent=error.message;button.hidden=false;}
- finally{if(epoch===registrationEpoch){button.disabled=false;await loadMe();await activity();}}
+ try{await waitForJob(pairLoginJob,'KUL-login controleren...',timeoutMs);if(epoch!==registrationEpoch)return;$('pair-complete-text').textContent='padelreservering-auth';pairLoginJob=null;}
+ catch(error){if(epoch!==registrationEpoch)return;message(error.message,!error.pending);$('pair-complete-text').textContent=error.pending?'De logincontrole loopt nog.':'Toestel bewaard. De logincontrole is mislukt: '+error.message;button.hidden=false;}
+ finally{if(epoch===registrationEpoch){button.disabled=false;try{await loadMe();await activity();}catch{}}}
 }
 
 document.querySelectorAll('[data-page]').forEach(b=>b.addEventListener('click',()=>guarded(()=>showPage(b.dataset.page))));
@@ -135,9 +142,6 @@ $('logout').addEventListener('click',()=>guarded(async()=>{await api('/auth/logo
 document.querySelectorAll('[data-close]').forEach(b=>b.addEventListener('click',()=>$(b.dataset.close).close()));
 $('start-device').addEventListener('click',()=>guarded(startDevice));$('retry-device').addEventListener('click',()=>guarded(startDevice));$('close-device').addEventListener('click',closeDevice);$('close-device-footer').addEventListener('click',closeDevice);$('device-dialog').addEventListener('cancel',e=>{e.preventDefault();e.stopPropagation();});$('device-dialog').addEventListener('click',e=>{if(e.target===$('device-dialog')){e.preventDefault();e.stopPropagation();}});
 $('pair-next').addEventListener('click',()=>pairStep(2));$('pair-back').addEventListener('click',()=>pairStep(1));$('pair-new-qr').addEventListener('click',()=>pairStep(2));
-$('device-advanced').addEventListener('toggle',()=>{if($('device-advanced').open)guarded(screen);});
-$('device-screen').addEventListener('click',e=>guarded(async()=>{const box=e.target.getBoundingClientRect();await deviceCommand('tap',{x:Math.min(479,Math.floor((e.clientX-box.left)/box.width*480)),y:Math.min(799,Math.floor((e.clientY-box.top)/box.height*800))});await pollEnrollment();}));
-$('device-back').addEventListener('click',()=>guarded(async()=>{await deviceCommand('back');await pollEnrollment();}));
 $('link-form').addEventListener('submit',e=>{e.preventDefault();guarded(async()=>{await deviceCommand('link',{link:$('device-link').value});$('device-link').value='';pairSubmitted=true;$('device-message').textContent='';pairStep(3);await pollEnrollment();});});
 $('pin-form').addEventListener('submit',e=>guarded(()=>finishEnrollment(e)));
 $('pair-check-login').addEventListener('click',()=>guarded(()=>checkPairLogin()));

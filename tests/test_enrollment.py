@@ -7,7 +7,7 @@ import xml.etree.ElementTree as ET
 import pytest
 from test_web import portal,sign_in
 from padelbot.android import PACKAGE
-from padelbot.web_device import DeviceManager,enrollment_phase,create_enrollment_pin,prepare_enrollment,submit_enrollment_pin
+from padelbot.web_device import DeviceManager,enrollment_phase,create_enrollment_pin,prepare_enrollment,submit_enrollment_pin,setup_enrollment_pin,verify_saved_account
 
 
 def qr_image(payload):
@@ -84,7 +84,9 @@ def test_distinct_kul_qrs_are_ambiguous_but_duplicate_same_qr_is_safe():
 def xml(title='',account=False,initial=False):
     root=ET.Element('hierarchy')
     ET.SubElement(root,'node',{'package':PACKAGE,'text':title,'resource-id':PACKAGE+':id/title'})
-    if account:ET.SubElement(root,'node',{'package':PACKAGE,'resource-id':PACKAGE+':id/account'})
+    if account:
+        ET.SubElement(root,'node',{'package':PACKAGE,'resource-id':PACKAGE+':id/account'})
+        ET.SubElement(root,'node',{'package':PACKAGE,'resource-id':PACKAGE+':id/activity_main'})
     if initial:ET.SubElement(root,'node',{'package':PACKAGE,'resource-id':PACKAGE+':id/initialise'})
     return ET.tostring(root,encoding='unicode')
 
@@ -185,6 +187,46 @@ def test_phases_reveal_no_account_or_pin_contents():
     assert enrollment_phase(xml('Is it you trying to sign in?'))=='login_qr'
 
 
+def test_enrollment_account_label_is_not_a_saved_account():
+    root=ET.fromstring(xml(account=True))
+    root.remove(next(n for n in root if n.get('resource-id')==PACKAGE+':id/activity_main'))
+    assert enrollment_phase(ET.tostring(root,encoding='unicode'))=='waiting'
+
+
+def test_single_form_confirms_native_pin_once_but_never_retries_again():
+    device=EnrollPinDevice(rounds=2)
+    assert setup_enrollment_pin(device,'7392','7392')=={'phase':'registered'}
+    assert ''.join(device.inputs)=='73927392'
+    device=EnrollPinDevice(rounds=3)
+    with pytest.raises(ValueError,match='niet opnieuw'):setup_enrollment_pin(device,'7392','7392')
+    assert ''.join(device.inputs)=='73927392'
+    device=EnrollPinDevice()
+    with pytest.raises(ValueError,match='dezelfde'):setup_enrollment_pin(device,'7392','7393')
+    assert not device.inputs
+    device=PinDevice('Is it you trying to sign in?')
+    with pytest.raises(ValueError):setup_enrollment_pin(device,'7392','7392')
+    assert not device.inputs
+
+
+@pytest.mark.parametrize('survives',[True,False])
+def test_save_requires_account_to_survive_app_restart(monkeypatch,survives):
+    from padelbot import android,web_device
+    actions=[]
+    class SavedDevice:
+        restarted=False
+        def dump_hierarchy(self):return xml(account=not self.restarted or survives,initial=self.restarted and not survives)
+        def press(self,key):actions.append(key)
+        def app_stop(self,package):actions.append('stop');self.restarted=True
+        def app_start(self,package,wait):actions.append('start')
+    monkeypatch.setattr(android,'run_adb',lambda *a,**kw:actions.append(a))
+    monkeypatch.setattr(web_device.time,'sleep',lambda _:None)
+    clock=iter([0,1,22]);monkeypatch.setattr(web_device.time,'monotonic',lambda:next(clock))
+    if survives:verify_saved_account(SavedDevice())
+    else:
+        with pytest.raises(ValueError,match='bewaard'):verify_saved_account(SavedDevice())
+    assert actions==['home',('shell','sync'),'stop','start']
+
+
 def test_slow_start_returns_immediately_is_private_and_can_be_cancelled(monkeypatch):
     async def run():
         events=[];started=[]
@@ -235,3 +277,18 @@ def test_enrollment_http_start_is_csrf_protected_and_status_is_tenant_private(po
     assert client.post('/api/device/control',json={'action':'stop'},headers=other_headers).status_code==404
     headers=sign_in(client,store,alice)
     assert client.post('/api/device/control',json={'action':'stop'},headers=headers).status_code==200
+
+
+def test_old_profile_alone_does_not_claim_registration_is_verified(portal):
+    from pathlib import Path
+    from padelbot.web_runtime import tenant_env
+    app,client,store,(_,alice,bob)=portal
+    sign_in(client,store,alice)
+    env=tenant_env(store,alice)
+    profile=Path(env['PADELBOT_ANDROID_PROFILE_FILE'])
+    profile.parent.mkdir(parents=True,exist_ok=True);profile.write_text('{}')
+    assert client.get('/api/me').json()['device_ready'] is False
+    profile.write_text('{"enrollment_verified":true}')
+    assert client.get('/api/me').json()['device_ready'] is True
+    sign_in(client,store,bob)
+    assert client.get('/api/me').json()['device_ready'] is False

@@ -171,7 +171,9 @@ def test_invalid_ranges_rules_and_other_users_device_are_rejected(portal):
     headers=sign_in(client,store,alice)
     assert client.post('/api/slots',json={'start':5,'end':0},headers=headers).status_code==400
     assert client.post('/api/rules',json={'day_of_week':0,'time_local':'25:00'},headers=headers).status_code==400
-    assert client.post('/api/device/control',json={'action':'screen'},headers=headers).status_code==400
+    for action in ['screen','tap','back']:
+        assert client.post('/api/device/control',json={'action':action},headers=headers).status_code==422
+    assert client.post('/api/device/control',json={'action':'finish','pin':'7392','checked':True},headers=headers).status_code==422
     assert client.post('/api/device/control',json={'action':'shell'},headers=headers).status_code==422
     assert client.get('/api/actions/arbitrary').status_code==405
 
