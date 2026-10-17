@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import hashlib
 import json
 from pathlib import Path
+import re
 import secrets
 import sqlite3
 import time
@@ -15,6 +16,12 @@ ACTIVE_JOB_STATUSES = ('queued','running','waiting_auth')
 
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def google_return_path(value: str | None) -> str:
+    """Only the local availability view may survive a Google login."""
+    match = re.fullmatch(r"/#slots/([0-6])-([0-6])", value or "")
+    return value if match and int(match[1]) <= int(match[2]) else "/"
 
 
 class PlatformStore:
@@ -36,7 +43,8 @@ class PlatformStore:
                     csrf TEXT NOT NULL, expires REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS oauth (
                     state TEXT PRIMARY KEY, browser TEXT NOT NULL, nonce TEXT NOT NULL,
-                    verifier TEXT NOT NULL, expires REAL NOT NULL);
+                    verifier TEXT NOT NULL, expires REAL NOT NULL,
+                    return_to TEXT NOT NULL DEFAULT '/');
                 CREATE TABLE IF NOT EXISTS jobs (
                     id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id),
                     kind TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL,
@@ -51,6 +59,8 @@ class PlatformStore:
             """)
             if "admin_until" not in {r[1] for r in c.execute("PRAGMA table_info(sessions)")}:
                 c.execute("ALTER TABLE sessions ADD COLUMN admin_until REAL NOT NULL DEFAULT 0")
+            if "return_to" not in {r[1] for r in c.execute("PRAGMA table_info(oauth)")}:
+                c.execute("ALTER TABLE oauth ADD COLUMN return_to TEXT NOT NULL DEFAULT '/'")
             columns={r[1] for r in c.execute('PRAGMA table_info(users)')}
             if 'restricted' not in columns:
                 c.execute('ALTER TABLE users ADD COLUMN restricted INTEGER NOT NULL DEFAULT 0')
@@ -155,11 +165,12 @@ class PlatformStore:
         with self.conn() as c:
             c.execute("DELETE FROM sessions WHERE token=?", (digest(token),))
 
-    def oauth_start(self) -> tuple[str, str, str, str]:
+    def oauth_start(self, return_to: str = "/") -> tuple[str, str, str, str]:
         state, browser, nonce, verifier = (secrets.token_urlsafe(32) for _ in range(4))
         with self.conn() as c:
             c.execute("DELETE FROM oauth WHERE expires<?", (time.time(),))
-            c.execute("INSERT INTO oauth VALUES(?,?,?,?,?)", (digest(state), digest(browser), nonce, verifier, time.time()+600))
+            c.execute("INSERT INTO oauth(state,browser,nonce,verifier,expires,return_to) VALUES(?,?,?,?,?,?)",
+                      (digest(state), digest(browser), nonce, verifier, time.time()+600, google_return_path(return_to)))
         return state, browser, nonce, verifier
 
     def oauth_consume(self, state: str, browser: str) -> dict | None:

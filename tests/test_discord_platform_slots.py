@@ -65,6 +65,30 @@ def overview(day=None, count=3, end=None):
     return ui.availability_overview(slots(day, count), day, end or day)
 
 
+@pytest.mark.parametrize('first,last,fragment', [(0, 5, '0-5'), (2, 2, '2-2'),
+    (0, 6, '0-6'), (0, 7, '0-6'), (15, 20, '0-6')])
+def test_dashboard_link_carries_range_and_falls_back_to_the_upcoming_week(first, last, fragment):
+    base = ui.today()
+    snapshot = overview(base + timedelta(days=first), end=base + timedelta(days=last))
+    assert ui.availability_dashboard_url(snapshot) == settings.padelbot_public_url.rstrip('/') + '/#slots/' + fragment
+
+
+def test_dashboard_buttons_keep_the_range_when_a_day_and_time_are_selected(service):
+    async def run():
+        base = ui.today()
+        snapshot = overview(end=base + timedelta(days=5))
+        ranged = ui.SlotsView(service, USER, OWNER, snapshot)
+        day = ui.DaySlotsView(service, USER, OWNER, snapshot, base, parent=snapshot)
+        chosen = day.replace(selected_time=day.time_select.options[0].value)
+        for view in [ranged, day, chosen]:
+            button = next(child for child in view.children if getattr(child, 'label', '') == 'Dashboard')
+            assert button.url.endswith('/#slots/0-5')
+        direct = ui.DaySlotsView(service, USER, OWNER, overview(), base)
+        assert next(child for child in direct.children if getattr(child, 'label', '') == 'Dashboard').url.endswith('/#slots/0-0')
+
+    asyncio.run(run())
+
+
 def test_range_command_visibly_lists_all_free_times_and_courts_plus_empty_days(service, monkeypatch):
     calls = []
 

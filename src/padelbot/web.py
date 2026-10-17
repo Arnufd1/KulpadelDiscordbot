@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field, ConfigDict
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .web_store import PlatformStore
+from .web_store import PlatformStore, google_return_path
 from .web_runtime import JobRunner, rules_for, tenant_env
 from .web_device import DeviceManager
 from .web_cards import CardVault
@@ -233,10 +233,10 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
         return {"status":"ok","google_configured":bool(config.google_client_id and config.google_client_secret)}
 
     @app.get("/auth/google")
-    def google_start():
+    def google_start(request:Request):
         if not config.google_client_id or not config.google_client_secret:
             raise HTTPException(503,"Google-login wordt nog ingesteld.")
-        state,browser,nonce,verifier = store.oauth_start()
+        state,browser,nonce,verifier = store.oauth_start(request.query_params.get("next","/"))
         challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
         url = "https://accounts.google.com/o/oauth2/v2/auth?"+urlencode({
             "client_id":config.google_client_id,"redirect_uri":config.public_url+"/auth/google/callback",
@@ -269,7 +269,7 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
         if old:
             store.logout(old)
         token,_ = store.new_session(user["id"])
-        response = RedirectResponse(config.public_url+"/",status_code=303)
+        response = RedirectResponse(config.public_url+google_return_path(flow.get("return_to")),status_code=303)
         response.set_cookie("padel_session",token,max_age=43200,httponly=True,secure=config.secure_cookies,samesite="lax",path="/")
         response.delete_cookie("padel_oauth",path="/auth")
         store.audit(user["id"],"google_login")

@@ -81,6 +81,16 @@ def day_overview(overview, target):
     return snapshots[target.date()]
 
 
+def availability_dashboard_url(overview):
+    """Carry the selected range into the dashboard's shared seven-day cache."""
+    base = today().date()
+    first = (overview.start.date() - base).days
+    last = (overview.end.date() - base).days
+    if not 0 <= first <= last <= 6:
+        first, last = 0, 6
+    return settings.padelbot_public_url.rstrip('/') + f'/#slots/{first}-{last}'
+
+
 class AvailabilityView(ProfileView):
     async def share(self, interaction):
         # Public snapshots contain availability only; publishing is still a
@@ -127,7 +137,7 @@ class SlotsView(AvailabilityView):
             self.button('Volgende pagina', self.next, row=1, disabled=self.page + 1 == len(overview.pages))
         self.button('Vernieuwen', self.refresh, row=2)
         self.button('Deel met groep', self.share, row=2, style=discord.ButtonStyle.primary)
-        self.add_item(discord.ui.Button(label='Dashboard', url=settings.padelbot_public_url, row=3))
+        self.add_item(discord.ui.Button(label='Dashboard', url=availability_dashboard_url(overview), row=3))
 
     def embed(self):
         return self.overview.embed(self.page)
@@ -189,7 +199,7 @@ class DaySlotsView(AvailabilityView):
         self.button('Deel met groep', self.share, row=3, style=discord.ButtonStyle.primary)
         if parent is not None:
             self.button('Terug naar alle dagen', self.back, row=4)
-        self.add_item(discord.ui.Button(label='Dashboard', url=settings.padelbot_public_url, row=4))
+        self.add_item(discord.ui.Button(label='Dashboard', url=availability_dashboard_url(parent or overview), row=4))
 
     def embed(self):
         return self.share_overview.embed(min(self.page, len(self.share_overview.pages) - 1))

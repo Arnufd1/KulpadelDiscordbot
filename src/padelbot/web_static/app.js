@@ -1,7 +1,7 @@
 'use strict';
 const $ = id => document.getElementById(id);
 let me = null, activePage = 'slots', booking = null, deviceTimer = null, communityFilter = 'all';
-let slotsCache=null,slotsLoading=null,slotsCacheDay=null,invitedMatch=null,inviteScrolled=false,inviteRefreshTried=false;
+let slotsCache=null,slotsLoading=null,slotsCacheDay=null,availabilityDestination=null,invitedMatch=null,inviteScrolled=false,inviteRefreshTried=false;
 let messageTimer=null,accountCheckFlight=null,accountCheckedAt=0,awaitingKulPayment=false,accountReturnTimer=null;
 let adminMetricsEpoch=0,adminMetricsLoading=false,adminMetricsLoaded=false,adminLoadEpoch=0;
 let selectedCancellation=null,bookingsCache=[],bookingSharing={};
@@ -54,17 +54,29 @@ function applyMe(updatePreferences=true){
  if(p?.stored_card)box.append(el('p',hasCard?'help is-linked':'help',hasCard?'\u2713 Creditcard gekoppeld':'Kaartkoppeling controleren'));
 }
 async function loadMe(updatePreferences=true){const updated=await api('/api/me');updated.payment=mergePayment(updated.payment);me=updated;applyMe(updatePreferences);}
+function availabilityRoute(value){const match=/^slots\/([0-6])-([0-6])$/.exec(value);return match&&Number(match[1])<=Number(match[2])?{start:Number(match[1]),end:Number(match[2]),fragment:match[0]}:null;}
+function setSlotRange(start,end){
+ $('range-start').value=start;$('range-end').value=end;
+ document.querySelectorAll('[data-range]').forEach(button=>button.classList.toggle('selected',button.dataset.range===start+','+end));
+}
+function rememberSlotRange(){
+ const route=availabilityRoute('slots/'+$('range-start').value+'-'+$('range-end').value);if(!route)throw new Error('Kies dagen tussen 0 en 6.');
+ availabilityDestination=route.fragment;history.replaceState(null,'','#'+route.fragment);
+}
+function updateLoginDestination(){const route=availabilityRoute(location.hash.slice(1)),button=document.querySelector('#login .google-button');button.href=route?'/auth/google?next='+encodeURIComponent('/#'+route.fragment):'/auth/google';}
 async function showPage(page){
+ const availability=availabilityRoute(page);if(availability){availabilityDestination=availability.fragment;setSlotRange(availability.start,availability.end);page='dashboard';}
+ else if(page==='dashboard'||page==='slots'||page.startsWith('slots/')){availabilityDestination=null;setSlotRange(0,0);}
  const invite=page.match(/^match\/([a-f0-9]{32})$/);if(invite){invitedMatch=invite[1];inviteScrolled=false;inviteRefreshTried=false;communityFilter='all';page='online';}else if(page!=='online')invitedMatch=null;
  const panel={settings:'profile-settings',rules:'autobook-panel',bookings:'my-bookings-panel'}[page];
  if(panel)page='dashboard';if(page==='slots')page='dashboard';
  if(!titles[page]||(page==='admin'&&me?.owner!==true))page='dashboard';activePage=page;
  for(const section of document.querySelectorAll('.page'))section.hidden=section.id!=='page-'+page;
  for(const button of document.querySelectorAll('nav [data-page]'))button.classList.toggle('active',button.dataset.page===page);
- $('page-title').textContent=titles[page];history.replaceState(null,'',page==='online'&&invitedMatch?'#match/'+invitedMatch:'#'+page);message('');
+ $('page-title').textContent=titles[page];history.replaceState(null,'',page==='online'&&invitedMatch?'#match/'+invitedMatch:page==='dashboard'&&availabilityDestination?'#'+availabilityDestination:'#'+page);message('');
  if(panel){$(panel).open=true;$(panel).scrollIntoView({block:'start',behavior:'smooth'});}
  if(page==='online')await loadOnline();if(page==='admin')await loadAdmin();
- if(page==='dashboard'){void guarded(loadPayments);if(me.connected&&(!slotsCache||slotsCacheDay!==brusselsDay())&&!slotsLoading)void guarded(()=>slots());}
+ if(page==='dashboard'){void guarded(loadPayments);if(me.connected){if(slotsCache&&slotsCacheDay===brusselsDay())renderSlots();else if(!slotsLoading)void guarded(()=>slots());}}
  if(panel==='profile-settings')await Promise.all([activity(),loadCard()]);if(panel==='autobook-panel')await loadRules();
  if(panel==='my-bookings-panel'&&!$('bookings').children.length)await bookings();
 }
@@ -355,8 +367,8 @@ async function checkPairLogin(timeoutMs=120000){
 }
 
 document.querySelectorAll('[data-page]').forEach(b=>b.addEventListener('click',()=>guarded(()=>showPage(b.dataset.page))));
-document.querySelectorAll('[data-range]').forEach(b=>b.addEventListener('click',()=>guarded(async()=>{const [a,z]=b.dataset.range.split(',');$('range-start').value=a;$('range-end').value=z;document.querySelectorAll('[data-range]').forEach(x=>x.classList.toggle('selected',x===b));await slots();})));
-$('refresh-slots').addEventListener('click',()=>guarded(()=>slots(true)));$('apply-range').addEventListener('click',()=>guarded(()=>slots()));$('refresh-payments').addEventListener('click',()=>guarded(loadPayments));$('refresh-bookings').addEventListener('click',()=>guarded(bookings));$('confirm-book').addEventListener('click',()=>guarded(confirmBook));
+document.querySelectorAll('[data-range]').forEach(b=>b.addEventListener('click',()=>guarded(async()=>{const [a,z]=b.dataset.range.split(',');setSlotRange(Number(a),Number(z));rememberSlotRange();await slots();})));
+$('refresh-slots').addEventListener('click',()=>guarded(()=>slots(true)));$('apply-range').addEventListener('click',()=>guarded(async()=>{rememberSlotRange();await slots();}));$('refresh-payments').addEventListener('click',()=>guarded(loadPayments));$('refresh-bookings').addEventListener('click',()=>guarded(bookings));$('confirm-book').addEventListener('click',()=>guarded(confirmBook));
 $('confirm-cancel-booking').addEventListener('click',()=>void confirmCancellation());
 $('cancel-booking-dialog').addEventListener('cancel',event=>event.preventDefault());
 $('rule-form').addEventListener('submit',e=>{e.preventDefault();guarded(async()=>{await api('/api/rules','POST',{day_of_week:Number($('rule-day').value),time_local:$('rule-start').value,end_time_local:$('rule-end').value,notes:$('rule-notes').value});await loadRules();feedback('rule-feedback','\u2713 Moment bewaard.');message('Moment bewaard.');},'rule-feedback');});
@@ -382,7 +394,7 @@ $('paste-qr').addEventListener('click',()=>{$('paste-qr').focus();$('qr-feedback
 document.addEventListener('paste',e=>{if(!$('device-dialog').open||pairSaving||pairFinished)return;const file=clipboardImage(e.clipboardData);if(file){e.preventDefault();guarded(()=>sendRegistration(file));}else if(e.target===$('paste-qr'))$('qr-feedback').textContent='Geen afbeelding op je klembord. Maak eerst een screenshot met Win+Shift+S.';});
 function savedInvite(){try{return sessionStorage.getItem('padel-invite');}catch{return null;}}
 function rememberInvite(value){try{if(value)sessionStorage.setItem('padel-invite',value);else sessionStorage.removeItem('padel-invite');}catch{}}
-(async()=>{try{await loadMe();$('app').hidden=false;$('today').textContent=new Date().toLocaleDateString('nl-BE',{weekday:'short',day:'numeric',month:'long'});const destination=location.hash.slice(1)||savedInvite()||'dashboard';rememberInvite(null);await guarded(()=>showPage(destination));void checkAccount();}catch(e){const invite=location.hash.slice(1);if(/^match\/[a-f0-9]{32}$/.test(invite))rememberInvite(invite);$('login').hidden=false;if(!e.message.includes('Meld je aan'))console.warn('Profiel is nog niet beschikbaar.');}})();
+(async()=>{try{await loadMe();$('app').hidden=false;$('today').textContent=new Date().toLocaleDateString('nl-BE',{weekday:'short',day:'numeric',month:'long'});const destination=location.hash.slice(1)||savedInvite()||'dashboard';rememberInvite(null);await guarded(()=>showPage(destination));void checkAccount();}catch(e){const invite=location.hash.slice(1);if(/^match\/[a-f0-9]{32}$/.test(invite))rememberInvite(invite);updateLoginDestination();$('login').hidden=false;if(!e.message.includes('Meld je aan'))console.warn('Profiel is nog niet beschikbaar.');}})();
 
 setInterval(()=>{if(me&&activePage==='online'&&!document.hidden)guarded(async()=>{await loadOnline();});},15000);
 
@@ -392,7 +404,7 @@ $('autobook-panel').addEventListener('toggle',()=>{if($('autobook-panel').open)g
 
 $('copy-share').addEventListener('click',()=>guarded(async()=>{await navigator.clipboard.writeText($('share-url').value);$('share-feedback').textContent='Link gekopieerd.';}));
 $('native-share').addEventListener('click',()=>guarded(async()=>{try{await navigator.share({title:'Padel',text:'Wie doet er mee?',url:$('share-url').value});}catch(error){if(error.name!=='AbortError')throw error;}}));
-window.addEventListener('hashchange',()=>{if(me)guarded(()=>showPage(location.hash.slice(1)||'dashboard'));});
+window.addEventListener('hashchange',()=>{if(me)guarded(()=>showPage(location.hash.slice(1)||'dashboard'));else updateLoginDestination();});
 let refreshingMe=false;
 async function refreshAccess(){if(!me||document.hidden||refreshingMe)return;refreshingMe=true;try{const current=await api('/api/me'),previousAdmin=me.admin;me.owner=current.owner;me.admin=current.admin;me.admin_eligible=current.admin_eligible;$('admin-nav').hidden=me.owner!==true;if(!me.owner||!me.admin){adminLoadEpoch++;$('admin-users').replaceChildren();clearAdminMetrics();}if(activePage==='admin'){if(!me.owner)await showPage('dashboard');else if(previousAdmin!==me.admin)await loadAdmin();}}catch{}finally{refreshingMe=false;}}
 window.addEventListener('focus',refreshAccess);document.addEventListener('visibilitychange',()=>{if(!document.hidden)void refreshAccess();});setInterval(refreshAccess,30000);

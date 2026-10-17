@@ -1,6 +1,9 @@
 import asyncio
 import json
+import sqlite3
 import time
+from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -11,7 +14,7 @@ from fastapi.testclient import TestClient
 
 from padelbot.web import WebSettings,create_app,validate_google_claims
 from padelbot.web_runtime import tenant_env,tenant_root,rules_for
-from padelbot.web_store import PlatformStore
+from padelbot.web_store import PlatformStore, digest, google_return_path
 
 
 @pytest.fixture
@@ -53,6 +56,104 @@ def test_oauth_state_requires_same_browser_and_is_one_use(portal):
     assert store.oauth_consume(state,'attacker') is None
     assert store.oauth_consume(state,browser)
     assert store.oauth_consume(state,browser) is None
+
+
+@pytest.mark.parametrize('destination',['/#slots/0-5','/#slots/0-6','/#slots/2-2','/'])
+def test_google_login_returns_to_state_bound_availability(portal,monkeypatch,destination):
+    from padelbot import web
+    app,client,store,(_,alice,_)=portal
+    app.state.config.google_client_id='test-client'
+    app.state.config.google_client_secret='not-disclosed'
+    started=client.get('/auth/google',params={'next':destination},follow_redirects=False)
+    authorization=parse_qs(urlsplit(started.headers['location']).query)
+    state=authorization['state'][0]
+    with store.conn() as connection:
+        saved=dict(connection.execute('SELECT * FROM oauth WHERE state=?',(digest(state),)).fetchone())
+    assert saved['return_to']==destination
+    assert saved['nonce']==authorization['nonce'][0]
+    posted=[]
+    class TokenClient:
+        def __init__(self,**kwargs):pass
+        async def __aenter__(self):return self
+        async def __aexit__(self,*args):pass
+        async def post(self,url,**kwargs):
+            posted.append((url,kwargs['data']))
+            return SimpleNamespace(raise_for_status=lambda:None,json=lambda:{'id_token':'signed-token'})
+    monkeypatch.setattr(web.httpx,'AsyncClient',TokenClient)
+    monkeypatch.setattr(web.jwt.PyJWKClient,'get_signing_key_from_jwt',lambda self,token:SimpleNamespace(key='signing-key'))
+    decoded=[]
+    def decode(token,key,**kwargs):
+        decoded.append((token,key,kwargs))
+        return {'iss':'https://accounts.google.com','aud':'test-client','nonce':saved['nonce'],
+                'sub':'alice','email':alice['email'],'email_verified':True}
+    monkeypatch.setattr(web.jwt,'decode',decode)
+    # A callback's own next parameter must never replace the state-bound destination.
+    response=client.get('/auth/google/callback',params={'state':state,'code':'provider-code','next':'https://evil.test'},follow_redirects=False)
+    assert response.status_code==303
+    assert response.headers['location']=='http://testserver'+destination
+    assert len(posted)==len(decoded)==1
+    assert posted[0][1]['code_verifier']==saved['verifier']
+    assert decoded[0][2]['audience']=='test-client'
+    assert decoded[0][2]['algorithms']==['RS256']
+    assert {'nonce','email_verified','exp','iat'}<=set(decoded[0][2]['options']['require'])
+    assert store.session(client.cookies.get('padel_session'))['user_id']==alice['id']
+    assert client.get('/auth/google/callback',params={'state':state,'code':'replay'},follow_redirects=False).status_code==400
+    assert len(posted)==1
+
+
+@pytest.mark.parametrize('destination',[
+    'https://evil.test/#slots/0-5','//evil.test/#slots/0-5','/\\evil.test',
+    '/auth/logout','/#matches/123','/#slots/0-7','/#slots/5-0','/#slots/-1-5',
+    '/#slots/00-5','/#slots/0-5/','/#slots/0-5?next=https://evil.test',
+    '/#slots/0-5\n','/%23slots/0-5','%2F%23slots%2F0-5',
+])
+def test_google_return_destinations_are_exact_local_availability_routes(portal,destination):
+    app,client,store,_=portal
+    app.state.config.google_client_id='test-client'
+    app.state.config.google_client_secret='not-disclosed'
+    response=client.get('/auth/google',params={'next':destination},follow_redirects=False)
+    state=parse_qs(urlsplit(response.headers['location']).query)['state'][0]
+    with store.conn() as connection:
+        assert connection.execute('SELECT return_to FROM oauth WHERE state=?',(digest(state),)).fetchone()[0]=='/'
+    assert google_return_path(destination)=='/'
+
+
+def test_google_return_destination_keeps_browser_and_failure_guards(portal):
+    app,client,store,_=portal
+    app.state.config.google_client_id='test-client'
+    app.state.config.google_client_secret='not-disclosed'
+    state,browser,_,_=store.oauth_start('/#slots/0-5')
+    client.cookies.set('padel_oauth','other-browser')
+    assert client.get('/auth/google/callback',params={'state':state,'code':'not-exchanged'},follow_redirects=False).status_code==400
+    client.cookies.set('padel_oauth',browser)
+    assert client.get('/auth/google/callback',params={'state':state,'error':'access_denied'},follow_redirects=False).status_code==400
+    assert store.oauth_consume(state,browser) is None
+
+
+def test_oauth_return_path_migration_preserves_users_sessions_and_pending_login(tmp_path):
+    database=tmp_path/'platform.sqlite3'
+    with sqlite3.connect(database) as connection:
+        connection.executescript('''
+            CREATE TABLE users (id TEXT PRIMARY KEY,google_sub TEXT UNIQUE,email TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,owner INTEGER NOT NULL DEFAULT 0,suspended INTEGER NOT NULL DEFAULT 0,
+                created REAL NOT NULL,preferences TEXT NOT NULL DEFAULT '{}');
+            CREATE TABLE sessions (token TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),
+                csrf TEXT NOT NULL,expires REAL NOT NULL);
+            CREATE TABLE oauth (state TEXT PRIMARY KEY,browser TEXT NOT NULL,nonce TEXT NOT NULL,
+                verifier TEXT NOT NULL,expires REAL NOT NULL);
+        ''')
+        connection.execute('INSERT INTO users(id,google_sub,email,name,owner,created) VALUES(?,?,?,?,?,?)',
+                           ('existing-owner','owner-sub','owner@example.test','Existing owner',1,time.time()))
+        connection.execute('INSERT INTO sessions VALUES(?,?,?,?)',(digest('session'),'existing-owner','csrf',time.time()+600))
+        connection.execute('INSERT INTO oauth VALUES(?,?,?,?,?)',(digest('state'),digest('browser'),'nonce','verifier',time.time()+600))
+    store=PlatformStore(tmp_path,'owner@example.test')
+    assert store.user('existing-owner')['name']=='Existing owner'
+    assert store.session('session')['user_id']=='existing-owner'
+    flow=store.oauth_consume('state','browser')
+    assert flow['nonce']=='nonce' and flow['verifier']=='verifier' and flow['return_to']=='/'
+    assert store.oauth_consume('state','browser') is None
+    state,browser,_,_=store.oauth_start('/#slots/0-5')
+    assert store.oauth_consume(state,browser)['return_to']=='/#slots/0-5'
 
 
 @pytest.mark.parametrize('field,value',[('nonce','wrong'),('iss','https://evil.example'),('aud','other'),('email_verified',False),('sub','')])
