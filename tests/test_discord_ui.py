@@ -99,7 +99,10 @@ def test_stale_slot_is_checked_again_before_any_booking(monkeypatch):
 
 
 def quote_for(selection):
-    slot = next(s for s in selection.slots if s.bookable_product_id == selection.court and ui.local_time(s) == selection.time)
+    slot = next(s for s in selection.slots if s.bookable_product_id == selection.court
+                and s.bookable_linked_product_id == selection.linked_court
+                and s.start_iso == selection.selected_group['start']
+                and s.end_iso == selection.selected_group['end'])
     return ui.BookingQuote(slot, OWNER, Decimal("8.00"), time.monotonic() + 120)
 
 

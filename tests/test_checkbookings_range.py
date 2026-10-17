@@ -201,8 +201,8 @@ def large_overview():
 def test_large_overviews_preserve_all_slots_with_valid_discord_pages():
     overview = large_overview()
     assert len(overview.pages) > 1
-    assert sum(body.count("**18:00**") for body, _ in overview.pages) == 4
-    assert sum(body.count("**22:30**") for body, _ in overview.pages) == 4
+    assert sum(body.count("**18:00–19:29**") for body, _ in overview.pages) == 4
+    assert sum(body.count("**22:30–23:59**") for body, _ in overview.pages) == 4
     async def run():
         it = interaction()
         for page in range(len(overview.pages)):
@@ -238,7 +238,7 @@ def test_sharing_posts_all_days_once_and_public_buttons_only_browse():
         assert {child.label for child in posted["view"].children} == {"Vorige pagina", "Volgende pagina"}
         for day in range(4):
             assert f"{BASE + timedelta(days=day):%d/%m/%Y}" in posted["attachment_text"]
-        assert posted["attachment_text"].count("**22:30**") == 4
+        assert posted["attachment_text"].count("**22:30–23:59**") == 4
         guest = interaction(user=43)
         public = posted["view"]
         assert await public.interaction_check(guest) is True

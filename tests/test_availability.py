@@ -104,6 +104,29 @@ def test_failed_occupancy_fetch_does_not_report_slots_as_free(discover):
         discover(Failing())
 
 
+def test_exact_duplicate_slots_with_equivalent_offsets_are_deduplicated(discover):
+    equivalent = dict(ROW, startDate="2030-10-08T19:30:00+02:00",
+                      endDate="2030-10-08T20:59:00+02:00")
+    slots = discover(Client(rows=[ROW, deepcopy(ROW), equivalent]))
+    assert len(slots) == 1
+    assert slots[0].start_iso == ROW["startDate"]
+
+
+@pytest.mark.parametrize("changes", [
+    {"endDate": "2030-10-08T19:29:00Z"},
+    {"linkedProductId": 4611},
+    {"bookableProductId": 4386},
+])
+def test_same_start_preserves_different_durations_and_court_identities(discover, changes):
+    distinct = dict(ROW, **changes)
+    slots = discover(Client(rows=[ROW, distinct, deepcopy(distinct)]))
+    assert len(slots) == 2
+    assert [(s.start_iso, s.end_iso, s.bookable_product_id, s.bookable_linked_product_id)
+            for s in slots] == [
+        (row["startDate"], row["endDate"], row["bookableProductId"], row["linkedProductId"])
+        for row in [ROW, distinct]]
+
+
 def test_slot_datetime_respects_iso_offset():
     slot = booking.Slot(1, 2, "2030-10-08T19:30:00+02:00", "2030-10-08T21:00:00+02:00", None, {})
     assert slot.start_dt == datetime(2030, 10, 8, 17, 30, tzinfo=timezone.utc)

@@ -129,14 +129,16 @@ def execute(kind: str, payload: dict) -> dict:
             return {"connected":True,"name":str(me.get("firstName") or me.get("name") or "KUL-account"),
                     "payment":payment_summary(me),"payment_checked_at":payment_checked_at}
         if kind == "slots":
+            from .slot_groups import group_slots
             start,end = int(payload["start"]),int(payload["end"])
             if not 0<=start<=end<=30:
                 raise ValueError("Kies een dag of periode tussen 0 en 30.")
             today = datetime.now(ZoneInfo("Europe/Brussels"))
             slots = find_slots_window(client,start_date=today+timedelta(days=start),days=end-start+1)
             names=get_product_names(client,{s.bookable_product_id for s in slots})
-            return {"slots":[{"product":s.bookable_product_id,"court":s.bookable_linked_product_id,
-                              "start":s.start_iso,"end":s.end_iso,"price":s.price,'name':names.get(s.bookable_product_id,'Padel')} for s in slots if s.start_dt>today]}
+            available=[{"product":s.bookable_product_id,"court":s.bookable_linked_product_id,
+                              "start":s.start_iso,"end":s.end_iso,"price":s.price,'name':names.get(s.bookable_product_id,'Padel')} for s in slots if s.start_dt>today]
+            return {"slots":available,"slot_groups":group_slots(available)}
         if kind == "bookings":
             return verified_bookings(client,me)
         if kind == "cancel_booking":
@@ -190,7 +192,8 @@ def execute(kind: str, payload: dict) -> dict:
                     raise ValueError('De maximale looptijd van deze draft is voorbij.')
                 if not settings.padelbot_android_profile_file.exists():raise ValueError('Koppel eerst je eigen KUL-authenticator.')
                 slots=find_slots(client,target_date=datetime.fromisoformat(draft['target']))
-                slot=next((s for s in slots if s.start_dt==datetime.fromisoformat(draft['target']) and s.bookable_product_id==draft['product'] and s.bookable_linked_product_id==draft['court']),None)
+                slot=next((s for s in slots if s.start_dt==datetime.fromisoformat(draft['target']) and s.bookable_product_id==draft['product'] and s.bookable_linked_product_id==draft['court']
+                           and datetime.fromisoformat(s.end_iso.replace('Z','+00:00'))==datetime.fromisoformat(draft['end'].replace('Z','+00:00'))),None)
                 if not slot:
                     drafts.stop(draft['id'],draft['profile_id'],'unavailable')
                     drafts.release(client,draft['id'],int(me['id']))
@@ -229,6 +232,11 @@ def execute(kind: str, payload: dict) -> dict:
         target = datetime.fromisoformat(payload["target"].replace('Z','+00:00'))
         if target.tzinfo is None:
             raise ValueError("Ongeldig tijdstip.")
+        requested_end = None
+        if payload.get('end') is not None:
+            requested_end = datetime.fromisoformat(payload['end'].replace('Z','+00:00'))
+            if requested_end.tzinfo is None or requested_end<=target:
+                raise ValueError('Ongeldige eindtijd.')
         slots = find_slots(client,target_date=target)
         rules = RulesStore(settings.padelbot_rules_file)
         rule = None
@@ -239,8 +247,12 @@ def execute(kind: str, payload: dict) -> dict:
                 return {"skipped":True}
             slot = find_rule_slot(slots,rule,target.date())
         else:
-            slot = next((s for s in slots if s.start_dt==target and s.bookable_linked_product_id==int(payload["court"])
-                         and s.bookable_product_id==int(payload['product'])),None)
+            candidates = [s for s in slots if s.start_dt==target and s.bookable_linked_product_id==int(payload["court"])
+                          and s.bookable_product_id==int(payload['product'])
+                          and (requested_end is None or datetime.fromisoformat(s.end_iso.replace('Z','+00:00'))==requested_end)]
+            if len(candidates)>1 and requested_end is None:
+                raise ValueError('Kies een volledig tijdslot. Vernieuw de beschikbaarheid.')
+            slot = next(iter(candidates),None)
         if slot is None:
             if kind=='rule':
                 return {'waiting':True,'message':'Nog geen terrein vrij binnen je venster. We blijven controleren.'}
@@ -310,7 +322,7 @@ def execute(kind: str, payload: dict) -> dict:
             booking_id=result.booking_id,target_slot_iso=slot.start_dt.astimezone(ZoneInfo("Europe/Brussels")).isoformat(),
             error=None if result.paid else "Betaling nog niet bevestigd; controleer KU Leuven Sport.")
         return {"sale_id":result.sale_id,"booking_id":result.booking_id,"paid":result.paid,
-                "amount":str(amount),"target":slot.start_iso,"payment_available":bool(result.payment_url) and not payment_pending,
+                "amount":str(amount),"target":slot.start_iso,"end":slot.end_iso,"payment_available":bool(result.payment_url) and not payment_pending,
                 'payment_pending':payment_pending,"payment_via_discord":payment_via_discord,
                 "message":"Je hebt geboekt." if result.paid else "Betaling wordt gecontroleerd. Controleer je boeking bij KUL voordat je opnieuw betaalt." if payment_pending else "Betaal om je boeking te bevestigen." if result.payment_url else "Reservatie aangemaakt. Controleer de betaling in KU Leuven Sport."}
 

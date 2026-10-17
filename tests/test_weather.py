@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -56,7 +56,9 @@ def test_forecast_is_cached_and_outage_never_fabricates_a_dry_forecast(monkeypat
 def test_weather_survives_selection_changes_and_appears_on_reservations():
     forecast = weather.parse_forecast(payload())
     start = datetime(2030, 6, 5, 13, 30, tzinfo=TZ)
-    slot = SimpleNamespace(start_dt=start, bookable_product_id=4385)
+    slot = SimpleNamespace(start_dt=start, start_iso=start.isoformat(),
+        end_iso=(start + timedelta(minutes=90)).isoformat(), bookable_product_id=4385,
+        bookable_linked_product_id=1, price=None)
     async def run():
         view = discord_ui.DaySlotsView(42, start, [slot], {4385: "Padel 4"}, forecast=forecast)
         assert "🌧️ 70%" in view.embed().description

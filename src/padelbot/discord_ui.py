@@ -20,6 +20,7 @@ from .payment import payment_message
 from .match_ui import ShareBookingView, publish_bookings, cancel_shared_booking, MAX_SHARE_BOOKINGS
 from .scheduler import compute_next_fire
 from . import weather
+from .slot_groups import group_slots, interval_label
 
 
 WEEKDAYS = ("maandag", "dinsdag", "woensdag", "donderdag", "vrijdag", "zaterdag", "zondag")
@@ -32,6 +33,15 @@ def today() -> datetime:
 
 def local_time(slot) -> str:
     return slot.start_dt.astimezone(ZoneInfo(settings.padel_local_tz)).strftime("%H:%M")
+
+
+def availability_slot_groups(slots, names):
+    """Adapt domain slots to the same grouping used by the web worker."""
+    return group_slots([{'product': slot.bookable_product_id,
+        'court': slot.bookable_linked_product_id, 'start': slot.start_iso,
+        'end': slot.end_iso, 'price': slot.price,
+        'name': names.get(slot.bookable_product_id, f'Veld {slot.bookable_product_id}')}
+        for slot in slots])
 
 
 def parse_day_range(value: str) -> tuple[int, int]:
@@ -121,16 +131,12 @@ class AvailabilityOverview:
             heading = f"**{WEEKDAYS[target.weekday()]} {target:%d/%m/%Y}**"
             if forecast and (badge := forecast.day_badge(target.date())):
                 heading += f" · {badge}"
-            grouped = {}
-            samples = {}
-            for slot in self.by_day.get(target.date(), []):
-                clock = local_time(slot)
-                grouped.setdefault(clock, set()).add(discord.utils.escape_markdown(names.get(slot.bookable_product_id, f"Veld {slot.bookable_product_id}")))
-                samples[clock] = slot
             lines = []
-            for clock, courts in sorted(grouped.items()):
-                badge = forecast.badge(samples[clock].start_dt) if forecast else None
-                lines.append(f"**{clock}**{' · ' + badge if badge else ''} · {', '.join(sorted(courts))}")
+            for group in availability_slot_groups(self.by_day.get(target.date(), []), names):
+                clock = interval_label(group, settings.padel_local_tz)
+                badge = forecast.badge(datetime.fromisoformat(group['start'].replace('Z', '+00:00'))) if forecast else None
+                courts = [discord.utils.escape_markdown(slot['name']) for slot in group['courts']]
+                lines.append(f"**{clock}**{' · ' + badge if badge else ''} · {', '.join(courts)}")
             if not lines:
                 lines = ["Nog niet boekbaar: KUL opent reservaties maximaal 7 dagen vooraf."
                          if target > opens_until else "Geen beschikbare padelvelden."]
@@ -265,19 +271,32 @@ async def share_availability(interaction, owner_id, overview):
 
 
 class DaySlotsView(OwnerView):
-    def __init__(self, owner_id, target, slots, names, *, page=0, time=None, court=None, forecast=None, overview=None, overview_page=0):
+    def __init__(self, owner_id, target, slots, names, *, page=0, time=None, court=None, linked_court=None, court_page=0, forecast=None, overview=None, overview_page=0):
         super().__init__(owner_id)
         self.forecast = forecast
         self.overview, self.overview_page = overview, overview_page
         self.share_overview = AvailabilityOverview(target, target, slots, names, forecast)
         self.target, self.slots, self.names = target, slots, names
         self.page, self.time, self.court = page, time, court
-        times = sorted({local_time(s) for s in slots})
-        self.pages = max(1, (len(times) + 24) // 25)
-        if times:
+        self.groups = availability_slot_groups(slots, names)
+        self.selected_group = next((group for group in self.groups if group['id'] == time), None)
+        if self.selected_group is None and time:
+            # Compatibility for an old in-process selection is safe only when
+            # its displayed start identifies exactly one complete interval.
+            matches = [group for group in self.groups if interval_label(group, settings.padel_local_tz).startswith(time + '–')]
+            if len(matches) == 1:
+                self.selected_group = matches[0]
+        self.linked_court = linked_court
+        if self.selected_group and court is not None and linked_court is None:
+            matches = [slot for slot in self.selected_group['courts'] if slot['product'] == court]
+            if len(matches) == 1:
+                self.linked_court = matches[0]['court']
+        self.pages = max(1, (len(self.groups) + 24) // 25, len(self.share_overview.pages))
+        self.page = min(max(0, page), self.pages - 1)
+        if self.groups[self.page * 25:(self.page + 1) * 25]:
             select = discord.ui.Select(placeholder="Kies een tijdstip", row=0, options=[
-                discord.SelectOption(label=t, value=t, default=t == time)
-                for t in times[page * 25:(page + 1) * 25]
+                discord.SelectOption(label=interval_label(group, settings.padel_local_tz), value=group['id'], default=group is self.selected_group)
+                for group in self.groups[self.page * 25:(self.page + 1) * 25]
             ])
             async def select_time(interaction):
                 view = DaySlotsView(owner_id, target, slots, names, page=page, time=select.values[0], forecast=self.forecast, overview=self.overview, overview_page=self.overview_page)
@@ -285,18 +304,28 @@ class DaySlotsView(OwnerView):
                 await interaction.response.edit_message(embed=view.embed(), view=view)
             select.callback = select_time
             self.add_item(select)
-        if time:
-            courts = sorted({s.bookable_product_id for s in slots if local_time(s) == time}, key=lambda p: names.get(p, str(p)))
+        self.court_page = court_page
+        if self.selected_group:
+            courts = self.selected_group['courts']
+            self.court_pages = max(1, (len(courts) + 24) // 25)
+            self.court_page = min(max(0, court_page), self.court_pages - 1)
+            products = [slot['product'] for slot in courts]
+            choices = {str(slot['product']) if products.count(slot['product']) == 1 else f"{slot['product']}:{slot['court']}": slot for slot in courts}
             court_select = discord.ui.Select(placeholder="Kies een veld", row=1, options=[
-                discord.SelectOption(label=names.get(p, f"Veld {p}")[:100], value=str(p), default=p == court)
-                for p in courts
+                discord.SelectOption(label=slot['name'][:100], value=value,
+                    default=slot['product'] == court and slot['court'] == self.linked_court)
+                for value, slot in list(choices.items())[self.court_page * 25:(self.court_page + 1) * 25]
             ])
             async def select_court(interaction):
-                view = DaySlotsView(owner_id, target, slots, names, page=page, time=time, court=int(court_select.values[0]), forecast=self.forecast, overview=self.overview, overview_page=self.overview_page)
+                chosen = choices[court_select.values[0]]
+                view = DaySlotsView(owner_id, target, slots, names, page=self.page, time=self.selected_group['id'], court=chosen['product'], linked_court=chosen['court'], court_page=self.court_page, forecast=self.forecast, overview=self.overview, overview_page=self.overview_page)
                 view.share_overview = self.share_overview
                 await view.reserve(interaction)
             court_select.callback = select_court
             self.add_item(court_select)
+            if self.court_pages > 1:
+                self.button('Vorige velden', self.previous_courts, row=2, disabled=self.court_page == 0)
+                self.button('Volgende velden', self.next_courts, row=2, disabled=self.court_page + 1 == self.court_pages)
         if self.pages > 1:
             self.button("Eerdere tijden", self.previous_times, row=2, disabled=page == 0)
             self.button("Latere tijden", self.next_times, row=2, disabled=page + 1 >= self.pages)
@@ -315,22 +344,24 @@ class DaySlotsView(OwnerView):
         return cls(owner_id, target, slots, names, forecast=forecast)
 
     def embed(self):
-        grouped = {}
-        for slot in self.slots:
-            grouped.setdefault(local_time(slot), set()).add(self.names.get(slot.bookable_product_id, "Veld"))
-        badges = {local_time(slot): self.forecast.badge(slot.start_dt) for slot in self.slots} if self.forecast else {}
-        lines = [f"**{t}**{' · ' + badges[t] if badges.get(t) else ''} · {', '.join(sorted(courts))}" for t, courts in sorted(grouped.items())]
-        description = "\n".join(lines) or "Geen beschikbare padelvelden op deze dag."
-        if self.forecast and (badge := self.forecast.day_badge(self.target.date())):
-            description = f"Leuven {badge}\n\n" + description
-        if self.target > today() + timedelta(days=settings.padel_opens_days_ahead):
-            description += "\nKUL opent reservaties maximaal 7 dagen vooraf."
-        if self.court is not None:
-            description += f"\n\n**Gekozen:** {self.time} · {self.names.get(self.court, 'Veld')}. Klik op **Boeken**."
-        embed = discord.Embed(title=f"Padel · {self.target:%d/%m/%Y}", description=description[:4096], color=0x377DFF,
-                              timestamp=datetime.now(ZoneInfo(settings.padel_local_tz)))
-        embed.set_footer(text=f"{len(self.slots)} vrije slots · beschikbaarheid wordt bij boeken opnieuw gecontroleerd" + (" · " + weather.CREDIT if self.forecast else ""))
+        embed = self.share_overview.embed(min(self.page, len(self.share_overview.pages) - 1))
+        if self.court is not None and self.selected_group:
+            name = discord.utils.escape_markdown(self.names.get(self.court, 'Veld'))[:100]
+            embed.description += f"\n\n**Gekozen:** {interval_label(self.selected_group, settings.padel_local_tz)} · {name}. Klik op **Boeken**."
         return embed
+
+    async def show_courts(self, interaction, page):
+        view = DaySlotsView(self.owner_id, self.target, self.slots, self.names,
+            page=self.page, time=self.selected_group['id'], court_page=page,
+            forecast=self.forecast, overview=self.overview, overview_page=self.overview_page)
+        view.share_overview = self.share_overview
+        await interaction.response.edit_message(embed=view.embed(), view=view)
+
+    async def previous_courts(self, interaction):
+        await self.show_courts(interaction, self.court_page - 1)
+
+    async def next_courts(self, interaction):
+        await self.show_courts(interaction, self.court_page + 1)
 
     async def show_day(self, interaction, target):
         await interaction.response.defer()
@@ -374,7 +405,14 @@ class DaySlotsView(OwnerView):
 
     def selected_slot(self, client):
         slots = find_slots_window(client, start_date=self.target, days=1)
-        slot = next((s for s in slots if s.bookable_product_id == self.court and local_time(s) == self.time), None)
+        current = next((group for group in availability_slot_groups(slots, self.names)
+                        if self.selected_group and group['id'] == self.selected_group['id']), None)
+        chosen = next((slot for slot in current['courts'] if slot['product'] == self.court
+                       and slot['court'] == self.linked_court), None) if current else None
+        slot = next((slot for slot in slots if chosen and slot.bookable_product_id == chosen['product']
+                     and slot.bookable_linked_product_id == chosen['court']
+                     and _timestamp_key(slot.start_iso) == _timestamp_key(chosen['start'])
+                     and _timestamp_key(slot.end_iso) == _timestamp_key(chosen['end'])), None)
         if slot is None:
             raise RuntimeError("Dit slot is intussen bezet. Vernieuw de beschikbaarheid.")
         return slot
@@ -447,8 +485,9 @@ class ConfirmBookingView(OwnerView):
     def embed(self):
         s = self.selection
         local = self.quote.slot.start_dt.astimezone(ZoneInfo(settings.padel_local_tz))
+        clock = interval_label({'start': self.quote.slot.start_iso, 'end': self.quote.slot.end_iso}, settings.padel_local_tz)
         embed = discord.Embed(title="Boeking bevestigen", color=0x377DFF,
-            description=f"**Datum:** {local:%d/%m/%Y}\n**Tijd:** {local:%H:%M}\n"
+            description=f"**Datum:** {local:%d/%m/%Y}\n**Tijd:** {clock}\n"
                         f"**Veld:** {s.names.get(s.court, 'Padelveld')}\n**Totaal:** {self.quote.amount_label}\n\n"
                         "Na bevestiging reserveert en betaalt de bot automatisch. Als je bank een goedkeuring vraagt, bevestig je die in je bank-app.")
         embed.set_footer(text="Deze bevestiging is 2 minuten geldig.")
@@ -459,7 +498,7 @@ class ConfirmBookingView(OwnerView):
     async def back(self, interaction):
         self.busy = True
         s = self.selection
-        view = DaySlotsView(s.owner_id, s.target, s.slots, s.names, page=s.page, time=s.time, court=s.court, forecast=s.forecast, overview=s.overview, overview_page=s.overview_page)
+        view = DaySlotsView(s.owner_id, s.target, s.slots, s.names, page=s.page, time=s.time, court=s.court, linked_court=s.linked_court, court_page=s.court_page, forecast=s.forecast, overview=s.overview, overview_page=s.overview_page)
         view.share_overview = s.share_overview
         await interaction.response.edit_message(content=None, embed=view.embed(), view=view)
 
@@ -488,7 +527,8 @@ class ConfirmBookingView(OwnerView):
                 result = await asyncio.to_thread(self.selection.reserve_now, self.quote, on_3ds_challenge=bank_verification)
             s = self.selection
             heading = "Gereserveerd en betaald" if result.paid else "Reservatie aangemaakt; betaling nog niet bevestigd"
-            message = f"🎾 **{heading}:** {s.target:%d/%m} {s.time} · {s.names.get(s.court, 'Veld')}\n{payment_message(result)}"
+            clock = interval_label(s.selected_group, settings.padel_local_tz) if s.selected_group else s.time
+            message = f"🎾 **{heading}:** {s.target:%d/%m} {clock} · {s.names.get(s.court, 'Veld')}\n{payment_message(result)}"
             shared_view = ShareBookingView(self.owner_id, result.booking_id) if result.paid and getattr(result, "booking_id", None) else None
         except Exception as error:
             message = f"Boeking niet bevestigd: {error}\nControleer `/bookings` voordat je opnieuw boekt."

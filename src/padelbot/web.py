@@ -89,6 +89,7 @@ class CardRequest(BaseModel):
 
 class BookingRequest(BaseModel):
     target: str = Field(max_length=40)
+    end: str | None = Field(default=None,max_length=40)
     product: int = Field(gt=0)
     court: int = Field(gt=0)
     amount: float = Field(gt=0,le=100)
@@ -516,12 +517,12 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
     @app.post('/api/drafts/{draft_id}/quote')
     def quote_draft(draft_id:str,user=Depends(current)):
         draft=drafts.owned(draft_id,user['id'])
-        return enqueue(user,'quote',{'target':draft['target'],'product':draft['product'],'court':draft['court'],'amount':1,'draft_id':draft_id})
+        return enqueue(user,'quote',{'target':draft['target'],'end':draft['end'],'product':draft['product'],'court':draft['court'],'amount':1,'draft_id':draft_id})
 
     @app.post('/api/drafts/{draft_id}/confirm')
     def confirm_draft(draft_id:str,body:DraftConfirmRequest,user=Depends(current)):
         draft=drafts.owned(draft_id,user['id'])
-        return enqueue(user,'book',{'target':draft['target'],'product':draft['product'],'court':draft['court'],'amount':body.amount,'draft_id':draft_id},
+        return enqueue(user,'book',{'target':draft['target'],'end':draft['end'],'product':draft['product'],'court':draft['court'],'amount':body.amount,'draft_id':draft_id},
                        dedup='draft-confirm:'+draft_id)
 
     @app.get('/api/community/mine')
@@ -616,11 +617,11 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
 
     @app.post("/api/book")
     def book(body:BookingRequest,user=Depends(current)):
-        return enqueue(user,"book",body.model_dump(),f"manual:{user['id']}:{body.product}:{body.court}:{body.target}")
+        return enqueue(user,"book",body.model_dump(exclude_none=True),f"manual:{user['id']}:{body.product}:{body.court}:{body.target}")
 
     @app.post("/api/quote")
     def quote(body:BookingRequest,user=Depends(current)):
-        return enqueue(user,"quote",body.model_dump())
+        return enqueue(user,"quote",body.model_dump(exclude_none=True))
 
     @app.post("/api/actions/{kind}")
     def action(kind:str,user=Depends(current)):

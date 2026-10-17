@@ -174,7 +174,7 @@ def test_discord_confirmation_writes_once_and_rejects_other_user(portal,monkeypa
         async def task(service,user,kind,payload):
             writes.append(user['id']);await asyncio.sleep(.01);return {'message':'Betaallink volgt via Discord.'}
         monkeypatch.setattr(discord_platform,'job',task)
-        view=discord_platform.ConfirmView(service,alice,12345,{'start':'2030-01-01T18:00:00Z','product':100,'court':200},{'amount':'12'})
+        view=discord_platform.ConfirmView(service,alice,12345,{'start':'2030-01-01T18:00:00Z','end':'2030-01-01T19:30:00Z','product':100,'court':200},{'amount':'12'})
         assert not await view.interaction_check(interaction(user=55555))
         assert not writes
         request=interaction(user=12345)

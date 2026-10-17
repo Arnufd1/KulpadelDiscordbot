@@ -6,14 +6,16 @@ import discord
 
 from .config import settings
 from .booking import Slot
-from .discord_ui import AvailabilityOverview, WEEKDAYS, local_time, share_availability, today
+from .discord_ui import AvailabilityOverview, WEEKDAYS, availability_slot_groups, share_availability, today
+from .slot_groups import interval_label
 from . import weather
 from .discord_sharing import SharePolicyError, prepare_public_share, with_server_settings
 
 
 def label(slot):
     start=datetime.fromisoformat(slot['start'].replace('Z','+00:00')).astimezone(ZoneInfo('Europe/Brussels'))
-    return f"{start:%d/%m %H:%M} · {slot.get('name','Padel')}"
+    clock=interval_label(slot) if slot.get('end') else f'{start:%H:%M}'
+    return f"{start:%d/%m} {clock} · {slot.get('name','Padel')}"
 
 
 async def job(service,user,kind,payload):
@@ -169,28 +171,36 @@ class SlotsView(AvailabilityView):
 
 class DaySlotsView(AvailabilityView):
     def __init__(self, service, user, discord_id, overview, target, *, page=0,
-                 selected_time=None, parent=None, parent_page=0):
+                 selected_time=None, court_page=0, parent=None, parent_page=0):
         super().__init__(service, user, discord_id)
         self.overview, self.target = overview, target
         self.parent, self.parent_page = parent, parent_page
         self.share_overview = day_overview(overview, target)
         self.slots = overview.by_day.get(target.date(), [])
+        self.groups = availability_slot_groups(self.slots, overview.names)
         self.selected_time = selected_time
-        times = sorted({local_time(slot) for slot in self.slots})
-        self.pages = max(1, (len(times) + 24) // 25, len(self.share_overview.pages))
+        self.selected_group = next((group for group in self.groups if group['id'] == selected_time), None)
+        self.pages = max(1, (len(self.groups) + 24) // 25, len(self.share_overview.pages))
         self.page = min(max(0, page), self.pages - 1)
-        if times[self.page * 25:(self.page + 1) * 25]:
+        if self.groups[self.page * 25:(self.page + 1) * 25]:
             self.time_select = discord.ui.Select(placeholder='Kies een tijdstip', row=0, options=[
-                discord.SelectOption(label=clock, value=clock, default=clock == selected_time)
-                for clock in times[self.page * 25:(self.page + 1) * 25]])
+                discord.SelectOption(label=interval_label(group, settings.padel_local_tz), value=group['id'], default=group is self.selected_group)
+                for group in self.groups[self.page * 25:(self.page + 1) * 25]])
             self.time_select.callback = self.choose_time
             self.add_item(self.time_select)
-        if selected_time:
+        self.court_page = court_page
+        if self.selected_group:
+            self.court_pages = max(1, (len(self.selected_group['courts']) + 24) // 25)
+            self.court_page = min(max(0, court_page), self.court_pages - 1)
             self.court_select = discord.ui.Select(placeholder='Kies een veld', row=1, options=[
-                discord.SelectOption(label=overview.names.get(slot.bookable_product_id, 'Padel')[:100], value=str(index))
-                for index, slot in enumerate(self.slots) if local_time(slot) == selected_time])
+                discord.SelectOption(label=slot['name'][:100], value=str(index))
+                for index, slot in enumerate(self.selected_group['courts'])
+                if self.court_page * 25 <= index < (self.court_page + 1) * 25])
             self.court_select.callback = self.choose_court
             self.add_item(self.court_select)
+            if self.court_pages > 1:
+                self.button('Vorige velden', self.previous_courts, row=2, disabled=self.court_page == 0)
+                self.button('Volgende velden', self.next_courts, row=2, disabled=self.court_page + 1 == self.court_pages)
         if self.pages > 1:
             self.button('Eerdere tijden', self.previous_times, row=2, disabled=self.page == 0)
             self.button('Latere tijden', self.next_times, row=2, disabled=self.page + 1 == self.pages)
@@ -207,7 +217,7 @@ class DaySlotsView(AvailabilityView):
 
     def replace(self, **kwargs):
         options = {'page': self.page, 'selected_time': self.selected_time,
-                   'parent': self.parent, 'parent_page': self.parent_page, **kwargs}
+                   'court_page': self.court_page, 'parent': self.parent, 'parent_page': self.parent_page, **kwargs}
         return DaySlotsView(self.service, self.user, self.discord_id, self.overview, self.target, **options)
 
     async def show(self, interaction, view):
@@ -215,7 +225,13 @@ class DaySlotsView(AvailabilityView):
         self.stop()
 
     async def choose_time(self, interaction):
-        await self.show(interaction, self.replace(selected_time=self.time_select.values[0]))
+        await self.show(interaction, self.replace(selected_time=self.time_select.values[0], court_page=0))
+
+    async def previous_courts(self, interaction):
+        await self.show(interaction, self.replace(court_page=self.court_page - 1))
+
+    async def next_courts(self, interaction):
+        await self.show(interaction, self.replace(court_page=self.court_page + 1))
 
     async def previous_times(self, interaction):
         await self.show(interaction, self.replace(page=self.page - 1, selected_time=None))
@@ -246,10 +262,10 @@ class DaySlotsView(AvailabilityView):
             return
         self.busy = True
         await interaction.response.defer()
-        slot = self.slots[int(self.court_select.values[0])].raw
+        slot = self.selected_group['courts'][int(self.court_select.values[0])]
         try:
             quote = await job(self.service, self.user, 'quote', {
-                'target': slot['start'], 'product': slot['product'], 'court': slot['court'], 'amount': 1})
+                'target': slot['start'], 'end': slot['end'], 'product': slot['product'], 'court': slot['court'], 'amount': 1})
             view = ConfirmView(self.service, self.user, self.discord_id, slot, quote, selection=self)
             mode = self.service.store.preferences(self.user['id']).get('payment_mode', 'kul')
             content = f"**{label(slot)} · €{quote['amount']}**\n" + (
@@ -282,7 +298,7 @@ class ConfirmView(ProfileView):
         if time.monotonic()>self.expires:
             await interaction.edit_original_response(content='Bevestiging verlopen. Kies het moment opnieuw.',view=None);return
         try:
-            result=await job(self.service,self.user,'book',{'target':self.slot['start'],'product':self.slot['product'],'court':self.slot['court'],'amount':self.quote['amount']})
+            result=await job(self.service,self.user,'book',{'target':self.slot['start'],'end':self.quote.get('end',self.slot['end']),'product':self.slot['product'],'court':self.slot['court'],'amount':self.quote['amount']})
             content=result['message']
             view=BookingResultView(self.service,self.user,self.discord_id,result)
         except Exception as error:content=str(error);view=None

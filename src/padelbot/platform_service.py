@@ -153,7 +153,11 @@ class PlatformService:
         if kind in {'book','quote'}:
             from datetime import datetime
             if int(payload['product'])<=0 or int(payload['court'])<=0:raise ValueError('Ongeldig terrein.')
-            if datetime.fromisoformat(payload['target'].replace('Z','+00:00')).tzinfo is None:raise ValueError('Ongeldig tijdstip.')
+            target_dt=datetime.fromisoformat(payload['target'].replace('Z','+00:00'))
+            if target_dt.tzinfo is None:raise ValueError('Ongeldig tijdstip.')
+            if payload.get('end') is not None:
+                end_dt=datetime.fromisoformat(payload['end'].replace('Z','+00:00'))
+                if end_dt.tzinfo is None or end_dt<=target_dt:raise ValueError('Ongeldige eindtijd.')
             amount=Decimal(str(payload.get('amount',1)))
             if not amount.is_finite() or not 0<amount<=100:raise ValueError('Ongeldig bedrag.')
             if kind=='book':
@@ -166,7 +170,11 @@ class PlatformService:
                 for row in prior:
                     previous=json.loads(row['payload'])
                     if (int(previous.get('product',0))==int(payload['product']) and int(previous.get('court',0))==int(payload['court'])
-                        and datetime.fromisoformat(previous['target'].replace('Z','+00:00')).timestamp()==target):return row['id']
+                        and datetime.fromisoformat(previous['target'].replace('Z','+00:00')).timestamp()==target):
+                        if (previous.get('end') and payload.get('end')
+                            and datetime.fromisoformat(previous['end'].replace('Z','+00:00'))!=end_dt):
+                            raise ValueError('Dit tijdstip is al aangevraagd met een andere eindtijd. Controleer je boekingen.')
+                        return row['id']
         return self.store.enqueue(user['id'],kind,payload,dedup=dedup)
 
     def oauth_start(self,user_id,session,return_to='/#dashboard'):

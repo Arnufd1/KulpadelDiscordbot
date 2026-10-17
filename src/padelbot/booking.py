@@ -153,7 +153,7 @@ def find_slots(
     booking_horizon = now_utc + timedelta(hours=168)
 
     slots: list[Slot] = []
-    seen: set[tuple[str, int]] = set()
+    seen: set[tuple[str, str, int, int]] = set()
     for r in raw_slots or []:
         sid_parent = r.get("bookableProductId") or r.get("activityProductId") or r.get("productId")
         sid_linked = r.get("bookableLinkedProductId") or r.get("linkedProductId") or r.get("id")
@@ -170,7 +170,7 @@ def find_slots(
         slot_start = datetime.fromisoformat(_timestamp_key(start))
         if not now_utc < slot_start <= booking_horizon:
             continue
-        key = (_timestamp_key(start), int(sid_parent))
+        key = (_timestamp_key(start), _timestamp_key(end), int(sid_parent), int(sid_linked))
         if key in seen:
             continue
         seen.add(key)
@@ -243,7 +243,7 @@ def find_slots_window(
     booking_horizon = now_utc + timedelta(hours=168)
 
     slots: list[Slot] = []
-    seen: set[tuple[str, int]] = set()
+    seen: set[tuple[str, str, int, int]] = set()
     for r in raw_slots or []:
         sid_parent = r.get("bookableProductId") or r.get("activityProductId") or r.get("productId")
         sid_linked = r.get("bookableLinkedProductId") or r.get("linkedProductId") or r.get("id")
@@ -259,7 +259,7 @@ def find_slots_window(
         slot_start = datetime.fromisoformat(_timestamp_key(start))
         if not now_utc < slot_start <= booking_horizon:
             continue
-        key = (_timestamp_key(start), int(sid_parent))
+        key = (_timestamp_key(start), _timestamp_key(end), int(sid_parent), int(sid_linked))
         if key in seen:
             continue
         seen.add(key)

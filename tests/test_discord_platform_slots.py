@@ -106,7 +106,7 @@ def test_range_command_visibly_lists_all_free_times_and_courts_plus_empty_days(s
         assert sent['content'] is None
         assert isinstance(sent['view'], ui.SlotsView)
         assert len(sent['view'].select.options) == 6
-        assert all(f'**{clock}**' in sent['embed'].description for clock in ('06:00', '06:30', '07:00'))
+        assert all(f'**{clock}**' in sent['embed'].description for clock in ('06:00–07:30', '06:30–08:00', '07:00–08:30'))
         assert 'Padel 1, Padel 2' in sent['embed'].description
         assert sent['embed'].description.count('Geen beschikbare padelvelden.') == 5
         assert any(getattr(item, 'label', '') == 'Vernieuwen' for item in sent['view'].children)
@@ -127,10 +127,98 @@ def test_single_day_command_opens_the_time_and_court_panel_directly(service, mon
         await ui.command(it, service, 'slots', 2, 2)
         view = it.edits[-1]['view']
         assert isinstance(view, ui.DaySlotsView)
-        assert [option.label for option in view.time_select.options] == ['06:00', '06:30', '07:00']
+        assert [option.label for option in view.time_select.options] == ['06:00–07:30', '06:30–08:00', '07:00–08:30']
         assert 'Padel 1, Padel 2' in it.edits[-1]['embed'].description
         assert not any(getattr(item, 'label', '') == 'Terug naar alle dagen' for item in view.children)
 
+    asyncio.run(run())
+
+
+def test_equal_start_different_end_keeps_exact_interval_through_quote_and_booking(service, monkeypatch):
+    rows = slots(count=1)
+    longer = {**rows[0], 'end': (ui.today().replace(hour=9)).isoformat(), 'price': 14}
+    rows.extend([dict(rows[0]), longer])
+    calls = []
+
+    async def queued(svc, user, kind, payload):
+        calls.append((kind, payload))
+        if kind == 'quote':
+            return {'amount': '14.00', 'end': longer['end']}
+        return {'message': 'Geboekt.', 'paid': False}
+    monkeypatch.setattr(ui, 'job', queued)
+
+    async def run():
+        snapshot = ui.availability_overview(rows, ui.today(), ui.today())
+        view = ui.DaySlotsView(service, USER, OWNER, snapshot, ui.today())
+        assert [option.label for option in view.time_select.options] == ['06:00–07:30', '06:00–09:00']
+        assert snapshot.pages[0][0].count('**06:00–07:30**') == 1
+        assert snapshot.pages[0][0].count('**06:00–09:00**') == 1
+        it = interaction()
+        view.time_select._values = [view.time_select.options[-1].value]
+        await view.choose_time(it)
+        timed = it.edits[-1]['view']
+        assert [option.label for option in timed.court_select.options] == ['Padel 1']
+        timed.court_select._values = [timed.court_select.options[0].value]
+        await timed.choose_court(it)
+        confirmation = it.edits[-1]['view']
+        assert confirmation.slot['end'] == longer['end'] and confirmation.slot['price'] == 14
+        await confirmation.confirm(it)
+        assert calls == [
+            ('quote', {'target': longer['start'], 'end': longer['end'], 'product': 1, 'court': 101, 'amount': 1}),
+            ('book', {'target': longer['start'], 'end': longer['end'], 'product': 1, 'court': 101, 'amount': '14.00'})]
+    asyncio.run(run())
+
+
+def test_shared_public_formatter_and_private_controls_deduplicate_and_naturally_sort_courts(service):
+    first = slots(count=1)[0]
+    rows = [{**first, 'product': number, 'court': 100 + number, 'name': f'Veld {number}'}
+            for number in (10, 2, 1)]
+    rows += [dict(rows[0])]
+    async def run():
+        snapshot = ui.availability_overview(rows, ui.today(), ui.today())
+        view = ui.DaySlotsView(service, USER, OWNER, snapshot, ui.today())
+        assert len(view.time_select.options) == 1
+        it = interaction()
+        view.time_select._values = [view.time_select.options[0].value]
+        await view.choose_time(it)
+        chosen = it.edits[-1]['view']
+        assert [option.label for option in chosen.court_select.options] == ['Veld 1', 'Veld 2', 'Veld 10']
+        await chosen.share(it)
+        published = it.replies[-1]
+        assert published['ephemeral'] is False
+        assert published['embed'].description == chosen.embed().description
+        assert published['embed'].description.count('**06:00–07:30**') == 1
+        assert 'Veld 1, Veld 2, Veld 10' in published['embed'].description
+    asyncio.run(run())
+
+
+def test_more_than_25_courts_are_reachable_without_changing_the_selected_interval(service, monkeypatch):
+    first = slots(count=1)[0]
+    rows = [{**first, 'product': number, 'court': 100 + number, 'name': f'Veld {number}'}
+            for number in reversed(range(1, 31))]
+    calls = []
+    async def queued(svc, user, kind, payload):
+        calls.append((kind, payload))
+        return {'amount': '8.00', 'end': payload['end']}
+    monkeypatch.setattr(ui, 'job', queued)
+    async def run():
+        snapshot = ui.availability_overview(rows, ui.today(), ui.today())
+        view = ui.DaySlotsView(service, USER, OWNER, snapshot, ui.today())
+        chosen = view.replace(selected_time=view.time_select.options[0].value)
+        assert len(chosen.court_select.options) == 25
+        assert chosen.court_select.options[-1].label == 'Veld 25'
+        it = interaction()
+        await chosen.next_courts(it)
+        last_page = it.edits[-1]['view']
+        assert last_page.selected_time == chosen.selected_time
+        assert [option.label for option in last_page.court_select.options] == [f'Veld {number}' for number in range(26, 31)]
+        assert len(last_page.to_components()) <= 5
+        last_page.court_select._values = [last_page.court_select.options[-1].value]
+        await last_page.choose_court(it)
+        assert calls == [('quote', {'target': first['start'], 'end': first['end'], 'product': 30, 'court': 130, 'amount': 1})]
+        await it.edits[-1]['view'].back(it)
+        restored = it.edits[-1]['view']
+        assert restored.court_page == 1 and restored.selected_time == chosen.selected_time
     asyncio.run(run())
 
 
@@ -206,13 +294,13 @@ def test_time_pages_and_court_choice_reach_last_slot_and_only_quote_before_confi
         await asyncio.gather(timed.choose_court(it), timed.choose_court(it))
         chosen = slots(count=30)[-1]
         assert calls == [(service, USER, 'quote', {
-            'target': chosen['start'], 'product': 2, 'court': 102, 'amount': 1})]
+            'target': chosen['start'], 'end': chosen['end'], 'product': 2, 'court': 102, 'amount': 1})]
         confirmation = it.edits[-1]['view']
         assert isinstance(confirmation, ui.ConfirmView)
         assert it.edits[-1]['embed'] is None
         await asyncio.gather(confirmation.confirm(it), confirmation.confirm(it))
         assert calls[-1] == (service, USER, 'book', {
-            'target': chosen['start'], 'product': 2, 'court': 102, 'amount': '8.00'})
+            'target': chosen['start'], 'end': chosen['end'], 'product': 2, 'court': 102, 'amount': '8.00'})
         assert [kind for _, _, kind, _ in calls] == ['quote', 'book']
 
     asyncio.run(run())

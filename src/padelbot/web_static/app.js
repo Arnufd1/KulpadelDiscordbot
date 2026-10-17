@@ -132,7 +132,20 @@ function renderSlots(){
  for(const slot of filtered){const key=date(slot.start);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(slot);}
  $('slots').replaceChildren();$('slot-summary').textContent=filtered.length+' vrije momenten';
  if(!groups.size){empty($('slots'),'Geen vrije momenten','Kies een andere dag.');return;}
- for(const [key,items] of groups){const row=el('div','slot-day'),label=el('div','slot-date',key.split(' ')[0]);label.append(el('strong','',key.split(' ').slice(1).join(' ')));const options=el('div','slot-options');for(const slot of items){const button=el('button','slot');button.append(el('strong','',clock(slot.start)+' - '+clock(slot.end)),el('small','',(slot.name||'Padel')+' \u00b7 Bekijk prijs'));button.addEventListener('click',()=>guarded(()=>quote(slot)));options.append(button);}row.append(label,options);$('slots').append(row);}
+ for(const [key,items] of groups){
+  const row=el('div','slot-day'),label=el('div','slot-date',key.split(' ')[0]);label.append(el('strong','',key.split(' ').slice(1).join(' ')));
+  const options=el('div','slot-options');
+  for(const group of items){
+   const interval=clock(group.start)+' - '+clock(group.end),card=el('div','slot'),courts=el('div','slot-courts');
+   card.setAttribute('role','group');card.setAttribute('aria-label',key+', '+interval);card.append(el('strong','slot-time',interval));
+   for(const slot of group.courts||[]){
+    const name=slot.name||'Veld',button=el('button','slot-court',name);button.type='button';
+    button.setAttribute('aria-label',name+' boeken, '+key+', '+interval);button.addEventListener('click',()=>guarded(()=>quote(slot)));courts.append(button);
+   }
+   card.append(courts);options.append(card);
+  }
+  row.append(label,options);$('slots').append(row);
+ }
 }
 function slotsSkeleton(){const skeleton=el('div','slots-skeleton');skeleton.setAttribute('aria-hidden','true');for(let i=0;i<3;i++){const row=el('div');row.append(el('span'),el('span'),el('span'));skeleton.append(row);}$('slots').replaceChildren(skeleton);$('slot-summary').textContent='7 dagen ophalen...';}
 async function slots(refresh=false){
@@ -140,7 +153,7 @@ async function slots(refresh=false){
  if(slotsCacheDay!==brusselsDay())slotsCache=null;
  if(slotsLoading){await slotsLoading;renderSlots();return;}
  if(!slotsCache||refresh){$('refresh-slots').disabled=true;$('refresh-slots').setAttribute('aria-busy','true');$('slots').setAttribute('aria-busy','true');if(!slotsCache)slotsSkeleton();
-  slotsLoading=(async()=>{const data=await task('/api/slots',{start:0,end:6},'Vrije momenten voor 7 dagen ophalen...');slotsCache=data.slots||[];slotsCacheDay=brusselsDay();})();
+  slotsLoading=(async()=>{const data=await task('/api/slots',{start:0,end:6},'Vrije momenten voor 7 dagen ophalen...');slotsCache=data.slot_groups||[];slotsCacheDay=brusselsDay();})();
   try{await slotsLoading;}catch(error){if(!slotsCache){$('slot-summary').textContent='';empty($('slots'),'Ophalen niet gelukt',error.message);}throw error;}finally{slotsLoading=null;$('refresh-slots').disabled=false;$('refresh-slots').setAttribute('aria-busy','false');$('slots').setAttribute('aria-busy','false');}
  }
  renderSlots();
@@ -151,10 +164,10 @@ async function loadPayments(){
  for(const payment of data.payments||[]){const url=safePaymentUrl(payment.url);if(!url||payment.status!=='pending')continue;const row=el('div','payment-item'),info=el('div');info.append(el('strong','',date(payment.target)+' \u00b7 '+clock(payment.target)),el('small','',euro(payment.amount)));const link=el('a','button dark','Betalen');link.href=url;link.target='_blank';link.rel='noopener noreferrer';row.append(info,link);container.append(row);}
  $('pending-payments').hidden=!container.children.length;
 }
-async function quote(slot){const result=await task('/api/quote',{target:slot.start,product:slot.product,court:slot.court,amount:1},'Jouw persoonlijke prijs controleren…');booking=result;$('create-draft').hidden=false;const detail=$('booking-detail');detail.replaceChildren(el('p','',(slot.name||'Padel')+' · '+date(result.target)+' · '+clock(result.target)),el('div','booking-amount',euro(result.amount)));$('confirm-book').textContent='Boeken en betalen · '+euro(result.amount);$('booking-payment-note').textContent=me.preferences.payment_mode==='discord'?'Eerst KUL-saldo, anders een betaallink.':'Met KUL-saldo of je gekoppelde creditcard.';$('confirm-book').textContent=(me.preferences.payment_mode==='discord'?'Boeken':'Boeken en betalen')+' - '+euro(result.amount);$('booking-dialog').showModal();}
-async function confirmBook(){if(!booking)return;$('confirm-book').disabled=true;try{$('booking-dialog').close();const result=booking.draft_id?await task('/api/drafts/'+booking.draft_id+'/confirm',{amount:Number(booking.amount)},'Boeking en betaling bevestigen...'):await task('/api/book',{target:booking.target,product:booking.product,court:booking.court,amount:Number(booking.amount)},'Je boeking wordt uitgevoerd...');message(result.message);booking=null;await loadMe();await loadPayments();if(result.payment_available)$('pending-payments').scrollIntoView({block:'center',behavior:'smooth'});}finally{$('confirm-book').disabled=false;}}
+async function quote(slot){const result=await task('/api/quote',{target:slot.start,end:slot.end,product:slot.product,court:slot.court,amount:1},'Jouw persoonlijke prijs controleren…');booking=result;$('create-draft').hidden=false;const detail=$('booking-detail');detail.replaceChildren(el('p','',(slot.name||'Padel')+' · '+date(result.target)+' · '+clock(result.target)+(result.end?' - '+clock(result.end):'')),el('div','booking-amount',euro(result.amount)));$('confirm-book').textContent='Boeken en betalen · '+euro(result.amount);$('booking-payment-note').textContent=me.preferences.payment_mode==='discord'?'Eerst KUL-saldo, anders een betaallink.':'Met KUL-saldo of je gekoppelde creditcard.';$('confirm-book').textContent=(me.preferences.payment_mode==='discord'?'Boeken':'Boeken en betalen')+' - '+euro(result.amount);$('booking-dialog').showModal();}
+async function confirmBook(){if(!booking)return;$('confirm-book').disabled=true;try{$('booking-dialog').close();const result=booking.draft_id?await task('/api/drafts/'+booking.draft_id+'/confirm',{amount:Number(booking.amount)},'Boeking en betaling bevestigen...'):await task('/api/book',{target:booking.target,end:booking.end,product:booking.product,court:booking.court,amount:Number(booking.amount)},'Je boeking wordt uitgevoerd...');message(result.message);booking=null;await loadMe();await loadPayments();if(result.payment_available)$('pending-payments').scrollIntoView({block:'center',behavior:'smooth'});}finally{$('confirm-book').disabled=false;}}
 async function createDraft(){if(!booking||booking.draft_id)return;$('create-draft').disabled=true;try{$('booking-dialog').close();await task('/api/drafts',{product:booking.product,court:booking.court,target:booking.target,end:booking.end},'Onbetaald voorstel aanmaken...');booking=null;communityFilter='draft';await showPage('online');}finally{$('create-draft').disabled=false;}}
-async function draftQuote(match){const result=await task('/api/drafts/'+match.id+'/quote',{},'Actuele prijs controleren...');booking={...result,draft_id:match.id};$('create-draft').hidden=true;const detail=$('booking-detail');detail.replaceChildren(el('p','',match.title+' - '+date(result.target)+' - '+clock(result.target)),el('div','booking-amount',euro(result.amount)));$('confirm-book').textContent='Boeken en betalen - '+euro(result.amount);$('booking-payment-note').textContent=me.preferences.payment_mode==='discord'?'Eerst KUL-saldo, anders een betaallink.':'Met KUL-saldo of je gekoppelde creditcard.';$('confirm-book').textContent=(me.preferences.payment_mode==='discord'?'Boeken':'Boeken en betalen')+' - '+euro(result.amount);$('booking-dialog').showModal();}
+async function draftQuote(match){const result=await task('/api/drafts/'+match.id+'/quote',{},'Actuele prijs controleren...');booking={...result,draft_id:match.id};$('create-draft').hidden=true;const detail=$('booking-detail');detail.replaceChildren(el('p','',match.title+' - '+date(result.target)+' - '+clock(result.target)+(result.end?' - '+clock(result.end):'')),el('div','booking-amount',euro(result.amount)));$('confirm-book').textContent='Boeken en betalen - '+euro(result.amount);$('booking-payment-note').textContent=me.preferences.payment_mode==='discord'?'Eerst KUL-saldo, anders een betaallink.':'Met KUL-saldo of je gekoppelde creditcard.';$('confirm-book').textContent=(me.preferences.payment_mode==='discord'?'Boeken':'Boeken en betalen')+' - '+euro(result.amount);$('booking-dialog').showModal();}
 
 async function shareMatch(id,url){
  if(!/^[a-f0-9]{32}$/.test(id))throw new Error('Deze match kan niet worden gedeeld.');
