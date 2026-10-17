@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 
 
 OPERATIONS = frozenset({"refresh_token", "silent_session", "android_login", "native_mfa", "emulator", "emulator_wait", "job", "job_wait"})
-JOB_KINDS = frozenset({"slots", "quote", "book", "bookings", "login", "account", "rule", "community_join", "draft_refresh", "draft_release"})
+JOB_KINDS = frozenset({"slots", "quote", "book", "bookings", "cancel_booking", "login", "account", "rule", "community_join", "draft_refresh", "draft_release"})
 CONTEXTS = frozenset({"login", "renewal", "enrollment", "probe"})
 OUTCOMES = frozenset({"running", "success", "failed", "cancelled"})
 ERRORS = frozenset({"session_expired", "network", "timeout", "configuration", "runtime", "interrupted", "unknown"})

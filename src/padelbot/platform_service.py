@@ -119,13 +119,26 @@ class PlatformService:
     def enqueue(self,user,kind,payload):
         if not self.store.user(user['id']) or self.store.user(user['id'])['suspended']:
             raise ValueError('Dit profiel is gepauzeerd.')
-        if kind not in {'slots','quote','book','bookings','login','account','rule','community_join'}:
+        if kind not in {'slots','quote','book','bookings','login','account','rule','community_join','cancel_booking'}:
             raise ValueError('Onbekende taak.')
         if kind in {'book','rule','community_join'}:self.require_writable(user['id'])
         if kind=='account':return self.account_check(user,force=True)['check']['job_id']
         if kind=='rule':
             if not self.can_autobook(user['id']):raise ValueError(AUTOBOOK_CARD_REQUIRED)
         dedup=None
+        if kind=='cancel_booking':
+            if self.access_status(user['id'])['suspended']:raise ValueError('Dit profiel is gepauzeerd.')
+            booking_id=payload.get('booking_id')
+            if type(booking_id) is not int or not 0<booking_id<2**63:raise ValueError('Ongeldige reservatie.')
+            dedup=f"cancel:{user['id']}:{booking_id}"
+            # Repeated clicks and interrupted writes keep the same operation.
+            # Ownership is also verified against KUL immediately before writing.
+            with self.store.conn() as c:
+                prior=c.execute('SELECT id FROM jobs WHERE user_id=? AND dedup=?',(user['id'],dedup)).fetchone()
+            if prior:return prior['id']
+            if not self._owns_upcoming_booking(user['id'],booking_id):
+                raise ValueError('Vernieuw je eigen boekingen voordat je deze reservatie annuleert.')
+            payload={'booking_id':booking_id}
         if kind=='slots':
             if not 0<=int(payload['start'])<=int(payload['end'])<=30:raise ValueError('Kies een periode van 0 tot 30 dagen.')
         if kind in {'book','quote'}:
@@ -162,10 +175,62 @@ class PlatformService:
             if row:c.execute('DELETE FROM discord_oauth WHERE state=?',(digest(state),))
         return bool(row)
 
-    def remember_payment(self,user_id,summary):
+    def remember_payment(self,user_id,summary,*,checked=None):
+        checked=time.time() if checked is None else float(checked)
         with self.store.conn() as c:
-            c.execute('INSERT INTO payment_accounts(user_id,balance,direct_debit,checked,stored_method,stored_card) VALUES(?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET balance=excluded.balance,direct_debit=excluded.direct_debit,checked=excluded.checked,stored_method=excluded.stored_method,stored_card=excluded.stored_card',
-                (user_id,str(summary['balance']),int(summary['direct_debit']),time.time(),int(summary.get('stored_method',False)),int(summary.get('stored_card',False))))
+            c.execute('INSERT INTO payment_accounts(user_id,balance,direct_debit,checked,stored_method,stored_card) VALUES(?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET balance=excluded.balance,direct_debit=excluded.direct_debit,checked=excluded.checked,stored_method=excluded.stored_method,stored_card=excluded.stored_card WHERE excluded.checked>=payment_accounts.checked',
+                (user_id,str(summary['balance']),int(summary['direct_debit']),checked,int(summary.get('stored_method',False)),int(summary.get('stored_card',False))))
+
+    def _owns_upcoming_booking(self,user_id,booking_id):
+        """Use only the signed-in profile's private snapshot, never a guest roster."""
+        from .web_community import timestamp
+        with self.store.conn() as c:
+            rows=c.execute("SELECT result FROM jobs WHERE user_id=? AND kind IN ('bookings','cancel_booking') AND status='done' AND result IS NOT NULL ORDER BY COALESCE(finished,created) DESC LIMIT 100",(user_id,)).fetchall()
+            for row in rows:
+                result=json.loads(row['result'])
+                if 'bookings' not in result:continue
+                for booking in result['bookings']:
+                    try:
+                        if (type(booking.get('id')) is int and booking['id']==booking_id
+                                and booking.get('cancellable') is not False and timestamp(booking['start'])>time.time()):return True
+                    except (KeyError,ValueError,TypeError):continue
+                return False  # A newer complete snapshot supersedes old ownership.
+            return bool(c.execute('SELECT 1 FROM community_matches WHERE user_id=? AND booking_id=? AND confirmed=1 AND start_ts>?',
+                (user_id,booking_id,time.time())).fetchone())
+
+    def cancellation_status(self,user_id):
+        with self.store.conn() as c:
+            rows=c.execute("SELECT id,payload,status,created,finished FROM jobs WHERE user_id=? AND kind='cancel_booking' AND dedup IS NOT NULL ORDER BY created DESC",(user_id,)).fetchall()
+        result={}
+        for row in rows:
+            booking_id=str(json.loads(row['payload'])['booking_id'])
+            if booking_id in result:continue
+            result[booking_id]={'job_id':row['id'],'status':row['status'],'updated':row['finished'] or row['created']}
+        return result
+
+    def confirm_cancelled_booking(self,user_id,booking_id):
+        """Invalidate exactly one confirmed KUL cancellation, even if refresh failed."""
+        booking_id=int(booking_id);now=time.time()
+        with self.store.conn() as c:
+            c.execute('BEGIN IMMEDIATE')
+            c.execute('UPDATE community_matches SET confirmed=0,shared=0,verified=? WHERE user_id=? AND booking_id=?',(now,user_id,booking_id))
+            c.execute('UPDATE booking_notifications SET confirmed=0,verified=? WHERE user_id=? AND booking_id=?',(now,user_id,booking_id))
+            c.execute("UPDATE private_payments SET status='cancelled',payload='' WHERE user_id=? AND booking_id=?",(user_id,booking_id))
+            c.execute("UPDATE discord_deliveries SET status='cancelled',payload='',finished=? WHERE user_id=? AND status='queued' AND (id IN (SELECT 'payment:' || user_id || ':' || sale_id FROM private_payments WHERE user_id=? AND booking_id=?) OR id LIKE ? OR id LIKE ?)",
+                (now,user_id,user_id,booking_id,f'booked:{user_id}:{booking_id}:%',f'reminder:{user_id}:{booking_id}:%'))
+        with self.hub.matches._connection() as c:
+            c.execute('BEGIN IMMEDIATE')
+            rows=c.execute('SELECT id FROM shared_matches WHERE hub_profile_id=? AND booking_id=?',(user_id,booking_id)).fetchall()
+            for row in rows:
+                c.execute("UPDATE shared_matches SET status='cancelled',hub_confirmed=0,hub_visible=0,hub_verified=? WHERE id=?",(now,row['id']))
+                self.hub.matches.queue_hub_update(c,row['id'])
+        self.store.audit(user_id,'booking_cancelled',str(booking_id))
+
+    def filter_stale_bookings(self,user_id,bookings,*,observed):
+        with self.store.conn() as c:
+            rows=c.execute("SELECT payload,result FROM jobs WHERE user_id=? AND kind='cancel_booking' AND status='done' AND finished>=?",(user_id,observed)).fetchall()
+        cancelled={json.loads(row['payload'])['booking_id'] for row in rows if row['result'] and json.loads(row['result']).get('cancelled') is True}
+        return [b for b in bookings if b.get('id') not in cancelled]
 
     def payment_status(self,user_id):
         with self.store.conn() as c:
@@ -264,6 +329,7 @@ class PlatformService:
                 groups[key]['attempts']+=1
                 continue
             message=('Je hebt geboekt.' if row['kind'] in {'book','rule'} and result.get('paid') is True else
+                     'Reservatie geannuleerd.' if row['kind']=='cancel_booking' and result.get('cancelled') is True else
                      'Wachten op betaling.' if result.get('payment_available') else
                      'Nog geen terrein vrij.' if result.get('waiting') else None)
             groups[key]={'id':row['id'],'kind':row['kind'],'status':row['status'],

@@ -89,3 +89,51 @@ def test_cleanup_failure_keeps_a_confirmed_cancellation_confirmed(monkeypatch):
         raise TimeoutError("cart cleanup delayed")
     monkeypatch.setattr(cart, "cleanup_slot_cart", failed_cleanup)
     assert booking_manager.cancel_booking(Client(), booking_id=123, member_id=42)["statusCode"] == 2
+
+
+def test_uncertain_write_exposes_only_safe_message_and_is_not_retried(monkeypatch):
+    own_booking(monkeypatch)
+    client = Client(error=TimeoutError("provider-cookie-secret"))
+    with pytest.raises(booking_manager.CancellationUncertain) as error:
+        booking_manager.cancel_booking(client, booking_id=123, member_id=42)
+    assert "provider-cookie-secret" not in str(error.value)
+    assert client.writes == [("/sales/12", {"statusCode": 2})]
+
+
+def test_preflight_network_failure_is_known_to_have_made_no_write(monkeypatch):
+    def failed_listing(*args, **kwargs):
+        raise TimeoutError("provider-secret")
+    monkeypatch.setattr(booking_manager, "list_my_bookings", failed_listing)
+    client = Client()
+    with pytest.raises(booking_manager.BookingCancellationError) as error:
+        booking_manager.cancel_booking(client, booking_id=123, member_id=42)
+    assert not isinstance(error.value, booking_manager.CancellationUncertain)
+    assert "provider-secret" not in str(error.value)
+    assert client.writes == []
+
+
+@pytest.mark.parametrize("item", [
+    {"bookingId": 123, "booking": {"id": 124}},
+    {"bookingId": 123, "saleId": 99},
+    {"bookingId": 123, "booking": "bad"},
+    {"bookingId": True},
+    {"productId": 7},
+])
+def test_inconsistent_sale_item_can_never_cancel_another_purchase(monkeypatch, item):
+    own_booking(monkeypatch)
+    client = Client()
+    original = client.get
+    client.get = lambda path, params=None: {"data": [item]} if path.endswith('/sale-items') else original(path, params)
+    with pytest.raises(booking_manager.BookingCancellationError):
+        booking_manager.cancel_booking(client, booking_id=123, member_id=42)
+    assert client.writes == []
+
+
+@pytest.mark.parametrize("response", [{"id": 12, "statusCode": 0}, {"id": 12, "creditSales": "pending"}, {"id": 12, "statusCode": 2, "customerPersonId": 43}])
+def test_paginated_list_absence_never_substitutes_positive_sale_confirmation(monkeypatch, response):
+    calls = own_booking(monkeypatch)
+    client = Client(response=response)
+    with pytest.raises(booking_manager.CancellationUncertain):
+        booking_manager.cancel_booking(client, booking_id=123, member_id=42)
+    assert len(calls) == 1  # No success inferred from an empty subsequent page.
+    assert len(client.writes) == 1

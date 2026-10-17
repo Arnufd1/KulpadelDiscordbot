@@ -135,6 +135,11 @@ class JobRunner:
         if not user or (user['suspended'] and row['kind']!='draft_release'):
             self.finish(row['id'],'cancelled',{'error':'Profiel is gepauzeerd.'})
             return None
+        if row['kind']=='cancel_booking':
+            from .platform_service import PlatformService
+            if PlatformService(self.store,self.community).access_status(user['id'])['suspended']:
+                self.finish(row['id'],'cancelled',{'error':'Profiel is gepauzeerd.','safe_to_retry':True})
+                return None
         if row['kind'] in {'book','rule','community_join','draft_refresh'}:
             try:self.store.assert_writable(user['id'])
             except ValueError as error:
@@ -270,10 +275,10 @@ class JobRunner:
             elif auth_stage and 'error' not in result:
                 if result.get('payment'):
                     from .platform_service import PlatformService
-                    PlatformService(self.store,self.community).remember_payment(row['user_id'],result['payment'])
+                    PlatformService(self.store,self.community).remember_payment(row['user_id'],result['payment'],checked=result.get('payment_checked_at') or row['started'] or row['created'])
                 with self.store.conn() as c:
                     c.execute("UPDATE jobs SET status='queued',auth_job_id=NULL,result=NULL WHERE id=? AND status='waiting_auth'",(row['id'],))
-            else:self.finish(row['id'],'failed' if 'error' in result else 'done',result)
+            else:self.finish(row['id'],'unknown' if result.get('cancellation_unknown') is True else 'failed' if 'error' in result else 'done',result)
         except asyncio.TimeoutError:
             if process:await self._stop_process(process)
             self.finish(row['id'],'unknown',{'error':'Taak duurde te lang. Controleer de boekingsstatus voor je opnieuw probeert.'})
@@ -287,20 +292,47 @@ class JobRunner:
     def finish(self, job_id, status, result):
         with self.store.conn() as c:
             job=c.execute('SELECT user_id,kind,payload,created,started FROM jobs WHERE id=?',(job_id,)).fetchone()
+        if job and job['kind']=='bookings' and status=='done' and isinstance(result.get('bookings'),list):
+            from .platform_service import PlatformService
+            service=PlatformService(self.store,self.community)
+            observed=result.get('bookings_checked_at') or job['started'] or job['created']
+            result['bookings']=service.filter_stale_bookings(job['user_id'],result['bookings'],observed=observed)
         if job and status in {'failed','unknown','cancelled'}:
             payload=json.loads(job['payload'])
             if job['kind']=='draft_refresh':
                 self.drafts.failed(payload['draft_id'],'KUL-controle onderbroken. Controleer je draft en winkelwagen.')
             elif job['kind']=='book' and payload.get('draft_id'):
                 self.drafts.uncertain_conversion(payload['draft_id'])
-        if job and job['kind']=='bookings' and status=='done':
+        if job and job['kind']=='cancel_booking' and status=='done' and result.get('cancelled') is True:
+            from .platform_service import PlatformService
+            from loguru import logger
+            service=PlatformService(self.store,self.community)
+            if result.get('payment'):
+                try:service.remember_payment(job['user_id'],result['payment'],checked=result.get('payment_checked_at') or job['started'] or job['created'])
+                except Exception as error:
+                    result['refresh_required']=True
+                    logger.warning('Cancellation balance refresh deferred: {}',type(error).__name__)
+            try:
+                service.confirm_cancelled_booking(job['user_id'],json.loads(job['payload'])['booking_id'])
+                if isinstance(result.get('bookings'),list):
+                    observed=result.get('bookings_checked_at') or job['started'] or job['created']
+                    result['bookings']=service.filter_stale_bookings(job['user_id'],result['bookings'],observed=observed)
+                    self.community.sync(job['user_id'],result['bookings'],device_verified=result.get('device_verified') is True)
+                    service.sync_verified_bookings(job['user_id'],result['bookings'],device_verified=result.get('device_verified') is True)
+                    service.queue_due_reminders()
+            except Exception as error:
+                # KUL has already confirmed the write. Never expose a retry just
+                # because a local notification or roster update was interrupted.
+                result['refresh_required']=True
+                logger.warning('Cancellation synchronization deferred: {}',type(error).__name__)
+        if job and job['kind']=='bookings' and status=='done' and isinstance(result.get('bookings'),list):
             self.community.sync(job['user_id'],result.get('bookings',[]),device_verified=result.get('device_verified') is True)
         if job and status=='done' and job['kind'] in {'book','rule','bookings'}:
             from .platform_service import PlatformService
             from loguru import logger
             try:
                 service=PlatformService(self.store,self.community)
-                if job['kind']=='bookings':
+                if job['kind']=='bookings' and isinstance(result.get('bookings'),list):
                     service.sync_verified_bookings(job['user_id'],result.get('bookings',[]),device_verified=result.get('device_verified') is True)
                     service.queue_due_reminders()
                 elif result.get('paid') is True and result.get('booking_id'):
@@ -311,7 +343,7 @@ class JobRunner:
                 logger.warning('Booking notification deferred: {}',type(error).__name__)
         if job and job['kind'] in {'login','account','quote'} and status=='done' and result.get('payment'):
             from .platform_service import PlatformService
-            PlatformService(self.store,self.community).remember_payment(job['user_id'],result['payment'])
+            PlatformService(self.store,self.community).remember_payment(job['user_id'],result['payment'],checked=result.get('payment_checked_at') or job['started'] or job['created'])
         with self.store.conn() as c:
             c.execute("UPDATE jobs SET status=?,result=?,finished=? WHERE id=?",(status,json.dumps(result),time.time(),job_id))
             if status=='done' and result.get('waiting') is True:
@@ -319,7 +351,9 @@ class JobRunner:
                 # read-only outcome may be checked again. Interrupted writes retain dedup.
                 c.execute("UPDATE jobs SET dedup=NULL WHERE id=? AND kind='rule'",(job_id,))
             elif status=='failed' and result.get('safe_to_retry') is True:
-                c.execute("UPDATE jobs SET dedup=NULL WHERE id=? AND kind IN ('book','rule')",(job_id,))
+                c.execute("UPDATE jobs SET dedup=NULL WHERE id=? AND kind IN ('book','rule','cancel_booking')",(job_id,))
+            elif status=='cancelled' and result.get('safe_to_retry') is True:
+                c.execute("UPDATE jobs SET dedup=NULL WHERE id=? AND kind='cancel_booking'",(job_id,))
         if job:
             from .telemetry import record_job
             record_job(self.store.root/'telemetry.sqlite3',user_id=job['user_id'],job_id=job_id,kind=job['kind'],

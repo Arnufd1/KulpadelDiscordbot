@@ -389,6 +389,14 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
     def private_payments(user=Depends(current)):
         return {'payments':platform.private_payments(user['id'])}
 
+    @app.get('/api/bookings/cancellations')
+    def cancellation_status(user=Depends(current)):
+        return {'cancellations':platform.cancellation_status(user['id'])}
+
+    @app.post('/api/bookings/{booking_id}/cancel')
+    def cancel_booking(booking_id:int,user=Depends(current)):
+        return {'job_id':platform.enqueue(user,'cancel_booking',{'booking_id':booking_id})}
+
     @app.get('/api/payment-card')
     def card_summary(user=Depends(current)):
         return {'enabled':cards.key is not None,'card':cards.summary(user['id']),'cards':cards.list(user['id'])}
@@ -562,6 +570,10 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
         job = store.job(user["id"],job_id)
         if job is None:
             raise HTTPException(404,"Taak niet gevonden.")
+        if job.get('result') and isinstance(job['result'].get('bookings'),list):
+            cancellations=platform.cancellation_status(user['id'])
+            for booking in job['result']['bookings']:
+                booking['cancellation']=cancellations.get(str(booking.get('id')))
         return job
 
     @app.get("/api/history")

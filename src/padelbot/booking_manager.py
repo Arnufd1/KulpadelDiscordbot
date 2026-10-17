@@ -9,6 +9,24 @@ from loguru import logger
 from .client import BackboneClient
 
 
+class BookingCancellationError(RuntimeError):
+    """A cancellation was rejected before any cancellation write was attempted."""
+
+
+class CancellationUncertain(BookingCancellationError):
+    """A cancellation write may have happened; never automatically repeat it."""
+
+
+def _single_booking_item(item: Any, booking_id: int, sale_id: int) -> bool:
+    if not isinstance(item, dict) or item.get("saleId", sale_id) != sale_id:
+        return False
+    joined = item.get("booking")
+    if joined is not None and not isinstance(joined, dict):
+        return False
+    references = [value for value in (item.get("bookingId"), (joined or {}).get("id")) if value is not None]
+    return bool(references) and all(type(value) is int and value == booking_id for value in references)
+
+
 @dataclass
 class MyBooking:
     id: int
@@ -108,28 +126,51 @@ def cancel_booking(
     in USC so cancelling one booking cannot cancel other purchased items.
     Never fall back to another write after an uncertain response.
     """
-    mine = list_my_bookings(client, member_id=member_id, upcoming_only=True)
+    if type(booking_id) is not int or booking_id <= 0 or type(member_id) is not int or member_id <= 0:
+        raise BookingCancellationError("Ongeldige reservatie.")
+    try:
+        mine = list_my_bookings(client, member_id=member_id, upcoming_only=True)
+    except Exception:
+        raise BookingCancellationError("Je eigen boekingen konden niet worden gecontroleerd. Er is niets geannuleerd.") from None
     booking = next((b for b in mine if b.id == booking_id), None)
-    if booking is None or not booking.sale_id:
-        raise RuntimeError("Deze reservatie is niet meer beschikbaar in je eigen boekingen.")
+    if booking is None or type(booking.sale_id) is not int or booking.sale_id <= 0:
+        raise BookingCancellationError("Deze reservatie is niet meer beschikbaar in je eigen boekingen.")
     sale_id = booking.sale_id
-    response = client.get(f"/sales/{sale_id}", params={
-        "s": {"id": sale_id, "customerPersonId": member_id},
-    })
-    sale = response.get("data", response)
-    if sale.get("id") != sale_id or sale.get("customerPersonId") != member_id:
-        raise RuntimeError("De aankoop hoort niet bij het aangemelde account.")
-    items_out = client.get(f"/sales/{sale_id}/sale-items", params={"join": "booking"})
+    try:
+        response = client.get(f"/sales/{sale_id}", params={
+            "s": {"id": sale_id, "customerPersonId": member_id},
+        })
+        items_out = client.get(f"/sales/{sale_id}/sale-items", params={"join": "booking"})
+    except Exception:
+        raise BookingCancellationError("De aankoop kon niet worden gecontroleerd. Er is niets geannuleerd.") from None
+    sale = response.get("data", response) if isinstance(response, dict) else None
+    if not isinstance(sale, dict) or sale.get("id") != sale_id or sale.get("customerPersonId") != member_id:
+        raise BookingCancellationError("De aankoop hoort niet bij het aangemelde account.")
     items = items_out.get("data", []) if isinstance(items_out, dict) else items_out
-    if not items or any((it.get("bookingId") or (it.get("booking") or {}).get("id")) != booking_id for it in items):
-        raise RuntimeError("Deze reservatie hoort bij een gecombineerde aankoop. Annuleer ze via KU Leuven Sport.")
+    if (not isinstance(items, list) or not items
+        or any(not _single_booking_item(it, booking_id, sale_id) for it in items)):
+        raise BookingCancellationError("Deze reservatie hoort bij een gecombineerde aankoop. Annuleer ze via KU Leuven Sport.")
     logger.info("Cancelling own sale id={} for booking={}", sale_id, booking_id)
-    response = client.patch(f"/sales/{sale_id}", {"statusCode": 2})
-    sale = response.get("data", response)
-    if sale.get("id") != sale_id or not (sale.get("statusCode") == 2 or sale.get("creditSales")):
-        raise RuntimeError("Annulering nog niet bevestigd. Vernieuw je boekingen voor je opnieuw probeert.")
-    if any(b.id == booking_id for b in list_my_bookings(client, member_id=member_id, upcoming_only=True)):
-        raise RuntimeError("Annulering verwerkt, maar de reservatie staat nog in het overzicht. Vernieuw je boekingen.")
+    try:
+        response = client.patch(f"/sales/{sale_id}", {"statusCode": 2})
+    except Exception:
+        raise CancellationUncertain("Annulering nog niet bevestigd. Vernieuw je boekingen voor je opnieuw probeert.") from None
+    sale = response.get("data", response) if isinstance(response, dict) else None
+    # Positive sale confirmation is required: absence from a paginated booking
+    # overview alone cannot prove that KUL cancelled a reservation.
+    if (not isinstance(sale, dict) or sale.get("id") != sale_id
+        or sale.get("customerPersonId", member_id) != member_id
+        or not (type(sale.get("statusCode")) is int and sale["statusCode"] == 2
+                or isinstance(sale.get("creditSales"), list) and any(
+                    isinstance(credit, dict) and type(credit.get("id")) is int and credit["id"] > 0
+                    for credit in sale["creditSales"]))):
+        raise CancellationUncertain("Annulering nog niet bevestigd. Vernieuw je boekingen voor je opnieuw probeert.")
+    try:
+        remaining = list_my_bookings(client, member_id=member_id, upcoming_only=True)
+    except Exception:
+        raise CancellationUncertain("Annulering nog niet bevestigd. Vernieuw je boekingen voor je opnieuw probeert.") from None
+    if any(b.id == booking_id for b in remaining):
+        raise CancellationUncertain("Annulering verwerkt, maar de reservatie staat nog in het overzicht. Vernieuw je boekingen.")
     if booking.raw.get("productId") and booking.raw.get("linkedProductId"):
         from .booking import Slot
         from .cart import cleanup_slot_cart

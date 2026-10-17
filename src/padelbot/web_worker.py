@@ -10,6 +10,7 @@ from pathlib import Path
 import signal
 import sqlite3
 import sys
+import time
 from zoneinfo import ZoneInfo
 
 from .config import settings
@@ -17,6 +18,7 @@ from .store import TokenStore
 
 
 _reservation_started=False
+_cancellation_started=False
 _prepared_delivery=None
 _prepared_service=None
 
@@ -72,6 +74,7 @@ def verified_bookings(client, me):
     return {'device_verified':device_verified,'bookings':[
         {'id':b.id,'sale_id':b.sale_id,'description':b.description,'name':names.get(b.raw.get('productId'),'Reservatie'),
          'start':b.start_iso,'end':b.end_iso,'paid':b.paid_for,
+         'cancellable':True,
          'confirmed':device_verified and b.status==0 and b.paid_for is True and completed.get(b.sale_id,False)
              and 'padel' in names.get(b.raw.get('productId'),'').lower()}
         for b in bookings]}
@@ -86,8 +89,9 @@ def platform_context():
 
 
 def execute(kind: str, payload: dict) -> dict:
-    global _reservation_started,_prepared_delivery,_prepared_service
+    global _reservation_started,_cancellation_started,_prepared_delivery,_prepared_service
     _reservation_started=False
+    _cancellation_started=False
     _prepared_delivery=_prepared_service=None
     if kind in {'book','rule','draft_refresh'} and os.environ.get('PADELWEB_DB'):
         assert_writable_profile()
@@ -108,12 +112,13 @@ def execute(kind: str, payload: dict) -> dict:
             token_store.save(tokens)
     with BackboneClient() as client:
         me = client.me()
+        payment_checked_at = time.time()
         if kind in {'account','login','quote','book','rule'}:
             from .payment import attach_stored_method
             me=attach_stored_method(client,me,cards_only=True)
         if kind in {"account","login"}:
             return {"connected":True,"name":str(me.get("firstName") or me.get("name") or "KUL-account"),
-                    "payment":payment_summary(me)}
+                    "payment":payment_summary(me),"payment_checked_at":payment_checked_at}
         if kind == "slots":
             start,end = int(payload["start"]),int(payload["end"])
             if not 0<=start<=end<=30:
@@ -125,11 +130,46 @@ def execute(kind: str, payload: dict) -> dict:
                               "start":s.start_iso,"end":s.end_iso,"price":s.price,'name':names.get(s.bookable_product_id,'Padel')} for s in slots if s.start_dt>today]}
         if kind == "bookings":
             return verified_bookings(client,me)
+        if kind == "cancel_booking":
+            from .booking_manager import cancel_booking, BookingCancellationError, CancellationUncertain
+            booking_id=payload.get('booking_id')
+            if type(booking_id) is not int or booking_id<=0:
+                return {'error':'Ongeldige reservatie.','safe_to_retry':True}
+            if os.environ.get('PADELWEB_DB'):
+                from .platform_service import PlatformService
+                context=platform_context()
+                if PlatformService(context.store,context).access_status(os.environ['PADELWEB_USER_ID'])['suspended']:
+                    return {'error':'Je profiel is gepauzeerd.','booking_id':booking_id,'safe_to_retry':True}
+            try:
+                _cancellation_started=True
+                cancel_booking(client,booking_id=booking_id,member_id=int(me['id']))
+            except CancellationUncertain as error:
+                return {'error':str(error),'booking_id':booking_id,'cancellation_unknown':True}
+            except BookingCancellationError as error:
+                return {'error':str(error),'booking_id':booking_id,'safe_to_retry':True}
+            # Only a positively confirmed cancellation reaches this point. A
+            # failed follow-up read must not fabricate an empty booking list or
+            # a refunded balance, and must never repeat the cancellation write.
+            try:
+                fresh=client.me()
+                checked_at=time.time()
+                if int(fresh['id'])!=int(me['id']):
+                    raise ValueError('KUL-account gewijzigd tijdens de controle.')
+                actual=verified_bookings(client,fresh)
+                if any(b['id']==booking_id for b in actual['bookings']):
+                    raise ValueError('KUL-overzicht nog niet bijgewerkt.')
+                from .payment import attach_stored_method
+                fresh=attach_stored_method(client,fresh,cards_only=True)
+                return {'cancelled':True,'booking_id':booking_id,**actual,
+                        'payment':payment_summary(fresh),'payment_checked_at':checked_at,
+                        'message':'Reservatie geannuleerd.'}
+            except Exception:
+                return {'cancelled':True,'booking_id':booking_id,'refresh_required':True,
+                        'message':'Reservatie geannuleerd. Saldo en boekingen konden nog niet vernieuwd worden.'}
         if kind in {'draft_refresh','draft_release'}:
             from .drafts import DraftStore,ensure_draft_cart,draft_deadline
             from .web_community import timestamp
             from filelock import FileLock
-            import time
             drafts=DraftStore(platform_context())
             draft=drafts.owned(payload['draft_id'],os.environ['PADELWEB_USER_ID'])
             settings.padelbot_rules_file.parent.mkdir(parents=True,exist_ok=True)
@@ -200,7 +240,7 @@ def execute(kind: str, payload: dict) -> dict:
         amount = slot_price(client,slot,me)
         if kind=="quote":
             return {"amount":str(amount),"product":slot.bookable_product_id,"court":slot.bookable_linked_product_id,"target":slot.start_iso,'end':slot.end_iso,
-                    "payment":payment_summary(me)}
+                    "payment":payment_summary(me),"payment_checked_at":payment_checked_at}
         maximum = Decimal(str(prefs.get("max_amount",0)))
         if (kind=='rule' or 'payment_mode' not in prefs) and (amount>maximum or maximum<=0):
             raise ValueError("De prijs ligt boven jouw ingestelde maximum. Er is niets geboekt.")
@@ -272,6 +312,8 @@ def main():
         # Provider exceptions may contain account identifiers, challenge links or cookies.
         result = {"error":"KUL kon deze taak niet afronden. Controleer je koppeling, saldo en boekingen voor je opnieuw probeert."}
     if 'error' in result and message['kind'] in {'book','rule'} and not _reservation_started:
+        result['safe_to_retry']=True
+    if 'error' in result and message['kind']=='cancel_booking' and not _cancellation_started:
         result['safe_to_retry']=True
     if 'error' in result and _prepared_delivery:
         try:_prepared_service.close_prepared(os.environ['PADELWEB_USER_ID'],os.environ['PADELWEB_JOB_ID'],_prepared_delivery)
