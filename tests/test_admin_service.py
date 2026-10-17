@@ -50,6 +50,10 @@ def test_admin_projection_uses_cached_state_redacts_payment_credentials_and_pref
     start=(datetime.now(timezone.utc)+timedelta(days=2)).replace(microsecond=0)
     booking={'id':111,'name':'Padel 1','start':start.isoformat(),'end':(start+timedelta(hours=1)).isoformat(),'confirmed':True}
     app.state.community.sync(alice['id'],[booking],device_verified=True)
+    from padelbot.web_cards import CardVault
+    key=store.root/'test-vault.key';key.write_bytes(b'a'*32)
+    app.state.platform.cards=CardVault(store,key)
+    app.state.platform.cards.save(alice['id'],holder='Alice',number='4242424242424242',month=12,year=2035)
     app.state.platform.remember_payment(alice['id'],{'balance':'12','direct_debit':False,'stored_method':True,'stored_card':True})
     active=rules_for(store,alice).add_rule(1,'18:00')
     disabled=rules_for(store,alice).add_rule(2,'18:00');rules_for(store,alice).set_enabled(disabled.id,False)

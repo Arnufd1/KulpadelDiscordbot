@@ -5,7 +5,7 @@ the Pi — NEVER through Discord.
 from __future__ import annotations
 import json
 import os
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -16,17 +16,17 @@ from cryptography.fernet import Fernet
 @dataclass
 class Card:
     holder: str
-    number: str
+    number: str = field(repr=False)
     exp_month: int
     exp_year: int   # 4-digit
-    cvv: str
+    cvv: str = field(repr=False)
 
     def masked(self) -> str:
         last4 = self.number[-4:] if len(self.number) >= 4 else "????"
         return f"**** **** **** {last4}  exp {self.exp_month:02d}/{self.exp_year}  ({self.holder})"
 
 
-def validate_card(card: Card) -> None:
+def validate_card(card: Card, *, allow_missing_cvv: bool = False) -> None:
     """Reject incomplete, mistyped or expired details without echoing them."""
     if not card.holder.strip():
         raise ValueError("Vul de naam van de kaarthouder in.")
@@ -42,6 +42,8 @@ def validate_card(card: Card) -> None:
         raise ValueError("De vervaldatum is ongeldig.")
     if (card.exp_year, card.exp_month) < (now.year, now.month):
         raise ValueError("Deze kaart is vervallen.")
+    if allow_missing_cvv and card.cvv == '':
+        return
     if not card.cvv.isascii() or not card.cvv.isdigit() or len(card.cvv) not in (3, 4):
         raise ValueError("De CVC moet uit 3 of 4 cijfers bestaan.")
 

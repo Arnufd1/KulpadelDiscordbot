@@ -324,12 +324,17 @@ def test_registration_qr_is_decoded_in_memory_and_external_links_rejected():
     ({'automatic_payment':True,'max_amount':20},0,12,12),
     ({'automatic_payment':True,'max_amount':20},100,12,11),
 ])
-def test_web_booking_fails_before_reservation_without_consent_funds_or_price_match(tmp_path,monkeypatch,preferences,balance,amount,confirmed):
+def test_web_booking_fails_before_reservation_without_consent_funds_or_price_match(portal,tmp_path,monkeypatch,preferences,balance,amount,confirmed):
     from decimal import Decimal
     from types import SimpleNamespace
     from datetime import datetime,timezone
     from padelbot import web_worker,client,booking,checkout
     from padelbot.config import settings
+    app,_,store,(_,alice,_)=portal
+    store.preferences(alice['id'],preferences)
+    monkeypatch.setenv('PADELWEB_DB',str(store.path))
+    monkeypatch.setenv('PADELWEB_USER_ID',alice['id'])
+    monkeypatch.setattr(web_worker,'platform_context',lambda:app.state.community)
     monkeypatch.setattr(web_worker,'initialise_key',lambda:None)
     monkeypatch.setattr(settings,'padelbot_rules_file',tmp_path/'rules.sqlite3')
     me={'id':123,'balance':balance}
@@ -538,13 +543,13 @@ def test_card_validation_does_not_echo_pan_or_accept_cvc(portal):
     headers=sign_in(client,store,alice)
     data={'holder':'Example','number':'4111111111111111','month':12,'year':2035,'cvc':'987'}
     response=client.post('/api/payment-card',json=data,headers=headers)
-    assert response.status_code==410
+    assert response.status_code==422
     assert data['number'] not in response.text and '987' not in response.text
-    assert response.json()['manage_url'].startswith('https://usc.kuleuven.cloud/')
+    assert 'manage_url' not in response.json()
     del data['cvc']
     data['number']='4111111111111112'
     response=client.post('/api/payment-card',json=data,headers=headers)
-    assert response.status_code==410 and data['number'] not in response.text
+    assert response.status_code==400 and data['number'] not in response.text
     assert client.get('/api/payment-card').json()['card'] is None
     assert client.post('/api/payment-card',json=data,headers={'Origin':'http://testserver'}).status_code==403
 

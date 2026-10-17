@@ -609,13 +609,17 @@ def book(
     on_3ds_challenge: Callable[[], None] | None = None,
     expected_amount: Decimal | None = None,
     payment_mode: str = 'legacy',
+    payment_card=None,
+    payment_card_loader=None,
+    local_card: dict | None = None,
 ) -> BookingResult:
     """Serialize the complete cart/checkout transaction across Discord and web workers."""
     from filelock import FileLock
     settings.padelbot_rules_file.parent.mkdir(parents=True,exist_ok=True)
     with FileLock(str(settings.padelbot_rules_file)+".booking.lock",timeout=180):
         return _book(client,slot,member_id=member_id,auto_pay=auto_pay,me=me,label=label,
-                     on_3ds_challenge=on_3ds_challenge,expected_amount=expected_amount,payment_mode=payment_mode)
+                     on_3ds_challenge=on_3ds_challenge,expected_amount=expected_amount,payment_mode=payment_mode,
+                     payment_card=payment_card,payment_card_loader=payment_card_loader,local_card=local_card)
 
 
 def _book(
@@ -629,6 +633,9 @@ def _book(
     on_3ds_challenge: Callable[[], None] | None = None,
     expected_amount: Decimal | None = None,
     payment_mode: str = 'legacy',
+    payment_card=None,
+    payment_card_loader=None,
+    local_card: dict | None = None,
 ) -> BookingResult:
     """Cart → sale → payment (optional).
 
@@ -643,7 +650,14 @@ def _book(
     if payment_mode=='kul':
         from .platform_service import validate_payment
         if me is None:me=client.me()
-        validate_payment(me,expected_amount or Decimal(str(slot.price or 0)),'kul')
+        if payment_card is not None:
+            from .card_store import validate_card
+            from .worldline_driver import _detect_card_brand
+            validate_card(payment_card,allow_missing_cvv=True)
+            if not _detect_card_brand(payment_card.number):raise ValueError('Dit kaarttype wordt nog niet ondersteund voor automatisch betalen.')
+            local_card={'network':{'VISA_brand':'visa','Eurocard_brand':'mastercard',
+                'BCMC_brand':'bancontact','Maestro_brand':'maestro'}[_detect_card_brand(payment_card.number)],'expired':False}
+        validate_payment(me,expected_amount or Decimal(str(slot.price or 0)),'kul',local_card=local_card)
     if expected_amount is not None:
         try:
             expected_amount = Decimal(str(expected_amount))
@@ -707,8 +721,16 @@ def _book(
                 resp=create_payment(client,sale_id=int(sale_id),member_id=member_id,amount=float(amount),method=method)
             elif payment_mode=='kul':
                 from .platform_service import validate_payment
-                validate_payment(me,Decimal(str(amount)),'kul')
-                method,resp=_auto_pay(client,sale_id=int(sale_id),member_id=member_id,amount=float(amount),me=me,allow_direct_debit=False)
+                validate_payment(me,Decimal(str(amount)),'kul',local_card=local_card)
+                if Decimal(str(me.get('balance') or 0))<Decimal(str(amount)):
+                    # The loader rechecks this profile's current consent and
+                    # primary card after the sale, immediately before payment.
+                    if payment_card_loader is not None:payment_card=payment_card_loader()
+                    if payment_card is None:raise ValueError('Je betaalkaart is niet meer beschikbaar. Gebruik de betaallink.')
+                    from .card_store import validate_card
+                    validate_card(payment_card,allow_missing_cvv=True)
+                method,resp=_auto_pay(client,sale_id=int(sale_id),member_id=member_id,amount=float(amount),me=me,
+                    allow_direct_debit=False,allow_stored_method=False)
             else:
                 method, resp = _auto_pay(client, sale_id=int(sale_id), member_id=member_id, amount=float(amount), me=me)
             result.pay_method = method.name
@@ -717,23 +739,14 @@ def _book(
                 logger.info("Built checkout link for sale {}", sale_id)
                 result.payment_url = url
                 if payment_mode=='discord':return result
-                if payment_mode=='kul':
-                    # A tokenized KUL card may require its bank's hosted approval.
-                    # Never load the separate card vault or automate that challenge.
-                    if url and resp.get('userInitiatedPaymentResult',{}).get('bPaidOnStoredPayMethod') is not True:return result
-                    result.payment_pending=True
-                    result.paid=wait_for_payment_confirmation(client,sale_id=int(sale_id),member_id=member_id,
-                        amount=float(amount),reference=payment_reference(resp))
-                    if result.paid:result.payment_pending=False;result.payment_url=None
-                    else:result.pay_error='Betaling nog niet bevestigd. Controleer KUL voor je opnieuw betaalt.'
-                    return result
                 # If a card is stored, drive the Worldline page headlessly.
                 from .worldline_driver import load_card, pay_via_worldline
-                card = load_card()
+                card = payment_card if payment_mode=='kul' else load_card()
                 if card and url:
                     logger.info("Driving Worldline checkout headlessly...")
+                    driver_options={'allow_missing_cvv':True} if payment_mode=='kul' else {}
                     drv = pay_via_worldline(payment_url=url, card=card, headless=True,
-                                            on_3ds_challenge=on_3ds_challenge)
+                                            on_3ds_challenge=on_3ds_challenge,**driver_options)
                     if drv.success or drv.submitted:
                         result.payment_pending = True
                         result.paid = wait_for_payment_confirmation(
@@ -743,8 +756,10 @@ def _book(
                         if result.paid:
                             result.payment_pending = False
                             result.pay_method = "CREDIT_CARD (auto)"
+                            result.payment_url = None
                             logger.info("Backend confirmed payment for sale {}", sale_id)
                         else:
+                            if payment_mode=='kul':result.payment_url=None
                             result.pay_error = drv.error or "Checkout attempted; payment confirmation is pending. Check the sale before paying again."
                     else:
                         result.pay_error = drv.error or "worldline driver failed"
@@ -768,7 +783,8 @@ def _book(
         except Exception as e:
             if isinstance(e, PaymentStateUnknownError):
                 result.payment_pending = True
-            result.pay_error = str(e)
-            logger.warning("auto_pay failed (booking still reserved): {}", e)
+                if payment_mode=='kul':result.payment_url=None
+            result.pay_error = str(e) if payment_mode=='legacy' else 'Betaling niet bevestigd. Controleer je boeking voordat je opnieuw betaalt.'
+            logger.warning("auto_pay failed (booking still reserved): {}", type(e).__name__)
 
     return result

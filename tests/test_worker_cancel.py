@@ -46,10 +46,10 @@ def worker(monkeypatch):
 def test_cancel_reloads_balance_and_bookings_only_after_provider_confirmation(worker,monkeypatch):
     monkeypatch.setattr(web_worker.time,'time',lambda:1234)
     result=web_worker.execute('cancel_booking',{'booking_id':123})
-    assert worker.events==[('me',1),('cancel',123,42),('me',2),('bookings',20),('stored',20)]
+    assert worker.events==[('me',1),('cancel',123,42),('me',2),('bookings',20)]
     assert result['cancelled'] is True and result['booking_id']==123
     assert result['bookings']==[{'id':456,'start':'2030-10-10T17:00:00Z'}]
-    assert result['payment']['balance']==20 and result['payment']['stored_card'] is True
+    assert result['payment']['balance']==20 and result['payment']['stored_card'] is False
     assert result['payment_checked_at']==1234
     assert 'id' not in result['payment'] and '_stored_method' not in result['payment']
 

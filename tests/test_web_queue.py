@@ -295,9 +295,15 @@ def test_preflight_requires_current_eligible_autobooking_and_uses_renewal_contex
     from padelbot.platform_service import PlatformService
     async def scenario():
         runner,store,community,(_,alice,_,_)=runner_for(hub);workers=Workers(monkeypatch)
+        from padelbot.web_cards import CardVault
+        key=store.root/'card-test.key';key.write_bytes(b'q'*32)
+        store.card_vault_key_file=key
+        vault=CardVault(store,key)
         service=PlatformService(store,community)
         for card,enabled,expected in [(False,True,'cancelled'),(True,False,'cancelled'),(True,True,'done')]:
-            service.remember_payment(alice['id'],{'balance':0,'direct_debit':False,'stored_card':card})
+            vault.delete(alice['id'])
+            if card:vault.save(alice['id'],holder='Alice',number='4242424242424242',month=12,year=2035)
+            service.remember_payment(alice['id'],{'balance':0,'direct_debit':False,'stored_card':False})
             store.preferences(alice['id'],{'automatic_payment':enabled,'payment_mode':'kul','max_amount':20})
             job=store.enqueue(alice['id'],'login',{'preflight':True})
             await ticks(runner)

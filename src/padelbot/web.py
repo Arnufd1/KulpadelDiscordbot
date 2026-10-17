@@ -12,6 +12,7 @@ from pathlib import Path
 import secrets
 import subprocess
 import time
+from typing import Literal
 from urllib.parse import urlencode, urlsplit
 
 import httpx
@@ -65,6 +66,17 @@ class PreferencesRequest(BaseModel):
     automatic_payment: bool = False
     max_amount: float = Field(ge=0,le=100)
     payment_mode: str = Field(default='kul',pattern=r'^(kul|discord)$')
+
+
+class CardRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    holder: str = Field(min_length=1,max_length=80,repr=False)
+    number: str = Field(min_length=12,max_length=32,repr=False)
+    month: int = Field(ge=1,le=12)
+    year: int = Field(ge=2000,le=9999)
+    label: str = Field(default='',max_length=200,repr=False)
+    primary: bool = False
+    funding: Literal['credit','debit','unknown'] = 'unknown'
 
 
 class BookingRequest(BaseModel):
@@ -125,10 +137,10 @@ def validate_google_claims(claims: dict, nonce: str, audience: str):
 def create_app(config: WebSettings | None = None, *, start_workers: bool = True) -> FastAPI:
     config = config or WebSettings()
     store = PlatformStore(config.root,config.owner_email)
-    runner, devices = JobRunner(store), DeviceManager(store)
+    runner, devices = JobRunner(store,card_vault_key_file=config.card_vault_key_file), DeviceManager(store)
     cards = CardVault(store,config.card_vault_key_file)
     community = runner.community
-    platform=PlatformService(store,community)
+    platform=PlatformService(store,community,cards=cards)
     from .admin_service import AdminService
     administration=AdminService(platform)
     drafts=runner.drafts
@@ -336,7 +348,7 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
         needs_attention=Path(env['PADELBOT_ANDROID_FAILURE_FILE']).exists()
         device_ready=profile.exists() and (verified or connected)
         newer_problem=bool(check and check['status']!='done' and check['checked']>(payment or {}).get('checked',0))
-        kul_verified=bool(connected and device_ready and payment and not needs_attention and not newer_problem)
+        kul_verified=bool(connected and device_ready and payment and payment.get('checked') and not needs_attention and not newer_problem)
         is_owner=bool(user['owner'] and user['email'].lower()==config.owner_email.lower())
         admin_eligible=bool(is_owner and request.state.session['admin_until']>time.time())
         return {"id":user["id"],"name":user["name"],"email":user["email"],"owner":is_owner,
@@ -402,8 +414,9 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
         return {'enabled':cards.key is not None,'card':cards.summary(user['id']),'cards':cards.list(user['id'])}
 
     @app.post('/api/payment-card')
-    def card_save(user=Depends(current)):
-        return JSONResponse(status_code=410,content={'detail':'Koppel je kaart via KU Leuven Sport.','manage_url':CARD_MANAGE_URL})
+    def card_save(body:CardRequest,user=Depends(current)):
+        card=cards.save(user['id'],**body.model_dump())
+        return {'ok':True,'card':card,'cards':cards.list(user['id'])}
 
     @app.post('/api/payment-card/{card_id}/primary')
     def primary_card(card_id:str,user=Depends(current)):

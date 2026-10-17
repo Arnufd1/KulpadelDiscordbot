@@ -23,7 +23,7 @@ def tenant_root(store: PlatformStore, user: dict) -> Path:
     return root
 
 
-def tenant_env(store: PlatformStore, user: dict) -> dict[str, str]:
+def tenant_env(store: PlatformStore, user: dict, *, card_vault_key_file: Path | None = None) -> dict[str, str]:
     # The legacy bot has module-level settings. Each tenant runs in a new process;
     # no settings object, cookie jar or card store is switched in a shared process.
     from .config import Settings
@@ -66,6 +66,10 @@ def tenant_env(store: PlatformStore, user: dict) -> dict[str, str]:
     env['PADELWEB_USER_ID']=user['id']
     env['PADELWEB_HUB_DB']=str(base.padelbot_rules_file.resolve())
     env['PADELWEB_TELEMETRY_DB']=str((store.root/'telemetry.sqlite3').resolve())
+    if card_vault_key_file is not None:
+        # Only a key filename enters the isolated process environment. Card
+        # values are loaded from the user's encrypted row at checkout time.
+        env['PADELWEB_CARD_VAULT_KEY_FILE']=str(card_vault_key_file.resolve())
     return env
 
 
@@ -92,8 +96,11 @@ def rule_window(rule,now:datetime):
 
 
 class JobRunner:
-    def __init__(self, store: PlatformStore):
+    def __init__(self, store: PlatformStore, *, card_vault_key_file: Path | None = None):
         self.store = store
+        self.card_vault_key_file=card_vault_key_file
+        if card_vault_key_file is not None:
+            store.card_vault_key_file=card_vault_key_file
         self.process = None
         self.running = {}
         self.community = CommunityBookings(store)
@@ -252,7 +259,7 @@ class JobRunner:
     async def _execute_job(self,row,user,source_user,*,auth_stage=False):
         output=tenant_root(self.store,user)/('job-'+row['id']+'.json')
         output.unlink(missing_ok=True)
-        env=tenant_env(self.store,source_user)
+        env=tenant_env(self.store,source_user,card_vault_key_file=self.card_vault_key_file)
         env['PADELWEB_HUB_DB']=str(self.community.matches.path.resolve())
         env['PADELWEB_RESULT']=str(output)
         env['PADELWEB_JOB_ID']=row['id']

@@ -98,20 +98,10 @@ def _detect_card_brand(card_number: str) -> str | None:
     n = card_number.strip().replace(" ", "")
     if not n.isdigit():
         return None
-    if n.startswith("4"):
-        return "VISA_brand"
-    # Mastercard ranges: 51-55 and 2221-2720
-    if n[:2] in {"51", "52", "53", "54", "55"}:
-        return "Eurocard_brand"
-    if n[:4].isdigit() and 2221 <= int(n[:4]) <= 2720:
-        return "Eurocard_brand"
-    # Bancontact (Belgian)
-    if n.startswith("6703"):
-        return "BCMC_brand"
-    # Maestro: 6759 / 5018 / 5020 / 5038 / 6304 / 6759 / 676...
-    if n[:4] in {"6759", "5018", "5020", "5038", "6304"}:
-        return "Maestro_brand"
-    return None
+    from .web_cards import card_network
+    network,_=card_network(n)
+    return {'visa':'VISA_brand','mastercard':'Eurocard_brand',
+            'bancontact':'BCMC_brand','maestro':'Maestro_brand'}.get(network)
 
 
 def _try_fill(page, selectors: list[str], value: str, *, kind: str) -> bool:
@@ -246,6 +236,7 @@ def pay_via_worldline(
     timeout_s: int = 120,
     headless: bool = True,
     diagnostics_dir: Path | None = None,
+    allow_missing_cvv: bool = False,
 ) -> WorldlineResult:
     """Drive the Worldline hosted-checkout page with the saved card.
 
@@ -253,6 +244,11 @@ def pay_via_worldline(
     callback URL, NOT that the backend has confirmed payment. The caller must
     check the sale and payment state. Failure diagnostics contain field metadata.
     """
+    from .card_store import validate_card
+    try:
+        validate_card(card,allow_missing_cvv=allow_missing_cvv)
+    except ValueError:
+        return WorldlineResult(success=False,error='De betaalkaart is ongeldig of vervallen.')
     try:
         from playwright.sync_api import sync_playwright, Error as PWError, TimeoutError as PWTimeout
     except ImportError as e:
@@ -266,8 +262,12 @@ def pay_via_worldline(
     submit_attempted = False
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        ctx = browser.new_context()
+        browser = p.chromium.launch(headless=headless,args=[
+            '--disable-save-password-bubble',
+            '--disable-features=AutofillServerCommunication,AutofillEnableAccountWalletStorage'])
+        # Incognito, memory-only state: no profile, traces, HAR, video, saved
+        # card autofill data or downloads containing payment details.
+        ctx = browser.new_context(accept_downloads=False,service_workers='block')
         page = ctx.new_page()
         try:
             logger.info("[worldline] navigating to payment URL...")
@@ -343,10 +343,15 @@ def pay_via_worldline(
             if not exp_ok:
                 return WorldlineResult(success=False, error="Expiry fields could not be filled", final_url=page.url)
 
-            cvv_ok = _try_fill(page, CVC_SELECTORS, card.cvv, kind="cvv")
-            if not cvv_ok:
-                _save_diag(page, diagnostics_dir, "no-cvv")
-                return WorldlineResult(success=False, error="CVV input not found", final_url=page.url)
+            if card.cvv:
+                cvv_ok = _try_fill(page, CVC_SELECTORS, card.cvv, kind="cvv")
+                if not cvv_ok:
+                    _save_diag(page, diagnostics_dir, "no-cvv")
+                    return WorldlineResult(success=False, error="CVV input not found", final_url=page.url)
+            elif any(page.locator(f'{selector}:visible').count() for selector in CVC_SELECTORS):
+                # A saved PAN never includes CVC. Do not guess, synthesize a
+                # value or submit a form requesting it; use the private link.
+                return WorldlineResult(success=False,error='Bevestig de CVC via je betaallink.',final_url=page.url)
 
             # Submit
             submit_attempted = True
@@ -378,6 +383,9 @@ def pay_via_worldline(
                 if not needed_3ds and _has_3ds_iframe(page):
                     needed_3ds = True
                     logger.info("[worldline] bank verification frame observed")
+                    if allow_missing_cvv:
+                        return WorldlineResult(success=False,error='Bevestig de betaling bij je bank via je betaallink.',
+                            needed_3ds=True,final_url=page.url,submitted=submit_attempted)
                     if on_3ds_challenge:
                         try:
                             on_3ds_challenge()

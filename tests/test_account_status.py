@@ -73,32 +73,45 @@ def test_failure_latch_prevents_automatic_reauthentication(portal):
     with store.conn() as c:assert c.execute('SELECT count(*) FROM jobs').fetchone()[0]==0
 
 
-def test_autobook_requires_fresh_kul_card_and_background_eligibility_does_not_expire(portal):
+def test_autobook_requires_own_local_card_and_does_not_expire_with_kul_balance_cache(portal):
     app,client,store,(_,alice,bob)=portal;s=app.state.platform
+    from padelbot.web_cards import CardVault
+    key=store.root/'test-vault.key';key.write_bytes(b'a'*32)
+    store.card_vault_key_file=key
+    s.cards=CardVault(store,key)
     headers=sign_in(client,store,alice)
     prefs={'automatic_payment':True,'payment_mode':'kul','max_amount':20}
     s.remember_payment(alice['id'],{'balance':100,'direct_debit':False,'stored_card':False})
     assert client.post('/api/preferences',json=prefs,headers=headers).status_code==400
     s.remember_payment(bob['id'],{'balance':100,'direct_debit':False,'stored_card':True})
+    s.cards.save(bob['id'],holder='Bob',number='5555555555554444',month=12,year=2035)
     assert client.post('/api/preferences',json=prefs,headers=headers).status_code==400
     s.remember_payment(alice['id'],{'balance':100,'direct_debit':False,'stored_card':True})
+    own=s.cards.save(alice['id'],holder='Alice',number='4242424242424242',month=12,year=2035)
     assert client.post('/api/preferences',json={**prefs,'payment_mode':'discord'},headers=headers).status_code==400
     assert client.post('/api/preferences',json=prefs,headers=headers).status_code==200
     failed=store.enqueue(alice['id'],'account',{})
     finish(store,failed,'failed',{'error':'KUL unavailable'})
-    assert client.post('/api/preferences',json=prefs,headers=headers).status_code==400
+    assert client.post('/api/preferences',json=prefs,headers=headers).status_code==200
     assert store.preferences(alice['id'])==prefs
     with store.conn() as c:c.execute('UPDATE payment_accounts SET checked=? WHERE user_id=?',(time.time()-86400,alice['id']))
-    assert s.can_autobook(alice['id'])  # Actual token is rechecked by the worker, not browser presence.
-    assert client.post('/api/preferences',json=prefs,headers=headers).status_code==400
+    assert s.can_autobook(alice['id'])  # The worker rechecks the current local primary at checkout.
+    assert client.post('/api/preferences',json=prefs,headers=headers).status_code==200
     s.remember_payment(alice['id'],{'balance':100,'direct_debit':False,'stored_card':False})
+    assert s.can_autobook(alice['id'])  # A KUL token snapshot cannot revoke an independent local card.
+    s.cards.delete(alice['id'],own['id'])
     assert not s.can_autobook(alice['id'])
     with pytest.raises(ValueError,match='kaart'):s.enqueue(alice,'rule',{'rule_id':1,'target':'2030-01-01T18:00:00Z'})
 
 
 @pytest.mark.parametrize('remove_during_lookup',[False,True])
-def test_rule_rechecks_kul_card_before_cart_even_when_balance_covers_price(portal,monkeypatch,remove_during_lookup):
+def test_rule_rechecks_local_card_before_cart_even_when_balance_covers_price(portal,monkeypatch,remove_during_lookup):
     app,_,store,(_,alice,_)=portal;s=app.state.platform
+    from padelbot.web_cards import CardVault
+    key=store.root/'test-vault.key';key.write_bytes(b'r'*32)
+    store.card_vault_key_file=key
+    s.cards=CardVault(store,key)
+    if remove_during_lookup:s.cards.save(alice['id'],holder='Alice',number='4242424242424242',month=12,year=2035)
     from padelbot import web_worker,client,booking,booking_manager,checkout,scheduler
     from padelbot.config import settings
     from padelbot.rules_store import RulesStore
@@ -117,17 +130,19 @@ def test_rule_rechecks_kul_card_before_cart_even_when_balance_covers_price(porta
         def me(self):return {'id':42,'balance':100}
         def get(self,path,params):
             reads.append(path)
-            card={'id':10,'personId':42,'type':3,'paymentProviderType':8,'preferred':True,'expirationDate':'2035-12-01'}
-            return {'data':[card] if remove_during_lookup and len(reads)==1 else []}
+            pytest.fail('No KUL stored-payment lookup')
     monkeypatch.setattr(client,'BackboneClient',Client)
-    monkeypatch.setattr(booking,'find_slots',lambda *a,**kw:[slot])
+    def slots(*args,**kwargs):
+        if remove_during_lookup:s.cards.delete(alice['id'])
+        return [slot]
+    monkeypatch.setattr(booking,'find_slots',slots)
     monkeypatch.setattr(scheduler,'find_rule_slot',lambda *a,**kw:slot)
     monkeypatch.setattr(checkout,'slot_price',lambda *a:Decimal(12))
     monkeypatch.setattr(booking_manager,'list_my_bookings',lambda *a,**kw:[])
-    monkeypatch.setattr(booking,'book',lambda *a,**kw:pytest.fail('No reservation without a current KUL card'))
+    monkeypatch.setattr(booking,'book',lambda *a,**kw:pytest.fail('No reservation without a current local card'))
     with pytest.raises(ValueError,match='kaart'):
         web_worker.execute('rule',{'rule_id':rule.id,'target':target.isoformat()})
-    assert len(reads)==(2 if remove_during_lookup else 1)
+    assert not reads
     assert s.payment_status(alice['id'])['stored_card']==0 and not s.can_autobook(alice['id'])
 
 

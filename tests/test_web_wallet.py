@@ -62,7 +62,8 @@ def test_legacy_revolut_import_is_one_time_and_excludes_cvc(portal,tmp_path,monk
     aad=app.state.cards._aad
     data_key=AESGCM(key).decrypt(row['wrap_nonce'],row['wrapped_key'],aad(owner['id'],row['id'],'key'))
     payload=json.loads(AESGCM(data_key).decrypt(row['nonce'],row['ciphertext'],aad(owner['id'],row['id'],'data')))
-    assert set(payload)=={'holder','number','month','year','label'}
+    assert set(payload)=={'holder','number','month','year','label','funding'}
+    assert payload['funding']=='unknown'
     assert '987' not in json.dumps(payload)
 
 
@@ -73,3 +74,43 @@ def test_card_limit_and_label_never_echo_pan(portal):
     for _ in range(5):vault.save(alice['id'],**CARD)
     with pytest.raises(ValueError):vault.save(alice['id'],**CARD,primary=True)
     assert len(vault.list(alice['id']))==5 and sum(c['primary'] for c in vault.list(alice['id']))==1
+
+
+def test_card_management_api_saves_masks_switches_and_deletes(portal):
+    app,client,store,(_,alice,bob)=portal
+    app.state.cards.key=AESGCM.generate_key(bit_length=256)
+    headers=sign_in(client,store,alice)
+    saved=client.post('/api/payment-card',json={**CARD,'label':'Personal','funding':'debit'},headers=headers)
+    assert saved.status_code==200
+    first=saved.json()['card']
+    assert first['primary'] and first['network']=='visa' and first['funding']=='debit' and not first['expired']
+    assert first['last4']=='1111' and 'number' not in first and 'holder' not in first
+    assert CARD['number'] not in saved.text and CARD['holder'] not in saved.text
+    second=client.post('/api/payment-card',json={**CARD,'label':'Reserve','primary':True},headers=headers).json()['card']
+    assert second['primary'] and second['funding']=='unknown'
+    assert client.get('/api/payment-card').json()['card']['id']==second['id']
+    assert client.post('/api/payment-card/'+first['id']+'/primary',json={},headers=headers).status_code==200
+    assert client.get('/api/payment-card').json()['card']['id']==first['id']
+    sign_in(client,store,bob)
+    assert client.get('/api/payment-card').json()['cards']==[]
+    assert app.state.cards.load_primary(bob['id']) is None
+    headers=sign_in(client,store,alice)
+    assert client.delete('/api/payment-card/'+first['id'],headers=headers).status_code==200
+    assert client.get('/api/payment-card').json()['card']['id']==second['id']
+
+
+def test_vault_internal_checkout_survives_restart_without_cvc(portal,tmp_path):
+    app,_,store,(_,alice,bob)=portal
+    keyfile=tmp_path/'vault.key';keyfile.write_bytes(AESGCM.generate_key(bit_length=256))
+    vault=CardVault(store,keyfile)
+    first=vault.save(alice['id'],**CARD)
+    restarted=CardVault(store,keyfile)
+    assert restarted.summary(alice['id'])==first
+    card=restarted.load_primary(alice['id'])
+    assert card.holder==CARD['holder'] and card.number==CARD['number']
+    assert card.exp_month==12 and card.exp_year==2035 and card.cvv==''
+    assert restarted.load_primary(bob['id']) is None
+    restarted.delete(bob['id'],first['id'])
+    assert restarted.load_primary(alice['id']).number==CARD['number']
+    restarted.delete(alice['id'],first['id'])
+    assert restarted.load_primary(alice['id']) is None

@@ -253,7 +253,7 @@ class DaySlotsView(AvailabilityView):
             mode = self.service.store.preferences(self.user['id']).get('payment_mode', 'kul')
             content = f"**{label(slot)} · €{quote['amount']}**\n" + (
                 'Betaallink hier, op je dashboard en in Discord. Voldoende KUL-saldo gebruiken we eerst.'
-                if mode == 'discord' else 'Betalen via je KUL-kaart. Voldoende KUL-saldo gebruiken we eerst.')
+                if mode == 'discord' else 'Betalen met je standaardkaart. Voldoende KUL-saldo gebruiken we eerst.')
             await interaction.edit_original_response(content=content, embed=None, view=view)
             self.stop()
         except Exception as error:

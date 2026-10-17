@@ -29,31 +29,36 @@ def payment_mode(preferences):
     return mode
 
 
-def validate_payment(me,amount,mode):
+def usable_local_card(card):
+    return bool(card and not card.get('expired',False)
+                and card.get('network') in {'visa','mastercard','bancontact','maestro'})
+
+
+def validate_payment(me,amount,mode,*,local_card=None):
     if mode=='discord':return
     if mode!='kul':raise ValueError('Kies een betaalwijze.')
     try:
         balance=Decimal(str(me.get('balance') or 0))
         if balance.is_finite() and balance>=amount:return
     except (ValueError,TypeError,InvalidOperation):pass
-    if me.get('_stored_method',{}).get('type')==3:return
-    raise ValueError('Koppel een KUL-betaalmethode of kies een betaallink.')
+    if usable_local_card(local_card):return
+    raise ValueError('Voeg een betaalkaart toe of kies een betaallink.')
 
 
-CARD_MANAGE_URL='https://usc.kuleuven.cloud/members/profile/myshopping#storedpaymethodcard'
-AUTOBOOK_CARD_REQUIRED='Koppel eerst een kaart bij KUL voor autobooking.'
+CARD_MANAGE_URL='/#settings'
+AUTOBOOK_CARD_REQUIRED='Voeg eerst een betaalkaart toe voor autobooking.'
 
 
-def validate_autobook_payment(me,mode):
-    """Autobooking always needs a KUL token, even when this sale uses balance."""
-    if mode!='kul' or me.get('_stored_method',{}).get('type')!=3:
+def validate_autobook_payment(me,mode,*,local_card=None):
+    """Autobooking needs an unexpired local card even when balance covers a sale."""
+    if mode!='kul' or not usable_local_card(local_card):
         raise ValueError(AUTOBOOK_CARD_REQUIRED)
 
 
 def public_job_error(error):
     """Activity is a human summary, never a second copy of provider diagnostics."""
     value=str(error or '').lower()
-    if 'kaart' in value or 'betaalmethode' in value:return 'Controleer je gekoppelde kaart bij KUL.'
+    if 'kaart' in value or 'betaalmethode' in value:return 'Controleer je betaalkaart bij Instellingen.'
     if 'prijs' in value or 'maximum' in value:return 'De prijs past niet binnen je ingestelde maximum.'
     if 'niet meer vrij' in value or 'niet meer beschikbaar' in value:return 'Dit tijdstip is niet meer vrij.'
     if 'al een boeking' in value:return 'Je hebt al een boeking op dit tijdstip.'
@@ -66,8 +71,9 @@ def public_job_error(error):
 
 
 class PlatformService:
-    def __init__(self,store:PlatformStore,community=None):
+    def __init__(self,store:PlatformStore,community=None,*,cards=None):
         self.store=store
+        self.cards=cards
         self.community=community or CommunityBookings(store)
         self.hub=self.community.hub
         with store.conn() as c:
@@ -232,10 +238,32 @@ class PlatformService:
         cancelled={json.loads(row['payload'])['booking_id'] for row in rows if row['result'] and json.loads(row['result']).get('cancelled') is True}
         return [b for b in bookings if b.get('id') not in cancelled]
 
+    def card_vault(self):
+        if self.cards is None:
+            from .web import WebSettings
+            from .web_cards import CardVault
+            config=WebSettings()
+            # A standalone/custom store must never inherit the production key.
+            key=getattr(self.store,'card_vault_key_file',None)
+            if key is None and self.store.root.resolve()==config.root.resolve():key=config.card_vault_key_file
+            self.cards=CardVault(self.store,key)
+        return self.cards
+
+    def local_card(self,user_id):
+        try:return self.card_vault().summary(user_id)
+        except (ValueError,OSError):return None
+
+    def attach_local_card(self,user_id,payment):
+        card=self.local_card(user_id)
+        return {**(payment or {}),'local_card':card,
+                'stored_card':usable_local_card(card),
+                'stored_method':False,'manage_url':CARD_MANAGE_URL}
+
     def payment_status(self,user_id):
         with self.store.conn() as c:
             row=c.execute('SELECT balance,direct_debit,checked,stored_method,stored_card FROM payment_accounts WHERE user_id=?',(user_id,)).fetchone()
-        return dict(row) if row else None
+        result=self.attach_local_card(user_id,dict(row) if row else {'balance':None,'checked':None,'direct_debit':False})
+        return result if row or result['local_card'] else None
 
     def account_status(self,user_id):
         with self.store.conn() as c:
@@ -264,14 +292,9 @@ class PlatformService:
             return self.account_status(user['id'])
 
     def require_autobook_card(self,user_id,*,fresh=True):
-        payment=self.payment_status(user_id)
-        if (not payment or not payment.get('stored_card') or
-            (fresh and payment['checked']<time.time()-300)):
+        card=self.local_card(user_id)
+        if not usable_local_card(card):
             raise ValueError(AUTOBOOK_CARD_REQUIRED)
-        if fresh:
-            check=self.account_status(user_id)['check']
-            if check and check['status']!='done' and check['checked']>payment['checked']:
-                raise ValueError('Wacht tot je kaart bij KUL is gecontroleerd.')
 
     def save_preferences(self,user,values):
         if values.get('automatic_payment'):
@@ -330,6 +353,7 @@ class PlatformService:
                 continue
             message=('Je hebt geboekt.' if row['kind'] in {'book','rule'} and result.get('paid') is True else
                      'Reservatie geannuleerd.' if row['kind']=='cancel_booking' and result.get('cancelled') is True else
+                     'Betaling nog niet bevestigd. Controleer je boeking bij KUL.' if result.get('payment_pending') else
                      'Wachten op betaling.' if result.get('payment_available') else
                      'Nog geen terrein vrij.' if result.get('waiting') else None)
             groups[key]={'id':row['id'],'kind':row['kind'],'status':row['status'],

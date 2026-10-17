@@ -61,10 +61,12 @@ def test_oauth_state_is_session_user_bound_expires_and_consumes_once(portal):
     assert not s.oauth_consume(state,'session-a',alice['id'])
 
 
-def test_unlinked_card_never_substitutes_for_kul_authorisation():
+def test_local_card_or_covering_balance_is_required_for_automatic_payment():
     validate_payment({'balance':12},Decimal('12'),'kul')
     validate_payment({'balance':0},Decimal('12'),'discord')
-    with pytest.raises(ValueError,match='KUL-betaalmethode'):validate_payment({'balance':0},Decimal('12'),'kul')
+    with pytest.raises(ValueError,match='betaalkaart'):validate_payment({'balance':0},Decimal('12'),'kul')
+    validate_payment({'balance':0},Decimal('12'),'kul',local_card={'network':'mastercard','expired':False})
+    with pytest.raises(ValueError):validate_payment({'balance':0},Decimal('12'),'kul',local_card={'network':'visa','expired':True})
 
 
 def test_private_delivery_is_encrypted_tenant_bound_and_never_repeated(portal):
@@ -210,9 +212,15 @@ def test_preflight_and_checkout_edit_the_same_private_message(portal):
 
 @pytest.mark.parametrize('mode',['discord','kul'])
 @pytest.mark.parametrize('can_dm',[False,True])
-def test_shared_worker_keeps_private_website_checkout_when_discord_unavailable(portal,monkeypatch,can_dm,mode):
+@pytest.mark.parametrize('payment_pending',[False,True])
+def test_shared_worker_keeps_private_website_checkout_when_discord_unavailable(portal,monkeypatch,can_dm,mode,payment_pending):
     app,_,store,(_,alice,_)=portal;s=app.state.platform
     s.hub.register(alice)
+    from padelbot.web_cards import CardVault
+    key=store.root/'test-vault.key';key.write_bytes(b'k'*32)
+    store.card_vault_key_file=key
+    s.cards=CardVault(store,key)
+    s.cards.save(alice['id'],holder='Alice',number='4242424242424242',month=12,year=2035)
     if can_dm:s.hub.link(alice['id'],12345)
     store.preferences(alice['id'],{'automatic_payment':False,'payment_mode':mode,'max_amount':0})
     from padelbot import web_worker,client,booking,booking_manager,checkout
@@ -224,7 +232,7 @@ def test_shared_worker_keeps_private_website_checkout_when_discord_unavailable(p
         def __enter__(self):return self
         def __exit__(self,*args):pass
         def me(self):return {'id':42,'balance':0}
-        def get(self,path,params):return {'data':[{'id':10,'personId':42,'type':3,'paymentProviderType':8,'preferred':True,'expirationDate':'2035-12-01'}]}
+        def get(self,path,params):pytest.fail('No KUL stored-method lookup')
     monkeypatch.setattr(client,'BackboneClient',Client)
     slot=booking.Slot(100,200,'2030-01-01T18:00:00Z','2030-01-01T19:30:00Z',12,{})
     monkeypatch.setattr(booking,'find_slots',lambda *a,**kw:[slot]);monkeypatch.setattr(checkout,'slot_price',lambda *a:Decimal(12))
@@ -234,14 +242,23 @@ def test_shared_worker_keeps_private_website_checkout_when_discord_unavailable(p
     monkeypatch.setattr(PlatformService,'prepare_delivery',prepare)
     writes=[]
     def reserve(*a,**kw):
-        writes.append(kw);return SimpleNamespace(paid=False,sale_id=12,booking_id=55,payment_url='https://payment.direct.worldline-solutions.com/example')
+        writes.append(kw)
+        if mode=='kul':
+            card=kw['payment_card_loader']()
+            assert card.holder=='Alice' and card.number=='4242424242424242' and card.cvv==''
+        else:assert kw['payment_card_loader'] is None
+        return SimpleNamespace(paid=False,sale_id=12,booking_id=55,payment_url='https://payment.direct.worldline-solutions.com/example',payment_pending=payment_pending)
     monkeypatch.setattr(booking,'book',reserve)
     payload={'product':100,'court':200,'target':slot.start_iso,'amount':12}
     result=web_worker.execute('book',payload)
     assert len(writes)==1 and writes[0]['payment_mode']==mode
-    assert result['payment_via_discord']==can_dm and result['payment_available'] and not result['paid']
+    assert result['payment_via_discord']==(can_dm and not payment_pending)
+    assert result['payment_available'] is not payment_pending and result['payment_pending'] is payment_pending and not result['paid']
     assert 'worldline' not in json.dumps(result)
-    assert s.private_payments(alice['id'])[0]['url']=='https://payment.direct.worldline-solutions.com/example'
+    if payment_pending:
+        assert not s.private_payments(alice['id'])
+        assert 'voordat je opnieuw betaalt' in result['message']
+    else:assert s.private_payments(alice['id'])[0]['url']=='https://payment.direct.worldline-solutions.com/example'
 
 
 def test_tokenized_kul_methods_are_owner_bound_current_and_explicitly_preferred():
@@ -254,7 +271,7 @@ def test_tokenized_kul_methods_are_owner_bound_current_and_explicitly_preferred(
                 {**good,'id':12,'paymentProviderType':999},{**good,'id':13,'expirationDate':'invalid'}]}
     me=attach_stored_method(Client(),{'id':42,'balance':0})
     assert me['_stored_method']=={'id':10,'type':3,'paymentProviderType':8,'preferred':True}
-    validate_payment(me,Decimal(12),'kul')
+    with pytest.raises(ValueError):validate_payment(me,Decimal(12),'kul')
     assert 'personId' not in me['_stored_method']
 
 
@@ -268,7 +285,8 @@ def test_stored_method_payment_rechecks_ownership_before_posting():
     assert not writes
 
 
-def test_kul_stored_card_requires_backend_confirmation_and_never_loads_vault(monkeypatch,tmp_path):
+@pytest.mark.parametrize('confirmed',[False,True])
+def test_local_card_requires_backend_confirmation_and_never_uses_kul_token(monkeypatch,tmp_path,confirmed):
     from padelbot import booking,payment,worldline_driver
     from padelbot.config import settings
     monkeypatch.setattr(settings,'padelbot_rules_file',tmp_path/'rules.sqlite3')
@@ -276,13 +294,21 @@ def test_kul_stored_card_requires_backend_confirmation_and_never_loads_vault(mon
     monkeypatch.setattr(booking,'create_sale',lambda *a,**kw:{'id':12,'total':12})
     monkeypatch.setattr(booking,'fetch_booking_id',lambda *a:55)
     calls=[]
-    def pay(*a,**kw):calls.append(kw);return {'userInitiatedPaymentResult':{'bSuccess':True,'bPaidOnStoredPayMethod':True}}
+    def pay(*a,**kw):calls.append(kw);return {'userInitiatedPaymentResult':{'bSuccess':True,'hostedPaymentPageUrl':'https://payment.direct.worldline-solutions.com/example'}}
     monkeypatch.setattr(payment,'create_payment',pay)
-    monkeypatch.setattr(payment,'wait_for_payment_confirmation',lambda *a,**kw:True)
-    monkeypatch.setattr(worldline_driver,'load_card',lambda:pytest.fail('Use KUL token, never the vault'))
+    monkeypatch.setattr(payment,'wait_for_payment_confirmation',lambda *a,**kw:confirmed)
+    monkeypatch.setattr(worldline_driver,'load_card',lambda:pytest.fail('No legacy card store'))
+    from padelbot.card_store import Card
+    card=Card('Alice','4242424242424242',12,2035,'')
+    driver=[]
+    def checkout(**kwargs):driver.append(kwargs);return worldline_driver.WorldlineResult(success=True,submitted=True)
+    monkeypatch.setattr(worldline_driver,'pay_via_worldline',checkout)
     slot=booking.Slot(100,200,'2030-01-01T18:00:00Z','2030-01-01T19:30:00Z',12,{})
-    result=booking.book(object(),slot,member_id=42,me={'id':42,'balance':0,'_stored_method':{'id':10,'type':3}},expected_amount=Decimal(12),payment_mode='kul')
-    assert result.paid and not result.payment_url and calls[0]['stored_method_id']==10
+    result=booking.book(object(),slot,member_id=42,me={'id':42,'balance':0,'_stored_method':{'id':10,'type':3}},expected_amount=Decimal(12),payment_mode='kul',payment_card=card)
+    assert result.paid is confirmed and result.payment_pending is not confirmed
+    assert ('stored_method_id' not in calls[0] or calls[0]['stored_method_id'] is None)
+    assert driver[0]['card'] is card and driver[0]['allow_missing_cvv'] is True
+    assert not result.payment_url
 
 
 def test_private_website_checkout_survives_discord_delivery_and_is_tenant_bound(portal):

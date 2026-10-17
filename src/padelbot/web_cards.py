@@ -16,6 +16,38 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from .web_store import PlatformStore
 
 
+def card_network(number: str) -> tuple[str, str]:
+    """Recognize common network prefixes locally; a PAN does not reveal funding."""
+    if number.startswith('6703'):
+        return 'bancontact', 'Bancontact'
+    if number.startswith('4'):
+        return 'visa', 'Visa'
+    if number[:2] in {'34', '37'}:
+        return 'amex', 'American Express'
+    if 51 <= int(number[:2]) <= 55 or 2221 <= int(number[:4]) <= 2720:
+        return 'mastercard', 'Mastercard'
+    if number.startswith(('5018', '5020', '5038', '5893', '6304', '6759', '6761', '6762', '6763')):
+        return 'maestro', 'Maestro'
+    return 'card', 'Betaalkaart'
+
+
+def _number(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError('Vul een geldig kaartnummer in.')
+    value = re.sub(r'[ -]', '', value)
+    if not re.fullmatch(r'[0-9]{12,19}', value) or not int(value):
+        raise ValueError('Vul een geldig kaartnummer in.')
+    digits = [int(d) for d in reversed(value)]
+    if sum(d if i % 2 == 0 else (2*d-9 if d > 4 else 2*d) for i, d in enumerate(digits)) % 10:
+        raise ValueError('Controleer het kaartnummer.')
+    return value
+
+
+def _expired(month: int, year: int) -> bool:
+    now = datetime.now(ZoneInfo('Europe/Brussels'))
+    return (year, month) < (now.year, now.month)
+
+
 class CardVault:
     def __init__(self, store: PlatformStore, key_file: Path | None):
         self.store = store
@@ -46,30 +78,30 @@ class CardVault:
     def _aad(user_id, card_id, purpose):
         return f'sigmadvisor-card-v1:{purpose}:{user_id}:{card_id}'.encode()
 
-    def save(self, user_id: str, *, holder: str, number: str, month: int, year: int, label: str='',primary: bool=False,_migration=None):
+    def save(self, user_id: str, *, holder: str, number: str, month: int, year: int, label: str='',primary: bool=False,funding: str='unknown',_migration=None):
         self._ready()
-        number = re.sub(r'[ -]', '', number)
-        if not re.fullmatch(r'[0-9]{13,19}', number):
-            raise ValueError('Vul een geldig kaartnummer in.')
-        digits = [int(d) for d in reversed(number)]
-        if sum(d if i % 2 == 0 else (2*d-9 if d>4 else 2*d) for i,d in enumerate(digits)) % 10:
-            raise ValueError('Controleer het kaartnummer.')
+        number = _number(number)
+        if not isinstance(holder, str):
+            raise ValueError('Vul de naam van de kaarthouder in.')
         holder = ' '.join(holder.split())
-        if not 1 <= len(holder) <= 80 or any(ord(ch)<32 for ch in holder):
+        if not 1 <= len(holder) <= 80 or any(ord(ch)<32 for ch in holder) or len(re.findall(r'[0-9]',holder))>=12:
             raise ValueError('Vul de naam van de kaarthouder in.')
         today = datetime.now(ZoneInfo('Europe/Brussels'))
-        if not 1<=month<=12 or not today.year<=year<=today.year+20 or (year,month)<(today.year,today.month):
+        if (type(month) is not int or type(year) is not int or not 1<=month<=12
+                or not today.year<=year<=today.year+20 or _expired(month, year)):
             raise ValueError('Vul een geldige, toekomstige vervaldatum in.')
+        if funding not in {'credit', 'debit', 'unknown'}:
+            raise ValueError('Kies een geldig kaarttype.')
         card_id = uuid.uuid4().hex
         data_key = AESGCM.generate_key(bit_length=256)
         nonce, wrap_nonce = secrets.token_bytes(12), secrets.token_bytes(12)
         # Labels are returned in plain text by the masked-card endpoint. Check the
         # whole input before truncation, including punctuation and zero-width
         # separators, so a formatted PAN cannot leak through the display name.
-        if len(re.findall(r'[0-9]',label))>=13:
+        if not isinstance(label, str) or len(re.findall(r'[0-9]',label))>=12:
             raise ValueError('Gebruik een kaartnaam, geen kaartnummer.')
         label=' '.join(label.split())[:40]
-        payload = json.dumps({'holder':holder,'number':number,'month':month,'year':year,'label':label}).encode()
+        payload = json.dumps({'holder':holder,'number':number,'month':month,'year':year,'label':label,'funding':funding}).encode()
         ciphertext = AESGCM(data_key).encrypt(nonce,payload,self._aad(user_id,card_id,'data'))
         wrapped = AESGCM(self.key).encrypt(wrap_nonce,data_key,self._aad(user_id,card_id,'key'))
         with self.store.conn() as c:
@@ -94,22 +126,50 @@ class CardVault:
             rows=c.execute('SELECT * FROM payment_cards WHERE user_id=? ORDER BY is_primary DESC,updated,id',(user_id,)).fetchall()
         return [self._summary(user_id,row) for row in rows]
 
-    def _summary(self,user_id,row):
+    def _decrypt(self,user_id,row):
         self._ready()
         try:
+            if row['user_id'] != user_id:
+                raise ValueError()
             key = AESGCM(self.key).decrypt(row['wrap_nonce'],row['wrapped_key'],self._aad(user_id,row['id'],'key'))
             data = json.loads(AESGCM(key).decrypt(row['nonce'],row['ciphertext'],self._aad(user_id,row['id'],'data')))
-        except (InvalidTag,ValueError,KeyError,TypeError):
+            if not isinstance(data, dict) or set(data) - {'holder','number','month','year','label','funding'}:
+                raise ValueError()
+            data['number'] = _number(data['number'])
+            if (not isinstance(data['holder'], str) or not 1 <= len(data['holder'].strip()) <= 80
+                    or any(ord(ch)<32 for ch in data['holder'])
+                    or type(data['month']) is not int or not 1 <= data['month'] <= 12
+                    or type(data['year']) is not int or not 2000 <= data['year'] <= 9999
+                    or data.get('funding','unknown') not in {'credit','debit','unknown'}):
+                raise ValueError()
+        except (InvalidTag,ValueError,KeyError,TypeError,OverflowError):
             raise ValueError('De bewaarde kaart kon niet veilig worden gelezen. Neem contact op met de beheerder.') from None
+        return data
+
+    def _summary(self,user_id,row):
+        data = self._decrypt(user_id,row)
         number = data['number']
-        brand = 'Visa' if number.startswith('4') else 'American Express' if number[:2] in {'34','37'} else 'Mastercard' if 51<=int(number[:2])<=55 or 2221<=int(number[:4])<=2720 else 'Betaalkaart'
+        network, brand = card_network(number)
         label=data.get('label')
         # Old encrypted records predate the input guard. Never let those labels
         # bypass the masked-only response contract either.
-        if not isinstance(label,str) or len(re.findall(r'[0-9]',label))>=13:
+        if not isinstance(label,str) or len(re.findall(r'[0-9]',label))>=12:
             label=''
-        return {'id':row['id'],'brand':brand,'label':label or brand,'last4':number[-4:],
-                'month':data['month'],'year':data['year'],'primary':bool(row['is_primary'])}
+        return {'id':row['id'],'brand':brand,'network':network,'label':label or brand,'last4':number[-4:],
+                'month':data['month'],'year':data['year'],'primary':bool(row['is_primary']),
+                'funding':data.get('funding','unknown'),'expired':_expired(data['month'],data['year'])}
+
+    def load_primary(self,user_id: str):
+        """Internal checkout access; never expose this result through the web API."""
+        from .card_store import Card
+        with self.store.conn() as c:
+            row=c.execute('SELECT * FROM payment_cards WHERE user_id=? AND is_primary=1',(user_id,)).fetchone()
+        if row is None:
+            return None
+        data=self._decrypt(user_id,row)
+        if _expired(data['month'],data['year']):
+            raise ValueError('Deze kaart is vervallen. Voeg een geldige kaart toe.')
+        return Card(holder=data['holder'],number=data['number'],exp_month=data['month'],exp_year=data['year'],cvv='')
 
     def delete(self, user_id: str,card_id=None):
         with self.store.conn() as c:
