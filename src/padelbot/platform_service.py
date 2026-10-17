@@ -11,7 +11,7 @@ from urllib.parse import urlencode
 from cryptography.fernet import Fernet
 from filelock import FileLock
 
-from .web_store import PlatformStore,digest
+from .web_store import PlatformStore,digest,google_return_path
 from .web_community import CommunityBookings
 
 
@@ -79,7 +79,8 @@ class PlatformService:
         with store.conn() as c:
             c.executescript('''
                 CREATE TABLE IF NOT EXISTS discord_oauth (
-                    state TEXT PRIMARY KEY,session TEXT NOT NULL,user_id TEXT NOT NULL,expires REAL NOT NULL);
+                    state TEXT PRIMARY KEY,session TEXT NOT NULL,user_id TEXT NOT NULL,expires REAL NOT NULL,
+                    return_to TEXT NOT NULL DEFAULT '/#dashboard');
                 CREATE TABLE IF NOT EXISTS discord_deliveries (
                     id TEXT PRIMARY KEY,user_id TEXT NOT NULL,discord_id INTEGER NOT NULL,
                     payload TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'queued',created REAL NOT NULL,
@@ -96,6 +97,8 @@ class PlatformService:
                     confirmed INTEGER NOT NULL,verified REAL NOT NULL,reminder_queued REAL,
                     PRIMARY KEY(user_id,booking_id));
             ''')
+            if 'return_to' not in {r[1] for r in c.execute('PRAGMA table_info(discord_oauth)')}:
+                c.execute("ALTER TABLE discord_oauth ADD COLUMN return_to TEXT NOT NULL DEFAULT '/#dashboard'")
             columns={r[1] for r in c.execute('PRAGMA table_info(discord_deliveries)')}
             for field in ['channel_id','message_id']:
                 if field not in columns:c.execute(f'ALTER TABLE discord_deliveries ADD COLUMN {field} INTEGER')
@@ -166,20 +169,23 @@ class PlatformService:
                         and datetime.fromisoformat(previous['target'].replace('Z','+00:00')).timestamp()==target):return row['id']
         return self.store.enqueue(user['id'],kind,payload,dedup=dedup)
 
-    def oauth_start(self,user_id,session):
+    def oauth_start(self,user_id,session,return_to='/#dashboard'):
         state=secrets.token_urlsafe(32)
+        destination=google_return_path(return_to)
+        if destination=='/':destination='/#dashboard'
         with self.store.conn() as c:
             c.execute('DELETE FROM discord_oauth WHERE expires<?',(time.time(),))
-            c.execute('INSERT INTO discord_oauth VALUES(?,?,?,?)',(digest(state),digest(session),user_id,time.time()+600))
+            c.execute('INSERT INTO discord_oauth(state,session,user_id,expires,return_to) VALUES(?,?,?,?,?)',
+                (digest(state),digest(session),user_id,time.time()+600,destination))
         return state
 
     def oauth_consume(self,state,session,user_id):
         with self.store.conn() as c:
             c.execute('BEGIN IMMEDIATE')
-            row=c.execute('SELECT state FROM discord_oauth WHERE state=? AND session=? AND user_id=? AND expires>?',
+            row=c.execute('SELECT * FROM discord_oauth WHERE state=? AND session=? AND user_id=? AND expires>?',
                 (digest(state),digest(session),user_id,time.time())).fetchone()
             if row:c.execute('DELETE FROM discord_oauth WHERE state=?',(digest(state),))
-        return bool(row)
+        return dict(row) if row else None
 
     def remember_payment(self,user_id,summary,*,checked=None):
         checked=time.time() if checked is None else float(checked)

@@ -8,6 +8,7 @@ from .config import settings
 from .booking import Slot
 from .discord_ui import AvailabilityOverview, WEEKDAYS, local_time, share_availability, today
 from . import weather
+from .discord_sharing import SharePolicyError, prepare_public_share, with_server_settings
 
 
 def label(slot):
@@ -113,7 +114,7 @@ class AvailabilityView(ProfileView):
         try:
             overview = await load_availability(self.service, self.user, start, end)
             view = make_view(overview)
-            await interaction.edit_original_response(content=None, embed=view.embed(), view=view)
+            await interaction.edit_original_response(content=None, embed=view.embed(), view=with_server_settings(view, interaction))
             self.stop()
         except Exception:
             self.busy = False
@@ -144,7 +145,7 @@ class SlotsView(AvailabilityView):
 
     async def show_page(self, interaction, page):
         view = SlotsView(self.service, self.user, self.discord_id, self.overview, page=page)
-        await interaction.response.edit_message(content=None, embed=view.embed(), view=view)
+        await interaction.response.edit_message(content=None, embed=view.embed(), view=with_server_settings(view, interaction))
         self.stop()
 
     async def previous(self, interaction):
@@ -158,7 +159,7 @@ class SlotsView(AvailabilityView):
                       if day.date().isoformat() == self.select.values[0])
         view = DaySlotsView(self.service, self.user, self.discord_id, self.overview, target,
                             parent=self.overview, parent_page=self.page)
-        await interaction.response.edit_message(content=None, embed=view.embed(), view=view)
+        await interaction.response.edit_message(content=None, embed=view.embed(), view=with_server_settings(view, interaction))
         self.stop()
 
     async def refresh(self, interaction):
@@ -210,7 +211,7 @@ class DaySlotsView(AvailabilityView):
         return DaySlotsView(self.service, self.user, self.discord_id, self.overview, self.target, **options)
 
     async def show(self, interaction, view):
-        await interaction.response.edit_message(content=None, embed=view.embed(), view=view)
+        await interaction.response.edit_message(content=None, embed=view.embed(), view=with_server_settings(view, interaction))
         self.stop()
 
     async def choose_time(self, interaction):
@@ -254,7 +255,7 @@ class DaySlotsView(AvailabilityView):
             content = f"**{label(slot)} · €{quote['amount']}**\n" + (
                 'Betaallink hier, op je dashboard en in Discord. Voldoende KUL-saldo gebruiken we eerst.'
                 if mode == 'discord' else 'Betalen met je standaardkaart. Voldoende KUL-saldo gebruiken we eerst.')
-            await interaction.edit_original_response(content=content, embed=None, view=view)
+            await interaction.edit_original_response(content=content, embed=None, view=with_server_settings(view, interaction))
             self.stop()
         except Exception as error:
             self.busy = False
@@ -272,7 +273,7 @@ class ConfirmView(ProfileView):
         if self.busy:return
         self.busy=True
         view=self.selection.replace()
-        await interaction.response.edit_message(content=None,embed=view.embed(),view=view)
+        await interaction.response.edit_message(content=None,embed=view.embed(),view=with_server_settings(view,interaction))
         self.stop()
     async def close(self,interaction):self.busy=True;await interaction.response.edit_message(content='Gesloten.',view=None)
     async def confirm(self,interaction):
@@ -285,7 +286,7 @@ class ConfirmView(ProfileView):
             content=result['message']
             view=BookingResultView(self.service,self.user,self.discord_id,result)
         except Exception as error:content=str(error);view=None
-        await interaction.edit_original_response(content=content,view=view)
+        await interaction.edit_original_response(content=content,view=with_server_settings(view,interaction))
 
 
 class BookingResultView(ProfileView):
@@ -327,9 +328,9 @@ class BookingsView(ProfileView):
         for option in self.select.options:option.default=int(option.value)==self.booking_id
         await interaction.response.edit_message(view=self)
     async def previous(self,interaction):
-        await interaction.response.edit_message(view=BookingsView(self.service,self.user,self.discord_id,self.bookings,page=self.page-1))
+        await interaction.response.edit_message(view=with_server_settings(BookingsView(self.service,self.user,self.discord_id,self.bookings,page=self.page-1),interaction))
     async def next(self,interaction):
-        await interaction.response.edit_message(view=BookingsView(self.service,self.user,self.discord_id,self.bookings,page=self.page+1))
+        await interaction.response.edit_message(view=with_server_settings(BookingsView(self.service,self.user,self.discord_id,self.bookings,page=self.page+1),interaction))
     async def share(self,interaction):
         if self.booking_id is None:return
         self.busy=True
@@ -358,10 +359,16 @@ async def share_booking(interaction,service,user,booking_id):
     if getattr(getattr(interaction,'context',None),'dm_channel',False):
         await interaction.response.send_message('Gebruik /deel in de groepschat of het serverkanaal.',ephemeral=True)
         return
+    try:
+        interaction=await prepare_public_share(interaction,'matches')
+    except ValueError as error:
+        await interaction.response.send_message(str(error),ephemeral=True)
+        return
     await interaction.response.defer(thinking=False)
     post=None;send_attempted=False
     try:
         await job(service,current,'bookings',{})
+        interaction=await prepare_public_share(interaction,'matches')
         # Community.share binds the profile, recent paid KUL snapshot and roster.
         service.community.share(current['id'],int(booking_id),True)
         match=service.community.matches.for_booking(interaction.user.id,int(booking_id))
@@ -378,6 +385,9 @@ async def share_booking(interaction,service,user,booking_id):
         message='Gedeeld.' if created else 'Al gedeeld in deze chat.'
         if post.jump_url:message+=' '+post.jump_url
         await interaction.edit_original_response(content=message,view=None,allowed_mentions=discord.AllowedMentions.none())
+    except SharePolicyError as error:
+        if post is not None:service.community.matches.drop_pending_post(post.id)
+        await interaction.edit_original_response(content=str(error),view=with_server_settings(None,interaction))
     except discord.HTTPException as error:
         if send_attempted and error.status in (400,403,404):service.community.matches.drop_pending_post(post.id)
         await interaction.edit_original_response(content='Delen niet bevestigd. Controleer deze chat voordat je opnieuw probeert.',view=None)
@@ -393,10 +403,10 @@ async def command(interaction,service,kind,first=0,last=0):
     try:user=service.discord_user(interaction.user.id)
     except ValueError:
         view=discord.ui.View();view.add_item(discord.ui.Button(label='Profiel koppelen',url=settings.padelbot_public_url+'/#dashboard'))
-        await interaction.response.send_message('Koppel je profiel om je eigen KUL-account te gebruiken.',view=view,ephemeral=True);return
+        await interaction.response.send_message('Koppel je profiel om je eigen KUL-account te gebruiken.',view=with_server_settings(view,interaction),ephemeral=True);return
     if kind=='rules':
         view=discord.ui.View();view.add_item(discord.ui.Button(label='Autobooking instellen',url=settings.padelbot_public_url+'/#rules'))
-        await interaction.response.send_message('Beheer je vaste momenten op je dashboard.',view=view,ephemeral=True);return
+        await interaction.response.send_message('Beheer je vaste momenten op je dashboard.',view=with_server_settings(view,interaction),ephemeral=True);return
     await interaction.response.defer(thinking=True,ephemeral=True)
     try:
         if kind=='slots':
@@ -405,11 +415,11 @@ async def command(interaction,service,kind,first=0,last=0):
             overview = await load_availability(service, user, start, end)
             view = (DaySlotsView(service, user, interaction.user.id, overview, start)
                     if first == last else SlotsView(service, user, interaction.user.id, overview))
-            await interaction.edit_original_response(content=None, embed=view.embed(), view=view)
+            await interaction.edit_original_response(content=None, embed=view.embed(), view=with_server_settings(view,interaction))
             return
         else:
             result=await job(service,user,'bookings',{})
             content='\n'.join(f"{label(b)} · "+('Bevestigd' if b['confirmed'] else 'Betaling controleren') for b in result['bookings']) or 'Geen komende boekingen.'
             view=BookingsView(service,user,interaction.user.id,result['bookings'])
-        await interaction.edit_original_response(content=content[:1950],view=view)
-    except Exception as error:await interaction.edit_original_response(content=str(error)[:1900],view=None)
+        await interaction.edit_original_response(content=content[:1950],view=with_server_settings(view,interaction))
+    except Exception as error:await interaction.edit_original_response(content=str(error)[:1900],view=with_server_settings(None,interaction))

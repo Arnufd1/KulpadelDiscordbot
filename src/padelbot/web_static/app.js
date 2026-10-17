@@ -6,9 +6,10 @@ let messageTimer=null,accountCheckFlight=null,accountCheckedAt=0;
 let cardLoadEpoch=0,cardSaving=false,cardVaultEnabled=true;
 let adminMetricsEpoch=0,adminMetricsLoading=false,adminMetricsLoaded=false,adminLoadEpoch=0;
 let selectedCancellation=null,bookingsCache=[],bookingSharing={};
+let discordServerId=null,discordServerEpoch=0,discordServerSaving=false;
 const bookingCancellations=new Map();
 const days = ['Maandag','Dinsdag','Woensdag','Donderdag','Vrijdag','Zaterdag','Zondag'];
-const titles={dashboard:'Dashboard',online:'Matches',admin:'Beheer'};
+const titles={dashboard:'Dashboard',online:'Matches',admin:'Beheer','discord-server':'Discord-server'};
 const date = iso => new Date(iso).toLocaleDateString('nl-BE',{timeZone:'Europe/Brussels',weekday:'long',day:'numeric',month:'long'});
 const clock = iso => new Date(iso).toLocaleTimeString('nl-BE',{timeZone:'Europe/Brussels',hour:'2-digit',minute:'2-digit'});
 const euro = amount => Number(amount).toLocaleString('nl-BE',{style:'currency',currency:'EUR'});
@@ -24,7 +25,7 @@ function identityAvatar(identity,guest=false){
 function playerRoster(match){const roster=el('div','player-roster');for(const person of (match.player_profiles||(match.players||[]).map(name=>({name}))).filter(Boolean)){const item=el('span','player-chip'),guest=person.registered===false;item.append(identityAvatar(person,guest),el('span','',person.name||'Speler'));if(guest){item.title='Discord-speler · niet geregistreerd';item.append(el('span','visually-hidden',' (niet geregistreerd)'));}roster.append(item);}return roster;}
 function message(text,error=false,busy=false){clearTimeout(messageTimer);const box=$('status');box.replaceChildren();box.className='status toast'+(error?' error':'')+(busy?' busy':'');box.hidden=!text;box.setAttribute('role',error?'alert':'status');if(!text)return;box.append(el('span','',text));const close=el('button','toast-close','\u00d7');close.type='button';close.setAttribute('aria-label','Melding sluiten');close.addEventListener('click',()=>message(''));box.append(close);if(!busy)messageTimer=setTimeout(()=>{if(box.textContent===text+'\u00d7')message('');},error?14000:7000);}
 function feedback(id,text,error=false){const box=$(id);if(!box)return;box.textContent=text;box.classList.toggle('error',error);box.setAttribute('role',error?'alert':'status');}
-async function api(path,method='GET',body,timeoutMs=30000){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),timeoutMs);try{const r=await fetch(path,{method,signal:controller.signal,credentials:'same-origin',headers:{'Content-Type':'application/json',...(me?{'X-CSRF-Token':me.csrf}:{})},...(body===undefined?{}:{body:JSON.stringify(body)})});let data;try{data=await r.json();}catch(error){if(controller.signal.aborted)throw error;throw new Error('De server gaf geen geldig antwoord. Probeer opnieuw.');}if(!r.ok)throw new Error(typeof data.detail==='string'?data.detail:'Controleer je invoer en probeer opnieuw.');if(data.error)throw new Error(data.error);return data;}catch(error){if(controller.signal.aborted)throw new Error('De aanvraag duurt te lang. Controleer de voortgang en probeer opnieuw.');throw error;}finally{clearTimeout(timer);}}
+async function api(path,method='GET',body,timeoutMs=30000){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),timeoutMs);try{const r=await fetch(path,{method,signal:controller.signal,credentials:'same-origin',headers:{'Content-Type':'application/json',...(me?{'X-CSRF-Token':me.csrf}:{})},...(body===undefined?{}:{body:JSON.stringify(body)})});let data;try{data=await r.json();}catch(error){if(controller.signal.aborted)throw error;throw new Error('De server gaf geen geldig antwoord. Probeer opnieuw.');}if(!r.ok){const error=new Error(typeof data.detail==='string'?data.detail:'Controleer je invoer en probeer opnieuw.');error.status=r.status;throw error;}if(data.error)throw new Error(data.error);return data;}catch(error){if(controller.signal.aborted)throw new Error('De aanvraag duurt te lang. Controleer de voortgang en probeer opnieuw.');throw error;}finally{clearTimeout(timer);}}
 async function guarded(fn,localId){try{await fn();}catch(e){if(localId)feedback(localId,e.message,true);if($('device-dialog').open)$('device-message').textContent=e.message;else message(e.message,true);}}
 async function waitForJob(job_id,text='KUL controleren...',timeoutMs=740000){message(text,false,true);const deadline=Date.now()+timeoutMs;for(let i=0;Date.now()<deadline;i++){await new Promise(r=>setTimeout(r,Math.min(2000,Math.max(1,deadline-Date.now()))));if(Date.now()>=deadline)break;const job=await api('/api/jobs/'+job_id,'GET',undefined,Math.min(30000,Math.max(1,deadline-Date.now())));if(job.status==='done'){message('');return job.result;}if(['failed','unknown','cancelled'].includes(job.status))throw new Error(job.result?.error||'De taak kon niet worden afgerond.');if(i===8)message('Nog even geduld. De KUL-login wordt gecontroleerd.',false,true);}const error=new Error('De controle loopt nog. Je kunt de voortgang opnieuw ophalen.');error.pending=true;throw error;}
 async function task(path,body={},text='Even ophalen bij KU Leuven Sport...'){message(text,false,true);const queued=await api(path,'POST',body);if(!queued.job_id){message('');return queued;}return waitForJob(queued.job_id,text);}
@@ -64,22 +65,59 @@ function rememberSlotRange(){
  const route=availabilityRoute('slots/'+$('range-start').value+'-'+$('range-end').value);if(!route)throw new Error('Kies dagen tussen 0 en 6.');
  availabilityDestination=route.fragment;history.replaceState(null,'','#'+route.fragment);
 }
-function updateLoginDestination(){const route=availabilityRoute(location.hash.slice(1)),button=document.querySelector('#login .google-button');button.href=route?'/auth/google?next='+encodeURIComponent('/#'+route.fragment):'/auth/google';}
+function discordServerRoute(value){const match=/^discord\/server\/([1-9][0-9]{0,18})$/.exec(value);return match&&BigInt(match[1])<=9223372036854775807n?{id:match[1],fragment:match[0]}:null;}
+function updateLoginDestination(){const value=location.hash.slice(1),route=availabilityRoute(value)||discordServerRoute(value),button=document.querySelector('#login .google-button');button.href=route?'/auth/google?next='+encodeURIComponent('/#'+route.fragment):'/auth/google';}
 async function showPage(page){
+ const server=discordServerRoute(page);if(server){discordServerId=server.id;page='discord-server';}else{discordServerId=null;discordServerEpoch++;}
  const availability=availabilityRoute(page);if(availability){availabilityDestination=availability.fragment;setSlotRange(availability.start,availability.end);page='dashboard';}
  else if(page==='dashboard'||page==='slots'||page.startsWith('slots/')){availabilityDestination=null;setSlotRange(0,0);}
  const invite=page.match(/^match\/([a-f0-9]{32})$/);if(invite){invitedMatch=invite[1];inviteScrolled=false;inviteRefreshTried=false;communityFilter='all';page='online';}else if(page!=='online')invitedMatch=null;
  const panel={settings:'profile-settings',rules:'autobook-panel',bookings:'my-bookings-panel'}[page];
  if(panel)page='dashboard';if(page==='slots')page='dashboard';
- if(!titles[page]||(page==='admin'&&me?.owner!==true))page='dashboard';activePage=page;
+ if(!titles[page]||(page==='admin'&&me?.owner!==true)||(page==='discord-server'&&!server))page='dashboard';activePage=page;
  for(const section of document.querySelectorAll('.page'))section.hidden=section.id!=='page-'+page;
  for(const button of document.querySelectorAll('nav [data-page]'))button.classList.toggle('active',button.dataset.page===page);
- $('page-title').textContent=titles[page];history.replaceState(null,'',page==='online'&&invitedMatch?'#match/'+invitedMatch:page==='dashboard'&&availabilityDestination?'#'+availabilityDestination:'#'+page);message('');
+ $('page-title').textContent=titles[page];history.replaceState(null,'',page==='discord-server'?'#'+server.fragment:page==='online'&&invitedMatch?'#match/'+invitedMatch:page==='dashboard'&&availabilityDestination?'#'+availabilityDestination:'#'+page);message('');
  if(panel){$(panel).open=true;$(panel).scrollIntoView({block:'start',behavior:'smooth'});}
  if(page==='online')await loadOnline();if(page==='admin')await loadAdmin();
+ if(page==='discord-server')await loadDiscordServer();
  if(page==='dashboard'){void guarded(loadPayments);if(me.connected){if(slotsCache&&slotsCacheDay===brusselsDay())renderSlots();else if(!slotsLoading)void guarded(()=>slots());}}
  if(panel==='profile-settings')await Promise.all([activity(),loadCard()]);if(panel==='autobook-panel')await loadRules();
  if(panel==='my-bookings-panel'&&!$('bookings').children.length)await bookings();
+}
+function applyDiscordServer(data){
+ $('discord-server-name').textContent=data.guild?.name||'Serverinstellingen';
+ $('discord-share-availability').checked=data.settings?.share_availability===true;$('discord-share-matches').checked=data.settings?.share_matches===true;
+ const select=$('discord-share-channel');select.replaceChildren(new Option('Huidig kanaal',''));
+ for(const channel of data.channels||[])select.add(new Option('#'+String(channel.name||'kanaal'),String(channel.id)));
+ const saved=data.settings?.share_channel_id||'',missing=!!saved&&![...select.options].some(option=>option.value===saved);
+ if(missing){const unavailable=new Option('Kanaal niet beschikbaar — kies een ander',saved,true,true);unavailable.disabled=true;select.add(unavailable);}
+ select.value=saved;select.setCustomValidity(missing?'Kies een beschikbaar kanaal.':'');return missing;
+}
+function discordServerError(error){
+ const denied=error.status===403;
+ if(denied)$('discord-server-form').hidden=true;
+ feedback('discord-server-feedback',denied?'Alleen de servereigenaar en leden met Server beheren kunnen deze instellingen aanpassen.':error.message,true);
+ $('discord-server-retry').hidden=denied;
+}
+async function loadDiscordServer(){
+ const id=discordServerId,epoch=++discordServerEpoch;if(!id)return;
+ $('discord-server-name').textContent='Serverinstellingen';$('discord-server-form').hidden=true;$('discord-server-retry').hidden=true;$('discord-server-panel').removeAttribute('aria-busy');
+ $('discord-server-connect').hidden=!!me.discord_linked;feedback('discord-server-feedback','');
+ $('discord-server-connect-link').href='/auth/discord?personal=true&next='+encodeURIComponent('/#discord/server/'+id);
+ if(!me.discord_linked)return;
+ feedback('discord-server-feedback','Instellingen ophalen...');$('discord-server-panel')?.setAttribute('aria-busy','true');
+ try{const data=await api('/api/discord/servers/'+id+'/settings');if(epoch!==discordServerEpoch||id!==discordServerId)return;const missing=applyDiscordServer(data);$('discord-server-form').hidden=false;feedback('discord-server-feedback',missing?'Het ingestelde kanaal is niet meer beschikbaar. Kies een ander kanaal.':'',missing);}
+ catch(error){if(epoch===discordServerEpoch&&id===discordServerId)discordServerError(error);}
+ finally{if(epoch===discordServerEpoch)$('discord-server-panel')?.removeAttribute('aria-busy');}
+}
+async function saveDiscordServer(event){
+ event.preventDefault();if(discordServerSaving||!discordServerId)return;
+ if(!$('discord-server-form').reportValidity())return;
+ const id=discordServerId,epoch=discordServerEpoch;discordServerSaving=true;$('discord-server-fields').disabled=true;$('discord-server-save').setAttribute('aria-busy','true');feedback('discord-server-feedback','Bewaren...');
+ try{const data=await api('/api/discord/servers/'+id+'/settings','PATCH',{share_availability:$('discord-share-availability').checked,share_matches:$('discord-share-matches').checked,share_channel_id:$('discord-share-channel').value||null});if(epoch!==discordServerEpoch||id!==discordServerId)return;const missing=applyDiscordServer(data);feedback('discord-server-feedback',missing?'Het ingestelde kanaal is niet meer beschikbaar. Kies een ander kanaal.':'\u2713 Instellingen bewaard.',missing);$('discord-server-retry').hidden=true;}
+ catch(error){if(epoch===discordServerEpoch&&id===discordServerId)discordServerError(error);}
+ finally{discordServerSaving=false;$('discord-server-fields').disabled=false;$('discord-server-save').removeAttribute('aria-busy');}
 }
 function brusselsDay(iso=new Date().toISOString()){
  const parts=new Intl.DateTimeFormat('en',{timeZone:'Europe/Brussels',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date(iso));
@@ -416,6 +454,7 @@ $('card-form').addEventListener('submit',saveCard);
 $('card-number').addEventListener('input',()=>{$('card-number').setCustomValidity('');updateCardNetwork();});$('card-number').addEventListener('change',updateCardNetwork);
 $('payment-dialog').addEventListener('close',resetCardForm);$('payment-dialog').addEventListener('cancel',event=>event.preventDefault());
 updateCardNetwork();
+$('discord-server-form').addEventListener('submit',saveDiscordServer);$('discord-server-retry').addEventListener('click',()=>void loadDiscordServer());$('discord-share-channel').addEventListener('change',()=>{$('discord-share-channel').setCustomValidity('');feedback('discord-server-feedback','');});
 $('link-discord').addEventListener('click',()=>guarded(async()=>{const result=await api('/api/discord/link','POST',{});$('discord-command').textContent=result.command;$('discord-link-code').hidden=false;}));$('copy-discord-link').addEventListener('click',()=>guarded(async()=>{await navigator.clipboard.writeText($('discord-command').textContent);message('Commando gekopieerd.');}));
 document.querySelectorAll('[data-community-filter]').forEach(button=>button.addEventListener('click',()=>guarded(async()=>{communityFilter=button.dataset.communityFilter;await loadOnline();})));$('create-draft').addEventListener('click',()=>guarded(createDraft));
 $('refresh-online').addEventListener('click',()=>guarded(refreshOnline));

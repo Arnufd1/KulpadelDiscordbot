@@ -230,6 +230,12 @@ async def share_availability(interaction, owner_id, overview):
         message = f"Dit overzicht is al gedeeld: {overview.shared_url}" if overview.shared_url else "Delen is al gestart. Controleer de chat; vernieuw het overzicht voor een nieuwe deelactie."
         await interaction.response.send_message(message, ephemeral=True)
         return
+    from .discord_sharing import SharePolicyError, prepare_public_share
+    try:
+        interaction = await prepare_public_share(interaction, 'availability', attachment=len(overview.pages) > 1)
+    except ValueError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
     # Set before awaiting, and do not retry an uncertain send automatically.
     overview.share_attempted = True
     await interaction.response.defer(thinking=False)
@@ -245,6 +251,10 @@ async def share_availability(interaction, owner_id, overview):
         if message.flags.ephemeral:
             raise RuntimeError("Discord heeft het overzicht alleen privé getoond.")
         overview.shared_url = message.jump_url
+    except SharePolicyError as error:
+        overview.share_attempted = False
+        view.stop()
+        await interaction.followup.send(str(error), ephemeral=True)
     except Exception as error:
         view.stop()
         logger.warning("Availability sharing failed: {}", type(error).__name__)

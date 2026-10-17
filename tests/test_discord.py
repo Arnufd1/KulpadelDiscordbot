@@ -30,10 +30,13 @@ def test_group_commands_registered_globally_even_with_test_server(tmp_path, monk
             await bot.setup_hook()
             assert requests[0][0] is None
             commands = {c["name"]: c for c in requests[0][1]}
-            assert set(commands) == {"checkbookings", "autobook", "bookings", "watcher", "koppel", "deel"}
-            for name in commands:
+            group_commands = {"checkbookings", "autobook", "bookings", "watcher", "koppel", "deel"}
+            assert set(commands) == group_commands | {"settings"}
+            for name in group_commands:
                 assert set(commands[name]["contexts"]) == {0, 1, 2}
                 assert set(commands[name]["integration_types"]) == {0, 1}
+            assert set(commands['settings']['contexts']) == {0}
+            assert set(commands['settings']['integration_types']) == {0}
             day = commands["checkbookings"]["options"][0]
             assert day["name"] == "dag" and day["type"] == discord.AppCommandOptionType.string.value
             assert "0-5" in day["description"]
@@ -41,7 +44,7 @@ def test_group_commands_registered_globally_even_with_test_server(tmp_path, monk
             assert day["required"] is False
             assert [r[0] for r in requests] == ([None, guild_id] if guild_id else [None])
             if guild_id:
-                assert {c["name"] for c in requests[1][1]} == {"checkbookings", "autobook", "bookings", "watcher", "koppel", "deel"}
+                assert {c["name"] for c in requests[1][1]} == group_commands | {"settings"}
             options = {option["name"]: option for option in commands["watcher"]["options"]}
             assert options["dag"]["min_value"] == 0 and options["dag"]["max_value"] == 365
             assert options["van"]["max_value"] == 23 and options["tot"]["max_value"] == 24

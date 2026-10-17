@@ -569,6 +569,17 @@ def _register_commands(bot: PadelBot) -> None:
     from .discord_ui import AutoBookView, BookingsView, DaySlotsView, SlotsRangeView, parse_day_range, today
     from datetime import timedelta
 
+    @bot.tree.command(name='settings',description='Beheer de instellingen van de padelbot in deze server')
+    @app_commands.allowed_installs(guilds=True,users=False)
+    @app_commands.allowed_contexts(guilds=True,dms=False,private_channels=False)
+    async def server_settings_cmd(interaction:discord.Interaction)->None:
+        from .discord_sharing import installed_guild,with_server_settings
+        if installed_guild(interaction) is None:
+            await interaction.response.send_message('Gebruik /settings in een server waar de bot is toegevoegd.',ephemeral=True)
+            return
+        await interaction.response.send_message('Beheer delen en het deelkanaal op de website. Alleen serverbeheerders kunnen wijzigingen bewaren.',
+            view=with_server_settings(None,interaction),ephemeral=True,allowed_mentions=discord.AllowedMentions.none())
+
     @bot.tree.command(name='koppel',description='Koppel je Discord-account aan je Google-profiel in de padelhub')
     @app_commands.describe(code='Eenmalige code uit Instellingen op padel.sigmadvisor.com')
     async def link_profile(interaction:discord.Interaction,code:str):

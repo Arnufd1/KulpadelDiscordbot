@@ -31,6 +31,7 @@ from .web_device import DeviceManager
 from .web_cards import CardVault
 from .platform_service import PlatformService,install_url,CARD_MANAGE_URL
 from .matches import MatchError
+from .discord_server_settings import DiscordServerSettings, DiscordServerAccess, DiscordServerAccessError, discord_id
 
 
 class WebSettings(BaseSettings):
@@ -66,6 +67,13 @@ class PreferencesRequest(BaseModel):
     automatic_payment: bool = False
     max_amount: float = Field(ge=0,le=100)
     payment_mode: str = Field(default='kul',pattern=r'^(kul|discord)$')
+
+
+class DiscordServerSettingsRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    share_availability: bool | None = None
+    share_matches: bool | None = None
+    share_channel_id: str | None = Field(default=None, max_length=19)
 
 
 class CardRequest(BaseModel):
@@ -141,6 +149,7 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
     cards = CardVault(store,config.card_vault_key_file)
     community = runner.community
     platform=PlatformService(store,community,cards=cards)
+    server_settings = DiscordServerSettings(store)
     from .admin_service import AdminService
     administration=AdminService(platform)
     drafts=runner.drafts
@@ -161,6 +170,8 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
     app.state.cards, app.state.community = cards,community
     app.state.devices=devices
     app.state.platform=platform
+    app.state.discord_server_settings = server_settings
+    app.state.discord_server_access = DiscordServerAccess()
     hosts = {urlsplit(config.public_url).hostname,urlsplit(config.tail_url).hostname,"localhost","127.0.0.1","192.168.0.220"}
     app.add_middleware(TrustedHostMiddleware,allowed_hosts=sorted(h for h in hosts if h))
     attempts = {}
@@ -298,7 +309,7 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
     def discord_start(request:Request,personal:bool=False,user=Depends(current)):
         if not config.discord_client_secret:
             return RedirectResponse(install_url(config.discord_client_id,personal=personal),status_code=302)
-        state=platform.oauth_start(user['id'],request.cookies['padel_session'])
+        state=platform.oauth_start(user['id'],request.cookies['padel_session'],request.query_params.get('next','/#dashboard'))
         return RedirectResponse('https://discord.com/oauth2/authorize?'+urlencode({
             'client_id':config.discord_client_id,'redirect_uri':config.public_url+'/auth/discord/callback',
             'response_type':'code','scope':'identify applications.commands' if personal else 'identify bot applications.commands',
@@ -306,9 +317,10 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
 
     @app.get('/auth/discord/callback')
     async def discord_callback(request:Request,user=Depends(current)):
+        flow=platform.oauth_consume(request.query_params.get('state',''),request.cookies['padel_session'],user['id'])
         if (not config.discord_client_secret or request.query_params.get('error') or
             request.query_params.get('iss','https://discord.com')!='https://discord.com' or
-            not platform.oauth_consume(request.query_params.get('state',''),request.cookies['padel_session'],user['id'])):
+            not flow):
             raise HTTPException(400,'Discord-autorisatie is verlopen of geweigerd.')
         try:
             async with httpx.AsyncClient(timeout=15) as client:
@@ -333,7 +345,9 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
         except Exception:
             raise HTTPException(400,'Discord kon niet gekoppeld worden. Probeer opnieuw.') from None
         store.audit(user['id'],'discord_linked')
-        return RedirectResponse(config.public_url+'/#dashboard',status_code=303)
+        destination=flow.get('return_to','/#dashboard')
+        destination=google_return_path(destination) if destination!='/#dashboard' else destination
+        return RedirectResponse(config.public_url+destination,status_code=303)
 
     @app.get("/api/me")
     def me(request:Request,user=Depends(current)):
@@ -371,6 +385,42 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
         code=community.hub.new_code(user['id'])
         store.audit(user['id'],'discord_link_requested')
         return {'command':'/koppel '+code,'expires_in':600}
+
+    async def discord_server_context(guild_id,user):
+        actor_id=platform.discord_id(user['id'])
+        if not actor_id:
+            raise HTTPException(409,'Koppel eerst je Discord-profiel.')
+        try:
+            context=await app.state.discord_server_access.verify(guild_id,actor_id)
+        except DiscordServerAccessError as error:
+            raise HTTPException(error.status_code,str(error)) from None
+        # The profile may have been relinked while Discord REST was in flight.
+        if str(platform.discord_id(user['id']))!=str(actor_id):
+            raise HTTPException(409,'Je Discord-koppeling is gewijzigd. Probeer opnieuw.')
+        return context,actor_id
+
+    @app.get('/api/discord/servers/{guild_id}/settings')
+    async def discord_server_get(guild_id:str,user=Depends(current)):
+        guild_id=discord_id(guild_id)
+        context,_=await discord_server_context(guild_id,user)
+        return {**context,'settings':server_settings.get(guild_id)}
+
+    @app.patch('/api/discord/servers/{guild_id}/settings')
+    async def discord_server_update(guild_id:str,body:DiscordServerSettingsRequest,user=Depends(current)):
+        guild_id=discord_id(guild_id)
+        platform.require_writable(user['id'])
+        values=body.model_dump(exclude_unset=True)
+        # Null resets the channel; switches must always be actual booleans.
+        if any(values.get(key) is None for key in ('share_availability','share_matches') if key in values):
+            raise HTTPException(422,'Controleer de serverinstellingen.')
+        context,actor_id=await discord_server_context(guild_id,user)
+        platform.require_writable(user['id'])
+        if values.get('share_channel_id') is not None:
+            channel_id=discord_id(values['share_channel_id'])
+            if channel_id not in {channel['id'] for channel in context['channels']}:
+                raise HTTPException(403,'Kies een kanaal waar jij en de bot berichten kunnen plaatsen.')
+            values['share_channel_id']=channel_id
+        return {**context,'settings':server_settings.save(guild_id,values,actor_id)}
 
     @app.post("/api/preferences")
     def preferences(body:PreferencesRequest,user=Depends(current)):

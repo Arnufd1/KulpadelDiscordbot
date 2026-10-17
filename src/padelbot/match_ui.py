@@ -15,6 +15,7 @@ from .config import settings
 from .matches import Match, MatchError, MatchStore
 from .match_notices import can_expire_notices
 from . import weather
+from .discord_sharing import SharePolicyError
 
 
 def shareable_booking(booking_id):
@@ -263,6 +264,12 @@ async def _publish_one(interaction, owner_id: int, booking_id: int, *, tag_every
         send_attempted = True
         post = await send_post(interaction, match, post, tag_everyone=tag_everyone)
         return True, f"Gedeeld: {post.jump_url}"
+    except SharePolicyError as error:
+        if post:
+            bot.match_store.drop_pending_post(post.id)
+        if created_match:
+            bot.match_store.drop_unpublished(match.id)
+        return False, str(error)
     except MatchError as error:
         if post and bot.match_store.get_post(post.id) is None and created_match:
             bot.match_store.drop_unpublished(match.id)
@@ -285,6 +292,10 @@ async def _publish_one(interaction, owner_id: int, booking_id: int, *, tag_every
 
 
 async def send_post(interaction, match, post, *, tag_everyone=False):
+    from .discord_sharing import prepare_public_share
+    interaction = await prepare_public_share(interaction, 'matches', mention_everyone=tag_everyone)
+    if post.channel_id != interaction.channel_id or post.guild_id != interaction.guild_id:
+        raise SharePolicyError('Het deelkanaal is gewijzigd. Open je boekingen opnieuw; er is niets gedeeld.')
     bot, store = interaction.client, interaction.client.match_store
     view = post_view(store, match, post, bot._match_action_lock)
     # Register before sending: a response can be lost after Discord published
@@ -301,13 +312,14 @@ async def send_post(interaction, match, post, *, tag_everyone=False):
 
 
 class CrossShareView(discord.ui.View):
-    def __init__(self, store, owner_id, channel_id, booking_ids, *, tag_everyone=False):
+    def __init__(self, store, owner_id, channel_id, booking_ids, *, tag_everyone=False, target_channel_id=None):
         super().__init__(timeout=900)
         self.owner_id, self.channel_id = owner_id, channel_id
+        target_channel_id = target_channel_id or channel_id
         self.busy = False
         for row, booking_id in enumerate(booking_ids):
             match = store.for_booking(owner_id, booking_id)
-            current = store.post_in_channel(match.id, channel_id)
+            current = store.post_in_channel(match.id, target_channel_id)
             start = datetime.fromisoformat(match.start_iso.replace("Z", "+00:00")).astimezone(ZoneInfo(settings.padel_local_tz))
             for move, label in [(False, "Ook hier delen"), (True, "Verplaatsen naar hier")]:
                 button = discord.ui.Button(label=f"{start:%d/%m %H:%M} · {label}" + (" + @everyone" if tag_everyone else ""),
@@ -325,7 +337,7 @@ class CrossShareView(discord.ui.View):
                         self.busy = False
                 button.callback = callback
                 self.add_item(button)
-            source = next((post for post in store.posts(match.id, active_only=True) if post.channel_id != channel_id and post.jump_url), None)
+            source = next((post for post in store.posts(match.id, active_only=True) if post.channel_id != target_channel_id and post.jump_url), None)
             if source:
                 self.add_item(discord.ui.Button(label="Bestaand bericht", url=source.jump_url, row=row))
         back = discord.ui.Button(label="Mijn reservaties", style=discord.ButtonStyle.secondary, row=0)
@@ -357,6 +369,12 @@ async def transfer_share(interaction, owner_id, booking_id, *, move=False, tag_e
             or getattr(getattr(interaction, "context", None), "dm_channel", False)):
         await interaction.response.send_message("Open je eigen `/bookings` in de gewenste groepschat of het serverkanaal.", ephemeral=True)
         return
+    from .discord_sharing import prepare_public_share
+    try:
+        interaction = await prepare_public_share(interaction, 'matches', mention_everyone=tag_everyone)
+    except ValueError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
     if tag_everyone and not getattr(interaction.app_permissions, "mention_everyone", False):
         await interaction.response.send_message("De app mag hier geen @everyone taggen.", ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none())
@@ -386,6 +404,10 @@ async def transfer_share(interaction, owner_id, booking_id, *, move=False, tag_e
                     status += " De oude groepsberichten zijn verwijderd."
             else:
                 status = f"{'Ook hier gedeeld' if created else 'Al gedeeld in deze chat'}: {post.jump_url}. Alle chats gebruiken dezelfde deelnemerslijst (maximaal vier spelers)."
+        except SharePolicyError as error:
+            if post is not None:
+                bot.match_store.drop_pending_post(post.id)
+            status = str(error)
         except MatchError as error:
             status = str(error)
         except discord.HTTPException as error:
@@ -416,6 +438,12 @@ async def publish_bookings(interaction, owner_id: int, booking_ids, *, tag_every
     if not booking_ids or len(booking_ids) > MAX_SHARE_BOOKINGS:
         await interaction.response.send_message(f"Selecteer één tot {MAX_SHARE_BOOKINGS} reservaties om te delen.", ephemeral=True)
         return
+    from .discord_sharing import prepare_public_share
+    try:
+        interaction = await prepare_public_share(interaction, 'matches', mention_everyone=tag_everyone)
+    except ValueError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
     if tag_everyone and not getattr(interaction.app_permissions, "mention_everyone", False):
         await interaction.response.send_message("De app mag hier geen @everyone taggen. Gebruik Deel met groep of geef de app die toestemming in dit kanaal.",
             ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
@@ -444,7 +472,9 @@ async def publish_bookings(interaction, owner_id: int, booking_ids, *, tag_every
         try:
             kwargs = dict(content="\n".join(statuses)[:2000], allowed_mentions=discord.AllowedMentions.none())
             if choices:
-                kwargs["view"] = CrossShareView(bot.match_store, owner_id, interaction.channel_id, choices, tag_everyone=tag_everyone)
+                origin_channel_id = getattr(interaction, 'original', interaction).channel_id
+                kwargs["view"] = CrossShareView(bot.match_store, owner_id, origin_channel_id, choices,
+                    tag_everyone=tag_everyone, target_channel_id=interaction.channel_id)
             await interaction.edit_original_response(**kwargs)
             return kwargs.get("view")
         except Exception as error:

@@ -19,9 +19,12 @@ def digest(value: str) -> str:
 
 
 def google_return_path(value: str | None) -> str:
-    """Only the local availability view may survive a Google login."""
+    """Only exact local availability and Discord server views survive login."""
     match = re.fullmatch(r"/#slots/([0-6])-([0-6])", value or "")
-    return value if match and int(match[1]) <= int(match[2]) else "/"
+    if match and int(match[1]) <= int(match[2]):
+        return value
+    server = re.fullmatch(r"/#discord/server/([1-9][0-9]{0,18})", value or "")
+    return value if server and int(server[1]) < 2**63 else "/"
 
 
 class PlatformStore:
