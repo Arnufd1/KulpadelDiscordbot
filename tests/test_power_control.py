@@ -154,6 +154,39 @@ def test_bridge_ssh_requires_pinned_host_keys_and_no_interactive_passwords(bridg
     assert args[-1] == "auth@vm"
 
 
+@pytest.mark.parametrize("command", ["status", "ensure " + LEASE, "heartbeat " + LEASE, "release " + LEASE])
+def test_power_control_ssh_cannot_consume_native_handshake_stdin(bridge, monkeypatch, command):
+    module = load_script("padel-auth-bridge")
+    calls = []
+    def run(args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(stdout='{"status":"running"}')
+    monkeypatch.setattr(module.subprocess, "run", run)
+    config = json.loads(bridge.module.CONFIG.read_text())
+    assert module.control(config, command) == {"status": "running"}
+    assert calls[0][0][-1] == command
+    assert calls[0][1]["stdin"] == subprocess.DEVNULL
+
+
+def test_ping_ssh_uses_devnull_and_only_native_worker_receives_handshake(bridge, monkeypatch):
+    probes = []
+    launches = []
+    def probe(args, **kwargs):
+        probes.append((args, kwargs))
+        return SimpleNamespace(returncode=0)
+    def launch(args, **kwargs):
+        launches.append((args, kwargs))
+        return SimpleNamespace(wait=lambda **k: 0, poll=lambda: 0)
+    monkeypatch.setattr(bridge.module.subprocess, "run", probe)
+    monkeypatch.setattr(bridge.module.subprocess, "Popen", launch)
+    handshake_stream = bridge.module.sys.stdin.buffer
+    bridge.module.main("approve")
+    assert probes[0][0][-1] == "ping"
+    assert probes[0][1]["stdin"] == subprocess.DEVNULL
+    assert launches[0][0][-1] == "approve"
+    assert launches[0][1]["stdin"] is handshake_stream
+
+
 def test_bridge_worker_failure_still_releases_its_lease(bridge, monkeypatch):
     monkeypatch.setattr(bridge.module.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0))
     remote = SimpleNamespace(wait=lambda **k: 3, poll=lambda: 3)

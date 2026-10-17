@@ -24,7 +24,7 @@ def ssh_args(config,role):
             '-o','IdentitiesOnly=yes','-i',config[role+'_key'],config[role+'_host']]
 
 def control(config,command):
-    result=subprocess.run(ssh_args(config,'control')+[command],check=True,capture_output=True,text=True,timeout=160)
+    result=subprocess.run(ssh_args(config,'control')+[command],stdin=subprocess.DEVNULL,check=True,capture_output=True,text=True,timeout=160)
     answer=json.loads(result.stdout)
     if answer.get('error'):raise RuntimeError('Power control unavailable')
     return answer
@@ -48,7 +48,7 @@ def main(mode):
         while True:
             # Forced command accepts ping only and never starts Android.
             try:
-                probe=subprocess.run(ssh_args(config,'worker')+['ping'],capture_output=True,timeout=8)
+                probe=subprocess.run(ssh_args(config,'worker')+['ping'],stdin=subprocess.DEVNULL,capture_output=True,timeout=8)
                 if probe.returncode==0:break
             except subprocess.TimeoutExpired:pass
             if time.monotonic()>=deadline:raise RuntimeError('Authenticator VM unavailable')
