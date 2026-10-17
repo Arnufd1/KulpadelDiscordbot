@@ -160,6 +160,20 @@ class JobRunner:
                 self.drafts.uncertain_conversion(payload['draft_id'])
         if job and job['kind']=='bookings' and status=='done':
             self.community.sync(job['user_id'],result.get('bookings',[]),device_verified=result.get('device_verified') is True)
+        if job and status=='done' and job['kind'] in {'book','rule','bookings'}:
+            from .platform_service import PlatformService
+            from loguru import logger
+            try:
+                service=PlatformService(self.store,self.community)
+                if job['kind']=='bookings':
+                    service.sync_verified_bookings(job['user_id'],result.get('bookings',[]),device_verified=result.get('device_verified') is True)
+                    service.queue_due_reminders()
+                elif result.get('paid') is True and result.get('booking_id'):
+                    service.queue_confirmed_booking(job['user_id'],result['booking_id'],result.get('target') or json.loads(job['payload'])['target'],result.get('amount'))
+            except Exception as error:
+                # A notification failure must never turn a confirmed paid write
+                # into a failed job that invites another booking attempt.
+                logger.warning('Booking notification deferred: {}',type(error).__name__)
         if job and job['kind'] in {'login','account','quote'} and status=='done' and result.get('payment'):
             from .platform_service import PlatformService
             PlatformService(self.store,self.community).remember_payment(job['user_id'],result['payment'])

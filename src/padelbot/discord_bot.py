@@ -117,6 +117,9 @@ class PadelBot(commands.Bot):
         if self.platform is not None and (self._delivery_task is None or self._delivery_task.done()):
             from .discord_delivery import run_deliveries
             self._delivery_task=asyncio.create_task(run_deliveries(self,self.platform))
+        if self.platform is not None and (self._reminder_task is None or self._reminder_task.done()):
+            from .discord_lifecycle import run_booking_lifecycle
+            self._reminder_task=asyncio.create_task(run_booking_lifecycle(self,self.platform))
         guild_ok = bool(settings.discord_guild_id)
         logger.info(
             "Owner gating: {} · Guild scope: {} · Type /checkbookings in Discord to test.",
@@ -164,6 +167,8 @@ class PadelBot(commands.Bot):
         self._availability_watcher_task = asyncio.create_task(run_availability_watcher(self))
 
     async def close(self):
+        if self._reminder_task is not None:
+            self._reminder_task.cancel();await asyncio.gather(self._reminder_task,return_exceptions=True)
         if self._delivery_task is not None:
             self._delivery_task.cancel();await asyncio.gather(self._delivery_task,return_exceptions=True)
         if self._hub_posts_task is not None:
@@ -231,6 +236,11 @@ class PadelBot(commands.Bot):
         if not any((embed.title or "").startswith("Mijn reservaties (") for embed in message.embeds):
             return
         if await _deny_if_not_owner(interaction):
+            return
+
+        if self.platform is not None:
+            from .discord_platform import command
+            await command(interaction,self.platform,'bookings')
             return
 
         # Reply immediately; KUL may need to renew its session before reading.
@@ -589,7 +599,7 @@ def _register_commands(bot: PadelBot) -> None:
         view = AutoBookView(settings.discord_owner_id, bot.rules_store)
         await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
 
-    @bot.tree.command(name="bookings", description="Bekijk je reservaties, deel met de groep of annuleer via de knoppen")
+    @bot.tree.command(name="bookings", description="Bekijk je reservaties en deel een bevestigde boeking met de groep")
     async def bookings_cmd(interaction: discord.Interaction) -> None:
         if bot.platform is not None:
             from .discord_platform import command
@@ -604,6 +614,13 @@ def _register_commands(bot: PadelBot) -> None:
             await interaction.followup.send("Reservaties ophalen mislukt. Probeer opnieuw.", ephemeral=True)
             return
         await interaction.followup.send(embed=view.embed(), view=view, ephemeral=True)
+
+    @bot.tree.command(name='deel',description='Deel je bevestigde padelboeking in deze chat')
+    async def share_cmd(interaction:discord.Interaction)->None:
+        if bot.platform is not None:
+            from .discord_platform import command
+            await command(interaction,bot.platform,'bookings');return
+        await bookings_cmd.callback(interaction)
 
     @bot.tree.command(name="watcher", description="Volg vrije slots op een dag, of beheer je watchers")
     @app_commands.describe(dag="0 = vandaag, 1 = morgen; leeg laten om watchers te beheren",

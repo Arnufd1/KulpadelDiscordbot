@@ -217,7 +217,8 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
         return user
 
     def admin(request:Request,user=Depends(current)):
-        if not user["owner"] or request.state.session["admin_until"]<time.time():
+        if (not user["owner"] or user['email'].lower()!=config.owner_email.lower()
+                or request.state.session["admin_until"]<time.time()):
             raise HTTPException(403,"Bevestig beheertoegang via Tailscale.")
         return user
 
@@ -320,8 +321,10 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
         profile=Path(env['PADELBOT_ANDROID_PROFILE_FILE'])
         try:verified=json.loads(profile.read_text()).get('enrollment_verified') is True
         except (OSError,ValueError,AttributeError):verified=False
-        return {"id":user["id"],"name":user["name"],"email":user["email"],"owner":bool(user["owner"]),
-            "admin":bool(user["owner"] and request.state.session["admin_until"]>time.time()),"csrf":request.state.session["csrf"],
+        is_owner=bool(user['owner'] and user['email'].lower()==config.owner_email.lower())
+        admin_eligible=bool(is_owner and request.state.session['admin_until']>time.time())
+        return {"id":user["id"],"name":user["name"],"email":user["email"],"owner":is_owner,
+            "admin":admin_eligible,"admin_eligible":admin_eligible,"csrf":request.state.session["csrf"],
             "connected":connected,"device_ready":profile.exists() and (verified or connected),
             "needs_attention":Path(env["PADELBOT_ANDROID_FAILURE_FILE"]).exists(),
             "discord_linked":community.hub.linked(user['id']),
@@ -341,6 +344,10 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
     @app.post("/api/preferences")
     def preferences(body:PreferencesRequest,user=Depends(current)):
         return store.preferences(user["id"],body.model_dump())
+
+    @app.get('/api/payments')
+    def private_payments(user=Depends(current)):
+        return {'payments':platform.private_payments(user['id'])}
 
     @app.get('/api/payment-card')
     def card_summary(user=Depends(current)):
@@ -413,7 +420,25 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
     @app.post('/api/community/share')
     def share_match(body:ShareRequest,user=Depends(current)):
         community.share(user['id'],body.booking_id,body.shared)
-        return {'ok':True}
+        with community.matches._connection() as c:
+            row=c.execute('SELECT id FROM shared_matches WHERE hub_profile_id=? AND booking_id=?',
+                          (user['id'],body.booking_id)).fetchone()
+        ident=row[0] if row else None
+        return {'ok':True,'id':ident,'url':config.public_url+'/#match/'+ident if ident and body.shared else None}
+
+    @app.post('/api/community/{match_id}/refresh')
+    def refresh_invitation(match_id:str,user=Depends(current)):
+        match=community.matches.get(match_id)
+        if match and match.status=='draft':
+            # Drafts already have a bounded background verification schedule.
+            if not any(item['id']==match_id for item in drafts.list(user['id'])):
+                raise HTTPException(404,'Deze match is niet meer beschikbaar.')
+            return {'refreshing':False}
+        host=community.host(match_id)
+        if match.hub_confirmed and match.hub_verified>time.time()-300:
+            return {'refreshing':False}
+        store.enqueue(host['user_id'],'bookings',{},dedup=f"online-refresh:{host['user_id']}:{int(time.time())//120}")
+        return {'refreshing':True}
 
     @app.post('/api/community/{match_id}/join')
     def join_match(match_id:str,user=Depends(current)):
@@ -533,7 +558,7 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
 
     @app.post("/api/admin/access")
     def admin_access(request:Request,user=Depends(current)):
-        if not user["owner"]:
+        if not user["owner"] or user['email'].lower()!=config.owner_email.lower():
             raise HTTPException(403,"Geen beheerder.")
         ticket = store.admin_ticket(request.cookies["padel_session"])
         return {"url":config.tail_url+"/admin/verify?"+urlencode({"ticket":ticket})}

@@ -72,10 +72,11 @@ def stored_methods(client,member_id):
     return valid
 
 
-def attach_stored_method(client,me):
+def attach_stored_method(client,me,*,cards_only=False):
     me=dict(me)
     try:
         methods=stored_methods(client,int(me['id']))
+        if cards_only:methods=[m for m in methods if m['type']==3]
         preferred=next((m for m in methods if m['preferred']),None)
         if preferred or len(methods)==1:me['_stored_method']=preferred or methods[0]
     except Exception:pass  # Unavailable/unverified methods cannot authorise a payment.
@@ -238,6 +239,7 @@ def auto_pay(
     member_id: int,
     amount: float,
     me: dict[str, Any] | None = None,
+    allow_direct_debit: bool = True,
 ) -> tuple[PayMethod, dict[str, Any]]:
     """Pick the best payment path and execute it.
 
@@ -258,14 +260,14 @@ def auto_pay(
             amount=amount, method=PayMethod.ACCOUNT,
         )
 
-    if has_direct_debit_mandate(me) and int(me.get("directDebitSpec") or 0) > 0:
+    if allow_direct_debit and has_direct_debit_mandate(me) and int(me.get("directDebitSpec") or 0) > 0:
         return PayMethod.DIRECT_DEBIT, create_payment(
             client, sale_id=sale_id, member_id=member_id,
             amount=amount, method=PayMethod.DIRECT_DEBIT,
         )
 
     stored=me.get('_stored_method')
-    if stored:
+    if stored and (stored['type']==3 or allow_direct_debit):
         method=PayMethod.CREDIT_CARD if stored['type']==3 else PayMethod.DIRECT_DEBIT
         return method,create_payment(client,sale_id=sale_id,member_id=member_id,amount=amount,
             method=method,stored_method_id=stored['id'])

@@ -42,10 +42,9 @@ def initialise_key():
 
 
 def payment_summary(me: dict) -> dict:
-    from .payment import has_direct_debit_mandate
     return {"balance":me.get("balance") or 0,
-            "direct_debit":has_direct_debit_mandate(me) and int(me.get("directDebitSpec") or 0)>0,
-            'stored_method':bool(me.get('_stored_method')),
+            "direct_debit":False,
+            'stored_method':me.get('_stored_method',{}).get('type')==3,
             'stored_card':me.get('_stored_method',{}).get('type')==3,
             "manage_url":"https://usc.kuleuven.cloud/members/profile/myshopping#storedpaymethodcard"}
 
@@ -64,7 +63,7 @@ def verified_bookings(client, me):
             completed[booking.sale_id]=(sale.get('id')==booking.sale_id and sale.get('customerPersonId')==int(me['id'])
                 and type(sale.get('statusCode')) is int and sale['statusCode']==0)
     return {'device_verified':device_verified,'bookings':[
-        {'id':b.id,'description':b.description,'name':names.get(b.raw.get('productId'),'Reservatie'),
+        {'id':b.id,'sale_id':b.sale_id,'description':b.description,'name':names.get(b.raw.get('productId'),'Reservatie'),
          'start':b.start_iso,'end':b.end_iso,'paid':b.paid_for,
          'confirmed':device_verified and b.status==0 and b.paid_for is True and completed.get(b.sale_id,False)
              and 'padel' in names.get(b.raw.get('productId'),'').lower()}
@@ -102,7 +101,7 @@ def execute(kind: str, payload: dict) -> dict:
         me = client.me()
         if kind in {'account','login','quote','book','rule'}:
             from .payment import attach_stored_method
-            me=attach_stored_method(client,me)
+            me=attach_stored_method(client,me,cards_only=True)
         if kind in {"account","login"}:
             return {"connected":True,"name":str(me.get("firstName") or me.get("name") or "KUL-account"),
                     "payment":payment_summary(me)}
@@ -190,22 +189,15 @@ def execute(kind: str, payload: dict) -> dict:
         maximum = Decimal(str(prefs.get("max_amount",0)))
         if (kind=='rule' or 'payment_mode' not in prefs) and (amount>maximum or maximum<=0):
             raise ValueError("De prijs ligt boven jouw ingestelde maximum. Er is niets geboekt.")
-        # Only KUL balance and an already-authorised mandate can be unattended.
+        # Only KUL balance and its verified tokenized credit-card path are used.
         # This worker never loads a legacy encrypted card or accepts browser card data.
         from .platform_service import payment_mode,validate_payment,PlatformService
         mode=payment_mode(prefs)
         validate_payment(me,amount,mode)
-        summary=payment_summary(me)
-        needs_discord=(mode=='discord' or (summary['stored_card'] and Decimal(str(summary['balance']))<amount and not summary['direct_debit']))
-        service=None
-        if needs_discord:
-            context=platform_context();service=PlatformService(context.store,context)
-            if not service.discord_id(os.environ['PADELWEB_USER_ID']):
-                raise ValueError('Koppel Discord om je betaallink te ontvangen.')
-            if not service.discord_online():raise ValueError('Discord is tijdelijk offline. Er is niets geboekt.')
-            service.cipher()  # Verify durable private delivery storage before creating a sale.
         if kind == "book" and amount != Decimal(str(payload["amount"])):
             raise ValueError("De prijs is gewijzigd. Vernieuw het overzicht en bevestig opnieuw.")
+        context=platform_context();service=PlatformService(context.store,context)
+        service.cipher()  # Verify durable private website storage before creating a sale.
         latest=current_preferences()
         if (payment_mode(latest)!=mode or
             ((kind=='rule' or 'payment_mode' not in latest) and (not latest.get('automatic_payment') or Decimal(str(latest.get('max_amount',0)))<amount))):
@@ -217,21 +209,17 @@ def execute(kind: str, payload: dict) -> dict:
         if any(_timestamp_key(b.start_iso)<_timestamp_key(slot.end_iso) and _timestamp_key(b.end_iso)>_timestamp_key(slot.start_iso)
             for b in list_my_bookings(client,member_id=int(me['id']))):
             raise ValueError('Je hebt al een boeking op dit tijdstip.')
-        if needs_discord:
-            _prepared_service=service
-            _prepared_delivery=service.prepare_delivery(os.environ['PADELWEB_USER_ID'],os.environ['PADELWEB_JOB_ID'],amount,slot.start_iso)
-            latest=current_preferences()
-            if payment_mode(latest)!=mode or (kind=='rule' and (not latest.get('automatic_payment') or Decimal(str(latest.get('max_amount',0)))<amount)):
-                raise ValueError('Je instellingen zijn gewijzigd. Er is niets geboekt.')
-            if rule:
-                current=rules.get_rule(rule.id)
-                if not current or not current.enabled:raise ValueError('Autobooking is gestopt. Er is niets geboekt.')
+        latest=current_preferences()
+        if payment_mode(latest)!=mode or (kind=='rule' and (not latest.get('automatic_payment') or Decimal(str(latest.get('max_amount',0)))<amount)):
+            raise ValueError('Je instellingen zijn gewijzigd. Er is niets geboekt.')
+        if rule:
+            current=rules.get_rule(rule.id)
+            if not current or not current.enabled:raise ValueError('Autobooking is gestopt. Er is niets geboekt.')
         _reservation_started=True
         result = book(client,slot,member_id=int(me["id"]),me=me,expected_amount=amount,label=rule.notes if rule else "Sigmadvisor",payment_mode=mode)
-        if result.payment_url and _prepared_delivery:
-            service.queue_payment(os.environ['PADELWEB_USER_ID'],result.sale_id,result.payment_url,amount,slot.start_iso,_prepared_delivery)
-        elif _prepared_delivery:
-            service.close_prepared(os.environ['PADELWEB_USER_ID'],os.environ['PADELWEB_JOB_ID'],_prepared_delivery,confirmed=result.paid)
+        payment_via_discord=False
+        if result.payment_url:
+            payment_via_discord=service.queue_payment(os.environ['PADELWEB_USER_ID'],result.sale_id,result.payment_url,amount,slot.start_iso,booking_id=result.booking_id)
         if payload.get('draft_id') and result.booking_id:
             DraftStore(platform_context()).converted(payload['draft_id'],result.booking_id,result.paid)
         elif payload.get('draft_id'):
@@ -240,8 +228,8 @@ def execute(kind: str, payload: dict) -> dict:
             booking_id=result.booking_id,target_slot_iso=slot.start_dt.astimezone(ZoneInfo("Europe/Brussels")).isoformat(),
             error=None if result.paid else "Betaling nog niet bevestigd; controleer KU Leuven Sport.")
         return {"sale_id":result.sale_id,"booking_id":result.booking_id,"paid":result.paid,
-                "amount":str(amount),"payment_via_discord":bool(result.payment_url and _prepared_delivery),
-                "message":"Geboekt en betaald." if result.paid else "Betaallink wordt via Discord verstuurd. Nog niet bevestigd." if result.payment_url and _prepared_delivery else "Reservatie aangemaakt. Controleer de betaling in KU Leuven Sport."}
+                "amount":str(amount),"target":slot.start_iso,"payment_available":bool(result.payment_url),"payment_via_discord":payment_via_discord,
+                "message":"Je hebt geboekt." if result.paid else "Betaal om je boeking te bevestigen." if result.payment_url else "Reservatie aangemaakt. Controleer de betaling in KU Leuven Sport."}
 
 
 def main():

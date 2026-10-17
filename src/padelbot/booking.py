@@ -701,12 +701,14 @@ def _book(
                 me = client.me()
             if payment_mode=='discord':
                 from .payment import create_payment
-                method=PayMethod.CREDIT_CARD
+                # The private link is a fallback after a fully covering KUL
+                # balance. No mandate or saved card is charged in link mode.
+                method=PayMethod.ACCOUNT if Decimal(str(me.get('balance') or 0))>=Decimal(str(amount)) else PayMethod.CREDIT_CARD
                 resp=create_payment(client,sale_id=int(sale_id),member_id=member_id,amount=float(amount),method=method)
             elif payment_mode=='kul':
                 from .platform_service import validate_payment
                 validate_payment(me,Decimal(str(amount)),'kul')
-                method,resp=_auto_pay(client,sale_id=int(sale_id),member_id=member_id,amount=float(amount),me=me)
+                method,resp=_auto_pay(client,sale_id=int(sale_id),member_id=member_id,amount=float(amount),me=me,allow_direct_debit=False)
             else:
                 method, resp = _auto_pay(client, sale_id=int(sale_id), member_id=member_id, amount=float(amount), me=me)
             result.pay_method = method.name

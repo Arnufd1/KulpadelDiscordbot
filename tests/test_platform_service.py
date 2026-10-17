@@ -40,14 +40,12 @@ def test_linked_discord_and_web_use_one_identity_and_one_booking_job(portal):
     with pytest.raises(ValueError):service.discord_user(12345)
 
 
-def test_payment_link_requires_linked_live_discord_before_reservation(portal):
+def test_website_payment_link_booking_does_not_require_discord(portal):
     app,_,store,(_,alice,_)=portal;service=app.state.platform
     store.preferences(alice['id'],{'payment_mode':'discord'})
     payload={'product':100,'court':200,'target':'2030-01-01T18:00:00Z','amount':12}
-    with pytest.raises(ValueError,match='Koppel Discord'):service.enqueue(alice,'book',payload)
-    service.hub.register(alice);service.hub.link(alice['id'],12345)
-    with pytest.raises(ValueError,match='offline'):service.enqueue(alice,'book',payload)
-    assert client_jobs(store)==0
+    assert service.enqueue(alice,'book',payload)
+    assert client_jobs(store)==1
 
 
 def client_jobs(store):
@@ -148,7 +146,7 @@ def test_discord_mode_creates_one_hosted_checkout_without_touching_saved_cards(m
     monkeypatch.setattr(payment,'auto_pay',lambda *a,**kw:pytest.fail('No automatic debit in Discord-link mode'))
     monkeypatch.setattr(worldline_driver,'load_card',lambda:pytest.fail('No card loaded in Discord-link mode'))
     slot=booking.Slot(100,200,'2030-01-01T18:00:00Z','2030-01-01T19:00:00Z',12,{})
-    result=booking.book(object(),slot,member_id=42,me={'id':42,'balance':100},expected_amount=Decimal(12),payment_mode='discord')
+    result=booking.book(object(),slot,member_id=42,me={'id':42,'balance':0},expected_amount=Decimal(12),payment_mode='discord')
     assert not result.paid and result.payment_url and len(calls)==1
     assert calls[0]['method']==payment.PayMethod.CREDIT_CARD
 
@@ -210,8 +208,10 @@ def test_preflight_and_checkout_edit_the_same_private_message(portal):
 
 @pytest.mark.parametrize('mode',['discord','kul'])
 @pytest.mark.parametrize('can_dm',[False,True])
-def test_shared_worker_stops_before_reserving_if_private_preflight_fails(portal,monkeypatch,can_dm,mode):
-    app,_,store,(_,alice,_)=portal;s=app.state.platform;s.hub.register(alice);s.hub.link(alice['id'],12345);heartbeat(s)
+def test_shared_worker_keeps_private_website_checkout_when_discord_unavailable(portal,monkeypatch,can_dm,mode):
+    app,_,store,(_,alice,_)=portal;s=app.state.platform
+    s.hub.register(alice)
+    if can_dm:s.hub.link(alice['id'],12345)
     store.preferences(alice['id'],{'automatic_payment':False,'payment_mode':mode,'max_amount':0})
     from padelbot import web_worker,client,booking,booking_manager,checkout
     from padelbot.config import settings
@@ -228,22 +228,18 @@ def test_shared_worker_stops_before_reserving_if_private_preflight_fails(portal,
     monkeypatch.setattr(booking,'find_slots',lambda *a,**kw:[slot]);monkeypatch.setattr(checkout,'slot_price',lambda *a:Decimal(12))
     monkeypatch.setattr(booking_manager,'list_my_bookings',lambda *a,**kw:[])
     def prepare(*a,**kw):
-        if not can_dm:raise ValueError('DM closed')
-        return {'channel_id':8,'message_id':9}
+        pytest.fail('Website checkout must not depend on a Discord preflight')
     monkeypatch.setattr(PlatformService,'prepare_delivery',prepare)
     writes=[]
     def reserve(*a,**kw):
         writes.append(kw);return SimpleNamespace(paid=False,sale_id=12,booking_id=55,payment_url='https://payment.direct.worldline-solutions.com/example')
     monkeypatch.setattr(booking,'book',reserve)
     payload={'product':100,'court':200,'target':slot.start_iso,'amount':12}
-    if not can_dm:
-        with pytest.raises(ValueError,match='DM closed'):web_worker.execute('book',payload)
-        assert not writes and not web_worker._reservation_started
-    else:
-        result=web_worker.execute('book',payload)
-        assert len(writes)==1 and writes[0]['payment_mode']==mode
-        assert result['payment_via_discord'] and not result['paid']
-        assert 'worldline' not in json.dumps(result)
+    result=web_worker.execute('book',payload)
+    assert len(writes)==1 and writes[0]['payment_mode']==mode
+    assert result['payment_via_discord']==can_dm and result['payment_available'] and not result['paid']
+    assert 'worldline' not in json.dumps(result)
+    assert s.private_payments(alice['id'])[0]['url']=='https://payment.direct.worldline-solutions.com/example'
 
 
 def test_tokenized_kul_methods_are_owner_bound_current_and_explicitly_preferred():
@@ -285,3 +281,168 @@ def test_kul_stored_card_requires_backend_confirmation_and_never_loads_vault(mon
     slot=booking.Slot(100,200,'2030-01-01T18:00:00Z','2030-01-01T19:30:00Z',12,{})
     result=booking.book(object(),slot,member_id=42,me={'id':42,'balance':0,'_stored_method':{'id':10,'type':3}},expected_amount=Decimal(12),payment_mode='kul')
     assert result.paid and not result.payment_url and calls[0]['stored_method_id']==10
+
+
+def test_private_website_checkout_survives_discord_delivery_and_is_tenant_bound(portal):
+    app,_,store,(_,alice,bob)=portal;s=app.state.platform
+    url='https://payment.direct.worldline-solutions.com/checkout/private-token'
+    assert s.queue_payment(alice['id'],100,url,12,'2030-01-01T18:00:00Z',booking_id=55) is False
+    payment=s.private_payments(alice['id'])[0]
+    assert payment['url']==url and payment['booking_id']==55 and payment['status']=='pending'
+    assert s.private_payments(bob['id'])==[]
+    with store.conn() as c:
+        row=c.execute('SELECT payload FROM private_payments WHERE user_id=?',(alice['id'],)).fetchone()
+        assert url not in row[0]
+        c.execute('INSERT INTO private_payments(user_id,sale_id,booking_id,payload,created) VALUES(?,?,?,?,?)',(bob['id'],100,55,row[0],time.time()))
+    assert s.private_payments(bob['id'])==[]
+    assert url not in store.path.read_bytes().decode('latin1')
+
+
+def test_confirmed_booking_and_fresh_reminder_are_sent_once_and_clear_payment(portal):
+    from datetime import datetime,timezone
+    from padelbot.discord_delivery import deliver_once
+    app,_,store,(_,alice,_)=portal;s=app.state.platform;s.hub.register(alice);s.hub.link(alice['id'],12345)
+    now=time.time();target=datetime.fromtimestamp(now+1790,timezone.utc).isoformat()
+    s.queue_payment(alice['id'],100,'https://payment.direct.worldline-solutions.com/private',12,target,booking_id=55)
+    s.queue_confirmed_booking(alice['id'],55,target,12)
+    s.queue_confirmed_booking(alice['id'],55,target,12)
+    assert s.private_payments(alice['id'])==[]
+    s.queue_due_reminders();s.queue_due_reminders()
+    messages=[]
+    class Recipient:
+        async def send(self,content,**kwargs):messages.append(content);return SimpleNamespace(id=9,channel=SimpleNamespace(id=8))
+    class Bot:
+        def get_user(self,ident):assert ident==12345;return Recipient()
+    for _ in range(4):asyncio.run(deliver_once(Bot(),s))
+    assert len(messages)==2
+    assert messages[0].startswith('Je hebt geboekt.')
+    assert messages[1].startswith('Padel begint over 30 minuten.')
+
+
+def test_reminders_require_fresh_confirmed_kul_snapshot_and_ignore_cancelled(portal):
+    from datetime import datetime,timezone
+    from padelbot.discord_delivery import deliver_once
+    app,_,store,(_,alice,_)=portal;s=app.state.platform;s.hub.register(alice);s.hub.link(alice['id'],12345)
+    now=time.time();target=datetime.fromtimestamp(now+1790,timezone.utc).isoformat()
+    booking={'id':55,'start':target,'confirmed':True}
+    s.sync_verified_bookings(alice['id'],[booking],device_verified=True)
+    assert s.delivery_status(alice['id'])==[]  # Historical lookup is not a new booking.
+    with store.conn() as c:c.execute('UPDATE booking_notifications SET verified=?',(now-301,))
+    s.queue_due_reminders()
+    assert s.delivery_status(alice['id'])==[]
+    assert s.users_needing_booking_refresh()==[alice['id']]
+    s.sync_verified_bookings(alice['id'],[booking],device_verified=True)
+    s.queue_due_reminders()
+    s.sync_verified_bookings(alice['id'],[],device_verified=True)
+    class Bot:
+        def get_user(self,_):pytest.fail('Cancelled reservation must not send a reminder')
+    asyncio.run(deliver_once(Bot(),s))
+    assert s.delivery_status(alice['id'])[0]['status']=='cancelled'
+
+
+def test_pending_payment_confirmation_from_kul_read_not_paidfor_alone(portal):
+    app,_,store,(_,alice,_)=portal;s=app.state.platform;s.hub.register(alice);s.hub.link(alice['id'],12345)
+    target='2030-01-01T18:00:00Z'
+    s.queue_payment(alice['id'],100,'https://payment.direct.worldline-solutions.com/private',12,target,booking_id=55)
+    s.sync_verified_bookings(alice['id'],[{'id':55,'start':target,'paid':True,'confirmed':False}],device_verified=True)
+    assert len(s.private_payments(alice['id']))==1
+    s.sync_verified_bookings(alice['id'],[{'id':55,'start':target,'paid':True,'confirmed':True}],device_verified=False)
+    assert len(s.private_payments(alice['id']))==1
+    s.sync_verified_bookings(alice['id'],[{'id':55,'start':target,'paid':True,'confirmed':True}],device_verified=True)
+    assert not s.private_payments(alice['id'])
+    with store.conn() as c:
+        assert c.execute("SELECT count(*) FROM discord_deliveries WHERE id LIKE 'booked:%'").fetchone()[0]==1
+
+
+def test_kul_sale_confirmation_finds_checkout_when_initial_booking_id_was_delayed(portal):
+    app,_,store,(_,alice,_)=portal;s=app.state.platform;s.hub.register(alice);s.hub.link(alice['id'],12345)
+    target='2030-01-01T18:00:00Z'
+    s.queue_payment(alice['id'],100,'https://payment.direct.worldline-solutions.com/private',12,target)
+    s.sync_verified_bookings(alice['id'],[{'id':55,'sale_id':999,'start':target,'confirmed':True}],device_verified=True)
+    assert len(s.private_payments(alice['id']))==1
+    s.sync_verified_bookings(alice['id'],[{'id':55,'sale_id':100,'start':target,'confirmed':True}],device_verified=True)
+    assert not s.private_payments(alice['id'])
+    with store.conn() as c:
+        assert c.execute('SELECT booking_id,status FROM private_payments WHERE user_id=?',(alice['id'],)).fetchone()['booking_id']==55
+
+
+@pytest.mark.parametrize('mode',['kul','discord'])
+def test_modern_checkout_uses_covering_balance_before_credit_card(monkeypatch,tmp_path,mode):
+    from padelbot import booking,payment,worldline_driver
+    from padelbot.config import settings
+    monkeypatch.setattr(settings,'padelbot_rules_file',tmp_path/'rules.sqlite3')
+    monkeypatch.setattr(booking,'add_to_cart',lambda *a,**kw:None)
+    monkeypatch.setattr(booking,'create_sale',lambda *a,**kw:{'id':12,'total':12})
+    monkeypatch.setattr(booking,'fetch_booking_id',lambda *a:55)
+    calls=[]
+    monkeypatch.setattr(payment,'create_payment',lambda *a,**kw:calls.append(kw) or {})
+    monkeypatch.setattr(payment,'wait_for_payment_confirmation',lambda *a,**kw:True)
+    monkeypatch.setattr(worldline_driver,'load_card',lambda:pytest.fail('No legacy card vault'))
+    slot=booking.Slot(100,200,'2030-01-01T18:00:00Z','2030-01-01T19:30:00Z',12,{})
+    result=booking.book(object(),slot,member_id=42,me={'id':42,'balance':12,'directDebitMandate':True,'directDebitSpec':42},expected_amount=Decimal(12),payment_mode=mode)
+    assert result.paid and not result.payment_url and len(calls)==1
+    assert calls[0]['method']==payment.PayMethod.ACCOUNT
+
+
+def test_modern_card_mode_never_substitutes_direct_debit():
+    with pytest.raises(ValueError):validate_payment({'balance':0,'directDebitMandate':True,'directDebitSpec':42},Decimal(12),'kul')
+    with pytest.raises(ValueError):validate_payment({'balance':0,'_stored_method':{'id':10,'type':2}},Decimal(12),'kul')
+
+
+def test_upcoming_existing_booking_gets_one_fresh_check_then_stops_polling(portal):
+    from datetime import datetime,timezone
+    app,_,store,(_,alice,_)=portal;s=app.state.platform;s.hub.register(alice);s.hub.link(alice['id'],12345)
+    now=time.time();target=datetime.fromtimestamp(now+1790,timezone.utc).isoformat()
+    end=datetime.fromtimestamp(now+7190,timezone.utc).isoformat()
+    s.community.sync(alice['id'],[{'id':55,'start':target,'end':end,'confirmed':True}],device_verified=True)
+    assert s.users_needing_booking_refresh()==[alice['id']]
+    s.sync_verified_bookings(alice['id'],[{'id':55,'start':target,'confirmed':True}],device_verified=True)
+    s.queue_due_reminders()
+    assert s.users_needing_booking_refresh(now=now+121)==[]
+
+
+def test_reminder_checks_exact_booking_even_when_another_same_time_is_cancelled(portal):
+    from datetime import datetime,timezone
+    from padelbot.discord_delivery import deliver_once
+    app,_,store,(_,alice,_)=portal;s=app.state.platform;s.hub.register(alice);s.hub.link(alice['id'],12345)
+    now=time.time();target=datetime.fromtimestamp(now+1790,timezone.utc).isoformat()
+    s.sync_verified_bookings(alice['id'],[{'id':54,'start':target,'confirmed':True},{'id':55,'start':target,'confirmed':True}],device_verified=True)
+    s.sync_verified_bookings(alice['id'],[{'id':55,'start':target,'confirmed':True}],device_verified=True)
+    s.queue_due_reminders()
+    messages=[]
+    class Recipient:
+        async def send(self,content,**kwargs):messages.append(content);return SimpleNamespace(id=9,channel=SimpleNamespace(id=8))
+    class Bot:
+        def get_user(self,_):return Recipient()
+    asyncio.run(deliver_once(Bot(),s))
+    assert len(messages)==1 and messages[0].startswith('Padel begint over 30 minuten.')
+
+
+def test_notification_failure_cannot_turn_successful_payment_into_retry(portal,monkeypatch):
+    from padelbot.web_runtime import JobRunner
+    app,_,store,(_,alice,_)=portal;s=app.state.platform
+    payload={'product':100,'court':200,'target':'2030-01-01T18:00:00Z','amount':12}
+    ident=s.enqueue(alice,'book',payload)
+    def unavailable(*args,**kwargs):raise OSError('Simulated notification storage outage')
+    monkeypatch.setattr(PlatformService,'queue_confirmed_booking',unavailable)
+    JobRunner(store).finish(ident,'done',{'paid':True,'booking_id':55,'sale_id':12,'amount':'12'})
+    outcome=store.job(alice['id'],ident)
+    assert outcome['status']=='done' and outcome['result']['paid'] is True
+    assert s.enqueue(alice,'book',payload)==ident
+
+
+@pytest.mark.parametrize('state',['paid','expired','started'])
+def test_delayed_discord_checkout_does_not_send_unusable_payment_link(portal,state):
+    from datetime import datetime,timezone
+    from padelbot.discord_delivery import deliver_once
+    app,_,store,(_,alice,_)=portal;s=app.state.platform
+    s.hub.register(alice);s.hub.link(alice['id'],12345)
+    target=datetime.fromtimestamp(time.time()+(-60 if state=='started' else 3600),timezone.utc).isoformat()
+    s.queue_payment(alice['id'],100,'https://payment.direct.worldline-solutions.com/private',12,target,booking_id=55)
+    with store.conn() as c:
+        if state=='paid':c.execute("UPDATE private_payments SET status='paid'")
+        if state=='expired':c.execute('UPDATE private_payments SET created=?',(time.time()-3601,))
+    class Bot:
+        def get_user(self,_):pytest.fail('An unusable payment link must not be sent')
+    asyncio.run(deliver_once(Bot(),s))
+    assert s.delivery_status(alice['id'])[0]['status']=='cancelled'

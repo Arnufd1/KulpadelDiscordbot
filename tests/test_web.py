@@ -358,10 +358,46 @@ def test_only_owner_can_discover_or_request_admin(portal):
     for user in (alice,bob):
         headers=sign_in(client,store,user)
         profile=client.get('/api/me').json()
-        assert profile['owner'] is False and profile['admin'] is False
+        assert profile['owner'] is False and profile['admin'] is False and profile['admin_eligible'] is False
         assert client.get('/api/admin/users').status_code==403
         assert client.post('/api/admin/access',json={},headers=headers).status_code==403
         assert client.post('/api/admin/users/'+owner['id']+'/toggle',json={},headers=headers).status_code==403
+
+
+def test_admin_navigation_requires_google_owner_and_unexpired_tailscale_proof(portal):
+    _,client,store,(owner,alice,_)=portal
+    token,_=store.new_session(owner['id']);client.cookies.set('padel_session',token)
+    assert client.get('/api/me').json()['admin_eligible'] is False
+    ticket=store.admin_ticket(token)
+    assert store.verify_admin_ticket(ticket,owner['email']) and store.activate_admin(ticket,token)
+    assert client.get('/api/me').json()['admin_eligible'] is True
+    from padelbot.web_store import digest
+    with store.conn() as c:c.execute('UPDATE sessions SET admin_until=0 WHERE token=?',(digest(token),))
+    assert client.get('/api/me').json()['admin_eligible'] is False
+    assert client.get('/api/admin/users').status_code==403
+    # Even a mistaken owner bit on another Google account cannot disclose administration.
+    with store.conn() as c:
+        c.execute('UPDATE users SET owner=0 WHERE id=?',(owner['id'],))
+        c.execute('UPDATE users SET owner=1 WHERE id=?',(alice['id'],))
+    headers=sign_in(client,store,alice)
+    assert client.get('/api/me').json()['owner'] is False
+    assert client.post('/api/admin/access',json={},headers=headers).status_code==403
+
+
+def test_checkout_link_is_private_to_booking_profile(portal):
+    app,client,store,(owner,alice,bob)=portal
+    url='https://payment.direct.worldline-solutions.com/private-checkout'
+    app.state.platform.queue_payment(alice['id'],777,url,'12.00','2027-01-01T18:00:00+01:00',booking_id=888)
+    assert client.get('/api/payments').status_code==401
+    for user in (owner,bob):
+        sign_in(client,store,user)
+        assert client.get('/api/payments').json()=={'payments':[]}
+    sign_in(client,store,alice)
+    payments=client.get('/api/payments').json()['payments']
+    assert len(payments)==1 and payments[0]['url']==url
+    assert payments[0]['sale_id']==777
+    for path in [store.path,store.path.with_name(store.path.name+'-wal')]:
+        if path.exists():assert b'private-checkout' not in path.read_bytes()
 
 
 def test_cards_are_encrypted_in_database_and_never_return_full_number(portal):
@@ -443,7 +479,9 @@ def test_community_only_shares_verified_own_confirmed_reservations(portal):
     assert client.post('/api/community/share',json={'booking_id':123,'shared':True},headers=headers).status_code==400
     community.sync(alice['id'],[booking],device_verified=True)
     assert client.get('/api/community').json()['matches']==[]
-    assert client.post('/api/community/share',json={'booking_id':123,'shared':True},headers=headers).status_code==200
+    shared=client.post('/api/community/share',json={'booking_id':123,'shared':True},headers=headers)
+    assert shared.status_code==200
+    assert shared.json()['url']=='http://testserver/#match/'+shared.json()['id']
     headers=sign_in(client,store,bob)
     assert client.post('/api/community/share',json={'booking_id':123,'shared':True},headers=headers).status_code==400
     match=client.get('/api/community').json()['matches'][0]
@@ -456,6 +494,26 @@ def test_community_only_shares_verified_own_confirmed_reservations(portal):
     community.sync(alice['id'],[],device_verified=True)
     assert client.get('/api/community').json()['matches']==[]
     with pytest.raises(ValueError):community.join_verified(match['id'],bob['id'])
+
+
+def test_stale_invitation_refreshes_only_its_host_without_exposing_host_job(portal):
+    app,client,store,(_,alice,bob)=portal;community=app.state.community
+    community.sync(alice['id'],[community_booking()],device_verified=True)
+    community.share(alice['id'],123,True)
+    match=community.list(bob['id'])[0]
+    headers=sign_in(client,store,bob)
+    path='/api/community/'+match['id']+'/refresh'
+    assert client.post(path,json={},headers=headers).json()=={'refreshing':False}
+    with community.matches._connection() as c:
+        c.execute('UPDATE shared_matches SET hub_verified=? WHERE id=?',(time.time()-700,match['id']))
+    for _ in range(2):
+        response=client.post(path,json={},headers=headers)
+        assert response.status_code==200 and response.json()=={'refreshing':True}
+    with store.conn() as c:jobs=c.execute('SELECT id,user_id,kind FROM jobs').fetchall()
+    assert len(jobs)==1 and jobs[0]['user_id']==alice['id'] and jobs[0]['kind']=='bookings'
+    assert client.get('/api/jobs/'+jobs[0]['id']).status_code==404
+    community.share(alice['id'],123,False)
+    assert client.post(path,json={},headers=headers).status_code==400
 
 
 def test_community_capacity_is_atomic_and_rescheduling_revokes_participation(portal):

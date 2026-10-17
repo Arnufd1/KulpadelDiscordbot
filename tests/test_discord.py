@@ -30,7 +30,7 @@ def test_group_commands_registered_globally_even_with_test_server(tmp_path, monk
             await bot.setup_hook()
             assert requests[0][0] is None
             commands = {c["name"]: c for c in requests[0][1]}
-            assert set(commands) == {"checkbookings", "autobook", "bookings", "watcher", "koppel"}
+            assert set(commands) == {"checkbookings", "autobook", "bookings", "watcher", "koppel", "deel"}
             for name in commands:
                 assert set(commands[name]["contexts"]) == {0, 1, 2}
                 assert set(commands[name]["integration_types"]) == {0, 1}
@@ -41,7 +41,7 @@ def test_group_commands_registered_globally_even_with_test_server(tmp_path, monk
             assert day["required"] is False
             assert [r[0] for r in requests] == ([None, guild_id] if guild_id else [None])
             if guild_id:
-                assert {c["name"] for c in requests[1][1]} == {"checkbookings", "autobook", "bookings", "watcher", "koppel"}
+                assert {c["name"] for c in requests[1][1]} == {"checkbookings", "autobook", "bookings", "watcher", "koppel", "deel"}
             options = {option["name"]: option for option in commands["watcher"]["options"]}
             assert options["dag"]["min_value"] == 0 and options["dag"]["max_value"] == 365
             assert options["van"]["max_value"] == 23 and options["tot"]["max_value"] == 24
@@ -167,6 +167,25 @@ def test_expired_panel_denies_other_group_members_before_reading(tmp_path, monke
             assert "Not authorized" in it.events[0][1]["content"]
         finally:
             await bot.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('owner',[True,False])
+def test_expired_legacy_panel_uses_shared_profile_worker_in_platform_mode(tmp_path,monkeypatch,owner):
+    from padelbot import discord_platform
+    async def legacy(*args):pytest.fail('Platform recovery must not read the global owner account')
+    monkeypatch.setattr(ui.BookingsView,'load',legacy)
+    calls=[]
+    async def modern(interaction,service,kind):calls.append((interaction.user.id,service,kind))
+    monkeypatch.setattr(discord_platform,'command',modern)
+    async def run():
+        bot=recovery_bot(tmp_path,monkeypatch);bot.platform=object()
+        it=component_interaction(bot,user=42 if owner else 43)
+        try:
+            await bot.on_interaction(it)
+            assert calls==([(42,bot.platform,'bookings')] if owner else [])
+            if not owner:assert it.events[0][1]['ephemeral'] is True
+        finally:await bot.close()
     asyncio.run(run())
 
 

@@ -105,6 +105,14 @@ class GroupMatchView(discord.ui.View):
             await interaction.response.send_message("Alleen de organisator kan dit groepsbericht verwijderen.", ephemeral=True)
             return
         await interaction.response.defer()
+        match=self.store.get(self.match_id)
+        if action=='join' and match.hub_profile_id and getattr(interaction.client,'platform',None) is not None:
+            from .discord_platform import refresh_match
+            try:await refresh_match(interaction.client.platform,match)
+            except ValueError as error:
+                await interaction.followup.send(str(error),ephemeral=True)
+                await self.update(interaction,self.store.get(self.match_id))
+                return
         async with self.lock:
             try:
                 post = await asyncio.to_thread(self.store.bind_post, self.post_id, interaction.channel_id, interaction.message.id)
