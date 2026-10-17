@@ -54,6 +54,34 @@ def has_direct_debit_mandate(me: dict[str, Any]) -> bool:
     return bool(me.get("directDebitMandate"))
 
 
+def stored_methods(client,member_id):
+    """USC's own person-scoped tokenized methods; never PAN or CVC."""
+    from datetime import datetime,timezone
+    out=client.get('/stored-pay-methods',params={'s':{'personId':member_id},'limit':100})
+    data=out.get('data',[]) if isinstance(out,dict) else out
+    valid=[];now=datetime.now(timezone.utc)
+    for value in data if isinstance(data,list) else []:
+        if (not isinstance(value,dict) or value.get('personId')!=member_id or type(value.get('id')) is not int
+            or value['id']<=0 or value.get('type') not in {2,3} or value.get('paymentProviderType')!=PAYMENT_PROVIDER_OGONE):continue
+        if value.get('expirationDate'):
+            try:
+                expiry=datetime.fromisoformat(value['expirationDate'].replace('Z','+00:00'))
+                if (expiry.year,expiry.month)<=(now.year,now.month):continue
+            except (ValueError,TypeError):continue
+        valid.append({'id':value['id'],'type':value['type'],'paymentProviderType':PAYMENT_PROVIDER_OGONE,'preferred':value.get('preferred') is True})
+    return valid
+
+
+def attach_stored_method(client,me):
+    me=dict(me)
+    try:
+        methods=stored_methods(client,int(me['id']))
+        preferred=next((m for m in methods if m['preferred']),None)
+        if preferred or len(methods)==1:me['_stored_method']=preferred or methods[0]
+    except Exception:pass  # Unavailable/unverified methods cannot authorise a payment.
+    return me
+
+
 def create_payment(
     client: BackboneClient,
     *,
@@ -61,6 +89,7 @@ def create_payment(
     member_id: int,
     amount: float,
     method: PayMethod,
+    stored_method_id: int | None = None,
 ) -> dict[str, Any]:
     """Start checkout once. The server supplies its own hosted payment URL.
 
@@ -68,6 +97,10 @@ def create_payment(
     Never retry a write when its outcome is unknown.
     """
     with _payment_lock:
+        if stored_method_id is not None:
+            selected=next((m for m in stored_methods(client,member_id) if m['id']==stored_method_id),None)
+            if not selected or method!=(PayMethod.CREDIT_CARD if selected['type']==3 else PayMethod.DIRECT_DEBIT):
+                raise RuntimeError('The linked KUL payment method is no longer available; no payment requested')
         sale = client.get(f"/sales/{sale_id}", params={
             "s": {"id": sale_id, "customerPersonId": member_id}, "join": "payments",
         })
@@ -87,7 +120,7 @@ def create_payment(
         if has_pending_payment(sale):
             raise PaymentStateUnknownError("An existing payment is pending; check this sale before paying again")
         body = {
-            "storedPayMethodId": None,
+            "storedPayMethodId": stored_method_id,
             "payMethod": int(method),
             "onSuccessRedirectUrl": "https://usc.kuleuven.cloud/sales/callback",
             "createStoredPayMethod": False,
@@ -230,6 +263,12 @@ def auto_pay(
             client, sale_id=sale_id, member_id=member_id,
             amount=amount, method=PayMethod.DIRECT_DEBIT,
         )
+
+    stored=me.get('_stored_method')
+    if stored:
+        method=PayMethod.CREDIT_CARD if stored['type']==3 else PayMethod.DIRECT_DEBIT
+        return method,create_payment(client,sale_id=sale_id,member_id=member_id,amount=amount,
+            method=method,stored_method_id=stored['id'])
 
     # Last resort: credit card via Worldline. Server creates the payment intent
     # and (we expect) returns a checkout URL or session id. Caller should

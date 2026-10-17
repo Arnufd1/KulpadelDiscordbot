@@ -1,92 +1,68 @@
 <!doctype html>
-<html lang="nl">
-<head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-  <meta name="description" content="Jouw padelplanning, eenvoudig geregeld. Persoonlijke boekingen bij KU Leuven Sport met Sigmadvisor.">
-  <meta name="theme-color" content="#171c19"><title>Padel · Sigmadvisor</title>
-  <link rel="icon" href="/assets/sigma-logo.png"><link rel="stylesheet" href="/assets/style.css">
-  <script src="/assets/app.js" defer></script>
-</head>
-<body>
-  <div id="login" class="welcome" hidden>
-    <section class="welcome-brand"><a href="/" class="wordmark"><img src="/assets/sigma-logo.png" alt="Sigmadvisor leeuw"><span>SIGMADVISOR</span></a>
-      <div class="welcome-copy"><h1>Sigmadvisor Padel</h1><p>Beschikbaarheid, boekingen en vaste speelmomenten.</p></div>
-      <div class="court-art" aria-hidden="true"><div class="court-lines"><i></i><b></b></div><span class="ball"></span></div>
-
-    </section>
-    <section class="welcome-form"><h2>Aanmelden</h2><a class="google-button" href="/auth/google"><span class="google-g">G</span> Verder met Google</a><p class="login-note">Gebruik je Google-account. Koppel daarna je KU Leuven-account.</p></section>
-  </div>
-
-  <div id="app" class="app" hidden>
-    <aside class="sidebar"><a class="wordmark" href="/"><img src="/assets/sigma-logo.png" alt="Sigmadvisor"><span>SIGMADVISOR</span></a>
-      <nav aria-label="Hoofdnavigatie"><button data-page="slots" class="active"><span>◫</span> <span class="nav-label">Beschikbaarheid</span><span class="nav-mobile">Vrij</span></button><button data-page="bookings"><span>▤</span> <span class="nav-label">Mijn boekingen</span><span class="nav-mobile">Boekingen</span></button><button data-page="online"><span>+</span> <span class="nav-label">Online boekingen</span><span class="nav-mobile">Online</span></button><button data-page="rules"><span>↻</span> <span class="nav-label">Autobooking</span><span class="nav-mobile">Autobook</span></button><button data-page="settings"><span>⚙</span> <span class="nav-label">Instellingen</span><span class="nav-mobile">Profiel</span></button><button data-page="admin" id="admin-nav" hidden><span>♙</span> <span class="nav-label">Beheer</span><span class="nav-mobile">Beheer</span></button></nav>
-      <div class="sidebar-bottom"><div class="connection"><span id="connection-dot"></span><span id="connection-label">Account koppelen</span></div><div class="profile"><div id="avatar" class="avatar">A</div><div><strong id="profile-name"></strong></div><button id="logout" aria-label="Afmelden" title="Afmelden">↗</button></div></div>
-    </aside>
-    <main>
-      <div class="page-head"><h1 id="page-title">Beschikbaarheid</h1><span id="today" class="date-label"></span></div>
-      <div id="setup-banner" class="banner" hidden><div><strong>Koppel je KU Leuven-account</strong><p>Maak je persoonlijke authenticator klaar om beschikbaarheid en boekingen te bekijken.</p></div><button class="button dark" data-page="settings">Account koppelen ↗</button></div>
-      <div id="status" class="status" role="status" hidden></div>
-
-      <section id="page-slots" class="page"><div class="toolbar"><div class="day-presets" aria-label="Snelle dagkeuze"><button data-range="0,0">Vandaag</button><button data-range="1,1">Morgen</button><button data-range="2,2">Overmorgen</button><button data-range="0,5" class="selected">Nu t/m dag 5</button></div><button id="refresh-slots" class="button light">↻ &nbsp; Vernieuwen</button></div><div class="range-row"><label>Van dag <input id="range-start" type="number" min="0" max="30" value="0"></label><span>tot en met</span><label>dag <input id="range-end" type="number" min="0" max="30" value="5"></label><button id="apply-range" class="text-button">Toon periode →</button></div><div id="slot-summary" class="section-label">Vrije terreinen</div><div id="slots" class="slots"><div class="empty"><span class="empty-icon">◫</span><h3>Vrije terreinen</h3><p>Klik op Vernieuwen om de actuele vrije terreinen te laden.</p></div></div><div class="footnote">Tijden in Brussel · Beschikbaarheid kan wijzigen tot je boeking bevestigd is.</div></section>
-
-      <section id="page-bookings" class="page" hidden><div class="toolbar"><button id="refresh-bookings" class="button light">↻ &nbsp; Vernieuwen</button></div><div id="bookings"></div><a class="external-link" href="https://usc.kuleuven.cloud/" target="_blank" rel="noopener">Boekingen en betalingen beheren bij KU Leuven Sport ↗</a></section>
-
-      <section id="page-online" class="page" hidden><div class="toolbar"><div class="day-presets" aria-label="Type match"><button data-community-filter="all" class="selected">Alle</button><button data-community-filter="confirmed">Bevestigd</button><button data-community-filter="draft">Drafts</button></div><button id="refresh-online" class="button light">Vernieuwen</button></div><div id="online-matches"></div><p class="help">Deelnemers en aantallen zijn gedeeld met Discord. Een draft is een onbetaald voorstel.</p><details class="draft-help"><summary>Hoe werkt een draft?</summary><p>De winkelwagen wordt elke 45 minuten gecontroleerd zolang het slot beschikbaar is. Meer dan 48 uur vooraf: maximaal 24 uur. Tussen 16 en 48 uur: 6 uur. Binnen 16 uur: 45 minuten. Een strengere tijdsgrens verkort de looptijd. Alleen de organisator kan daarna boeken en betalen. Een winkelwagenitem garandeert geen terrein.</p></details></section>
-
-      <section id="page-rules" class="page" hidden><div class="two-columns"><div><div id="rules"></div></div><form id="rule-form" class="panel"><h3>Wekelijks speelmoment</h3><label>Dag<select id="rule-day"><option value="0">Maandag</option><option value="1">Dinsdag</option><option value="2">Woensdag</option><option value="3">Donderdag</option><option value="4">Vrijdag</option><option value="5">Zaterdag</option><option value="6">Zondag</option></select></label><div class="input-pair"><label>Vroegste start<input id="rule-start" type="time" value="18:00" required></label><label>Laatste start<input id="rule-end" type="time" value="20:00" required></label></div><label>Notitie <span class="optional">optioneel</span><input id="rule-notes" maxlength="100" placeholder="Bijvoorbeeld: dinsdag met de vrienden"></label><p class="help">We proberen één terrein binnen dit startvenster te boeken wanneer KUL de reservaties opent. Automatisch betalen moet ingeschakeld zijn.</p><button class="button dark" type="submit">Speelmoment toevoegen +</button></form></div></section>
-
-      <section id="page-settings" class="page" hidden>
-        <div class="two-columns">
-          <div class="panel"><h3>KUL-account</h3><div id="device-state" class="account-state"></div><div class="button-row"><button id="start-device" class="button dark">KUL koppelen</button><button id="test-account" class="button light">Controleren</button></div></div>
-          <form id="payment-form" class="panel"><h3>Autobooking</h3><div id="payment-state"></div><label class="checkbox"><input id="auto-pay" type="checkbox"> Automatisch boeken</label><label>Maximum per boeking (&euro;)<input id="max-amount" type="number" min="0" max="100" step="0.01" value="0" required></label><div class="button-row"><button class="button dark" type="submit">Bewaren</button><a class="text-button" href="https://usc.kuleuven.cloud/" target="_blank" rel="noopener">KUL-betalingen &nearr;</a></div></form>
-        </div>
-        <form id="card-form" name="payment-card" class="panel activity-panel" autocomplete="on"><h3>Betaalkaarten</h3><div id="saved-card"></div><div class="card-fields"><label class="card-number-field">Kaartnummer<input id="card-number" name="cc-number" type="text" inputmode="numeric" maxlength="32" autocomplete="cc-number" required></label><label>Naam op de kaart<input id="card-holder" name="cc-name" type="text" maxlength="80" autocomplete="cc-name" required></label><label>Vervaldatum<input id="card-expiry" name="cc-exp" type="text" inputmode="numeric" maxlength="7" autocomplete="cc-exp" placeholder="MM/JJ" pattern="(0[1-9]|1[0-2])/[0-9]{2}([0-9]{2})?" required></label></div><button id="save-card" class="button dark" type="submit">Kaart toevoegen</button></form>
-        <div class="panel activity-panel"><h3>Discord</h3><p id="discord-status"></p><button id="link-discord" class="button light" type="button">Koppelen</button><div id="discord-link-code" hidden><p>Voer dit commando uit in Discord:</p><code id="discord-command"></code><button id="copy-discord-link" class="button light" type="button">Kopi&euml;ren</button></div></div>
-        <div class="panel activity-panel"><h3>Recente activiteit</h3><div id="activity"></div></div>
-      </section>
-
-      <section id="page-admin" class="page" hidden><div id="admin-gate" class="panel"><h3>Beheer</h3><p>Bevestig je Tailscale-identiteit om alle profielen te bekijken. Je Google-login blijft vereist.</p><button id="verify-admin" class="button dark">Beheertoegang bevestigen ↗</button></div><div id="admin-users"></div></section>
-
-    </main>
-  </div>
-
-  <dialog id="booking-dialog"><button class="dialog-close" data-close="booking-dialog" aria-label="Sluiten">×</button><h2>Boeking bevestigen</h2><div id="booking-detail"></div><p class="help">Je boekt en betaalt met jouw gekoppelde KUL-account. De prijs wordt vóór betaling opnieuw gecontroleerd.</p><div class="dialog-actions"><button id="confirm-book" class="button dark">Boeken en betalen</button><button id="create-draft" class="button light">Voorstel maken (draft)</button></div></dialog>
+<html lang="nl"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#172b23"><meta name="description" content="Sigmadvisor Padel"><title>Padel &middot; Sigmadvisor</title>
+<link rel="icon" href="/assets/sigma-logo.png"><link rel="stylesheet" href="/assets/style.css"><script src="/assets/app.js" defer></script>
+</head><body>
+<section id="login" class="login" hidden><a class="wordmark" href="/"><img src="/assets/sigma-logo.png" alt=""><span>SIGMADVISOR <b>PADEL</b></span></a><div class="login-card"><h1>Padel</h1><a class="google-button" href="/auth/google"><span class="google-g">G</span> Verder met Google</a></div></section>
+<div id="app" class="app" hidden>
+<header class="app-header"><a class="wordmark" href="/#dashboard"><img src="/assets/sigma-logo.png" alt="Sigmadvisor"><span>SIGMADVISOR <b>PADEL</b></span></a><nav aria-label="Navigatie"><button data-page="dashboard" class="active">Dashboard</button><button data-page="online">Matches</button><button data-page="admin" id="admin-nav" hidden>Beheer</button></nav><div class="profile"><span id="profile-name"></span><button id="avatar" data-page="settings" aria-label="Profiel"></button><button id="logout" class="text-button" aria-label="Afmelden">Afmelden</button></div></header>
+<main><div class="page-head"><h1 id="page-title">Dashboard</h1><span id="today" class="date-label"></span></div><div id="status" class="status" role="status" hidden></div><div id="setup-banner" hidden></div><span id="connection-dot" hidden></span><span id="connection-label" hidden></span>
+<section id="page-dashboard" class="page">
+<div class="setup-grid">
+ <div class="setup-item"><span>KUL</span><strong id="setup-kul-state">Niet gekoppeld</strong><button class="text-button" data-open-setting="kul">Koppelen</button></div>
+ <div class="setup-item"><span>Discord</span><strong id="setup-discord-state">Niet gekoppeld</strong><a id="add-discord" class="text-button" href="/auth/discord">Toevoegen aan Discord &nearr;</a></div>
+ <div class="setup-item"><span>Betalen</span><strong id="setup-payment-state">Kies je betaalwijze</strong><button class="text-button" data-open-setting="payment">Instellen</button></div>
+</div>
+<div class="panel availability"><div class="section-head"><h2>Vrije momenten</h2><button id="refresh-slots" class="button dark">Zoeken</button></div><div class="day-presets" aria-label="Dag"><button data-range="0,0">Vandaag</button><button data-range="1,1">Morgen</button><button data-range="2,2">Overmorgen</button><button data-range="0,5" class="selected">Komende 5 dagen</button></div><details class="range-options"><summary>Andere periode</summary><div class="range-row"><label>Van dag<input id="range-start" type="number" min="0" max="30" value="0"></label><label>Tot dag<input id="range-end" type="number" min="0" max="30" value="5"></label><button id="apply-range" class="button light">Zoeken</button></div></details><div id="slot-summary" class="section-label"></div><div id="slots" class="slots"><p class="empty-line">Kies een dag en klik Zoeken.</p></div></div>
+<details id="my-bookings-panel" class="panel dashboard-detail"><summary>Mijn boekingen</summary><div class="section-head"><span></span><button id="refresh-bookings" class="button light">Vernieuwen</button></div><div id="bookings"></div><a class="text-button" href="https://usc.kuleuven.cloud/" target="_blank" rel="noopener">Beheren bij KUL &nearr;</a></details>
+<details id="autobook-panel" class="panel dashboard-detail"><summary>Autobooking</summary><div class="two-columns"><div><div id="rules"></div><label class="checkbox"><input id="auto-pay" type="checkbox" form="payment-form"> Wekelijks automatisch boeken</label><label>Limiet per boeking (&euro;)<input id="max-amount" type="number" min="0" max="100" step="0.01" value="0" form="payment-form"></label><button class="button light" type="submit" form="payment-form">Bewaren</button></div><form id="rule-form"><label>Dag<select id="rule-day"><option value="0">Maandag</option><option value="1">Dinsdag</option><option value="2">Woensdag</option><option value="3">Donderdag</option><option value="4">Vrijdag</option><option value="5">Zaterdag</option><option value="6">Zondag</option></select></label><div class="input-pair"><label>Vanaf<input id="rule-start" type="time" value="18:00" required></label><label>Tot<input id="rule-end" type="time" value="20:00" required></label></div><details class="inline-detail"><summary>Notitie</summary><input id="rule-notes" maxlength="100" aria-label="Notitie"></details><button class="button dark" type="submit">Moment toevoegen</button></form></div></details>
+<details id="profile-settings" class="panel dashboard-detail"><summary>Instellingen</summary><div class="settings-grid">
+ <section id="kul-settings"><div class="section-head"><h3>KUL</h3><span id="device-state" class="badge"></span></div><div class="button-row"><button id="start-device" class="button dark">KUL koppelen</button><button id="test-account" class="button light">Controleren</button></div></section>
+ <section id="discord-settings"><div class="section-head"><h3>Discord</h3><span id="discord-status" class="badge"></span></div><a class="button light" href="/auth/discord">Autoriseren &nearr;</a><details id="discord-fallback" class="inline-detail" hidden><summary>Profiel koppelen</summary><button id="link-discord" class="button light" type="button">Koppelcode</button><div id="discord-link-code" hidden><code id="discord-command"></code><button id="copy-discord-link" class="text-button" type="button">Kopi&euml;ren</button></div></details><details class="inline-detail"><summary>Zonder server gebruiken</summary><a class="text-button" href="/auth/discord?personal=true">Toevoegen aan mijn Discord &nearr;</a></details></section>
+ <form id="payment-form"><h3>Betalen</h3><label>Betaalwijze<select id="payment-mode"><option value="discord">Geen koppeling &middot; betaallink via Discord</option><option value="kul">Gekoppelde betaalmethode bij KUL</option></select></label><div id="payment-state"></div><div class="button-row"><button class="button dark" type="submit">Bewaren</button><a id="manage-payment" class="text-button" href="https://usc.kuleuven.cloud/members/profile/myshopping#storedpaymethodcard" target="_blank" rel="noopener">Betaalmethode bij KUL &nearr;</a><button id="check-payment" class="text-button" type="button">Controleren</button></div></form>
+</div><details class="inline-detail"><summary>Bewaarde kaarten</summary>        <form id="card-form" name="payment-card" class="card-form" autocomplete="on"><p class="help">Kaartkluis. Betalen koppel je bij KUL.</p><div id="saved-card"></div><div class="card-fields"><label class="card-number-field">Kaartnummer<input id="card-number" name="cc-number" type="text" inputmode="numeric" maxlength="32" autocomplete="cc-number" required></label><label>Naam op de kaart<input id="card-holder" name="cc-name" type="text" maxlength="80" autocomplete="cc-name" required></label><label>Vervaldatum<input id="card-expiry" name="cc-exp" type="text" inputmode="numeric" maxlength="7" autocomplete="cc-exp" placeholder="MM/JJ" pattern="(0[1-9]|1[0-2])/[0-9]{2}([0-9]{2})?" required></label></div><button id="save-card" class="button dark" type="submit">Kaart toevoegen</button></form>
+</details><details class="inline-detail"><summary>Activiteit</summary><div id="activity"></div></details></details>
+</section>
+<section id="page-online" class="page" hidden><div class="section-head"><div class="day-presets"><button data-community-filter="all" class="selected">Alle</button><button data-community-filter="confirmed">Bevestigd</button><button data-community-filter="draft">Voorstellen</button></div><button id="refresh-online" class="button light">Vernieuwen</button></div><div id="online-matches"></div><details class="inline-detail"><summary>Over voorstellen</summary><p>Onbetaald. Controle elke 45 minuten. Maximaal 24 uur bij meer dan 48 uur vooraf, 6 uur tussen 16-48 uur, 45 minuten binnen 16 uur. Geen definitieve reservatie voor betaling.</p></details></section>
+<section id="page-admin" class="page" hidden><div id="admin-gate" class="panel"><h3>Beheer</h3><button id="verify-admin" class="button dark">Tailscale bevestigen</button></div><div id="admin-users"></div></section>
+</main></div>
+<dialog id="booking-dialog"><button class="dialog-close" data-close="booking-dialog" aria-label="Sluiten">&times;</button><h2>Bevestigen</h2><div id="booking-detail"></div><p id="booking-payment-note"></p><div class="dialog-actions"><button id="confirm-book" class="button dark">Boeken</button><button id="create-draft" class="button light">Voorstel maken</button></div></dialog>
   <dialog id="device-dialog" class="device-dialog pairing-dialog" closedby="none">
     <button class="dialog-close" id="close-device" aria-label="Koppelen sluiten">&times;</button>
     <h2>KUL koppelen</h2>
-    <ol class="pair-steps" aria-label="Koppelstappen"><li data-pair-marker="1" aria-current="step">1. KUL openen</li><li data-pair-marker="2">2. QR toevoegen</li><li data-pair-marker="3">3. Afronden</li></ol>
-    <p id="pair-progress" class="pair-progress" role="status">Je persoonlijke toestel wordt klaargezet.</p>
+    <ol class="pair-steps" aria-label="Koppelstappen"><li data-pair-marker="1" aria-current="step">1. KUL</li><li data-pair-marker="2">2. QR</li><li data-pair-marker="3">3. PIN</li></ol>
+    <p id="pair-progress" class="pair-progress" role="status">Toestel starten...</p>
     <section data-pair-step="1">
-      <h3>Toestel toevoegen</h3>
-      <p>Open KUL-accountbeheer en meld je aan met je eigen telefoon. Kies bij je authenticatortoestellen <strong>Toestel toevoegen</strong>.</p>
+      <h3>Open KUL</h3>
+      <p>Kies <strong>Toestel toevoegen</strong> bij KUL.</p>
       <a id="open-kul-registration" class="button dark" href="https://account.kuleuven.be/mfa" target="_blank" rel="noopener">Open KUL-accountbeheer &nearr;</a>
-      <p class="help">Je voegt het toestel <strong>padelreservering-auth</strong> toe.</p>
-      <button id="pair-next" class="button light" type="button">De registratie-QR is zichtbaar &rarr;</button>
+
+      <button id="pair-next" class="button light" type="button">QR is zichtbaar &rarr;</button>
     </section>
     <section data-pair-step="2" hidden>
-      <h3>Neem de registratie-QR over</h3>
-      <p>Ga bij <strong>Toestel toevoegen</strong> verder tot de registratie-QR verschijnt. Plak of upload een screenshot; wij zoeken de code in de afbeelding.</p>
+      <h3>Voeg je QR toe</h3>
+      <p>Plak of upload de registratie-QR.</p>
       <div class="qr-options">
         <button id="paste-qr" class="qr-paste-target" type="button" aria-keyshortcuts="Control+V Meta+V"><strong>Screenshot plakken</strong><span>Klik hier en druk Ctrl+V</span></button>
         <div class="qr-file-option"><button id="upload-qr" class="button light" type="button">Afbeelding uploaden</button><span>PNG, JPG of WebP</span><input id="device-qr" type="file" accept="image/png,image/jpeg,image/webp" hidden></div>
       </div>
-      <p class="help qr-desktop-hint">Knipprogramma: Win+Shift+S, selecteer de QR en druk hier Ctrl+V.</p>
+
       <p id="qr-feedback" class="qr-feedback" role="status" aria-live="polite"></p>
-      <p class="help">Een volledige gsm-screenshot mag ook. Gebruik de registratie-QR, niet de download-QR voor Google Play of de App Store.</p>
+
       <details class="pair-alternative"><summary>Ik heb een registratielink</summary><form id="link-form"><label>Registratielink<input id="device-link" type="url" placeholder="https://icts.kuleuven.be/apps/authenticator/..." required></label><button id="send-device-link" class="button light" disabled>Registratielink gebruiken</button></form></details>
-      <button id="pair-back" class="text-button" type="button">Terug naar KUL openen</button>
+      <button id="pair-back" class="text-button" type="button">Terug</button>
     </section>
     <figure id="qr-preview" class="qr-preview" hidden><img id="qr-preview-image" alt="Jouw toegevoegde screenshot met QR-code"><figcaption><span id="qr-preview-state">Afbeelding toegevoegd</span><button id="remove-qr" class="text-button" type="button">Verwijderen</button></figcaption></figure>
     <section data-pair-step="3" hidden>
       <h3 id="pair-pin-title">Kies een PIN</h3>
-      <p id="pair-pin-help">Gebruik vier cijfers voor padelreservering-auth.</p>
+      <p id="pair-pin-help">4 cijfers.</p>
       <form id="pin-form"><label for="device-pin">PIN</label><div class="pin-input"><input id="device-pin" type="password" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" autocomplete="new-password" required disabled><button class="pin-eye" type="button" data-pin-toggle="device-pin" aria-label="PIN tonen" aria-pressed="false"></button></div><label for="device-pin-confirm">PIN bevestigen</label><div class="pin-input"><input id="device-pin-confirm" type="password" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" autocomplete="new-password" required disabled><button class="pin-eye" type="button" data-pin-toggle="device-pin-confirm" aria-label="PIN bevestiging tonen" aria-pressed="false"></button></div><button id="finish-device" class="button dark" disabled>Koppelen</button></form>
-      <button id="pair-new-qr" class="text-button" type="button">Een andere registratie-QR gebruiken</button>
+      <button id="pair-new-qr" class="text-button" type="button">Andere QR</button>
     </section>
     <section id="pair-complete" hidden><h3 id="pair-complete-title">Gekoppeld</h3><p id="pair-complete-text"></p><button id="pair-check-login" class="button light" type="button" hidden>Controle vernieuwen</button></section>
     <p id="device-message" class="pair-message" role="alert"></p>
     <button id="retry-device" class="button light" type="button" hidden>Toestel opnieuw starten</button>
     <button id="close-device-footer" class="button light pair-close" type="button">Sluiten</button>
   </dialog>
-  <noscript>Schakel JavaScript in om je profiel en boekingen te beheren.</noscript>
-</body></html>
+<noscript>Schakel JavaScript in.</noscript></body></html>

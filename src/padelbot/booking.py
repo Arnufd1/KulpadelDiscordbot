@@ -608,13 +608,14 @@ def book(
     label: str | None = None,
     on_3ds_challenge: Callable[[], None] | None = None,
     expected_amount: Decimal | None = None,
+    payment_mode: str = 'legacy',
 ) -> BookingResult:
     """Serialize the complete cart/checkout transaction across Discord and web workers."""
     from filelock import FileLock
     settings.padelbot_rules_file.parent.mkdir(parents=True,exist_ok=True)
     with FileLock(str(settings.padelbot_rules_file)+".booking.lock",timeout=180):
         return _book(client,slot,member_id=member_id,auto_pay=auto_pay,me=me,label=label,
-                     on_3ds_challenge=on_3ds_challenge,expected_amount=expected_amount)
+                     on_3ds_challenge=on_3ds_challenge,expected_amount=expected_amount,payment_mode=payment_mode)
 
 
 def _book(
@@ -627,6 +628,7 @@ def _book(
     label: str | None = None,
     on_3ds_challenge: Callable[[], None] | None = None,
     expected_amount: Decimal | None = None,
+    payment_mode: str = 'legacy',
 ) -> BookingResult:
     """Cart → sale → payment (optional).
 
@@ -637,6 +639,11 @@ def _book(
     `label` is stored as `primaryPurchaseMessage` (free-text booking note like
     "for Sara & Tom"). Visible in the purchase history.
     """
+    if payment_mode not in {'legacy','kul','discord'}:raise ValueError('Ongeldige betaalwijze.')
+    if payment_mode=='kul':
+        from .platform_service import validate_payment
+        if me is None:me=client.me()
+        validate_payment(me,expected_amount or Decimal(str(slot.price or 0)),'kul')
     if expected_amount is not None:
         try:
             expected_amount = Decimal(str(expected_amount))
@@ -692,12 +699,32 @@ def _book(
                                   PaymentStateUnknownError)
             if me is None:
                 me = client.me()
-            method, resp = _auto_pay(client, sale_id=int(sale_id), member_id=member_id, amount=float(amount), me=me)
+            if payment_mode=='discord':
+                from .payment import create_payment
+                method=PayMethod.CREDIT_CARD
+                resp=create_payment(client,sale_id=int(sale_id),member_id=member_id,amount=float(amount),method=method)
+            elif payment_mode=='kul':
+                from .platform_service import validate_payment
+                validate_payment(me,Decimal(str(amount)),'kul')
+                method,resp=_auto_pay(client,sale_id=int(sale_id),member_id=member_id,amount=float(amount),me=me)
+            else:
+                method, resp = _auto_pay(client, sale_id=int(sale_id), member_id=member_id, amount=float(amount), me=me)
             result.pay_method = method.name
             if method == PayMethod.CREDIT_CARD:
                 url = build_payment_url(resp)
                 logger.info("Built checkout link for sale {}", sale_id)
                 result.payment_url = url
+                if payment_mode=='discord':return result
+                if payment_mode=='kul':
+                    # A tokenized KUL card may require its bank's hosted approval.
+                    # Never load the separate card vault or automate that challenge.
+                    if url and resp.get('userInitiatedPaymentResult',{}).get('bPaidOnStoredPayMethod') is not True:return result
+                    result.payment_pending=True
+                    result.paid=wait_for_payment_confirmation(client,sale_id=int(sale_id),member_id=member_id,
+                        amount=float(amount),reference=payment_reference(resp))
+                    if result.paid:result.payment_pending=False;result.payment_url=None
+                    else:result.pay_error='Betaling nog niet bevestigd. Controleer KUL voor je opnieuw betaalt.'
+                    return result
                 # If a card is stored, drive the Worldline page headlessly.
                 from .worldline_driver import load_card, pay_via_worldline
                 card = load_card()

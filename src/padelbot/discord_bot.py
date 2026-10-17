@@ -69,6 +69,12 @@ class PadelBot(commands.Bot):
         self._hub_posts_task: asyncio.Task | None = None
         self._last_keepalive_ok: bool = True
         self._last_keepalive_at: float = 0.0
+        self.platform=None
+        self._delivery_task=None
+        if settings.padelbot_platform_root is not None:
+            from .web_store import PlatformStore
+            from .platform_service import PlatformService
+            self.platform=PlatformService(PlatformStore(settings.padelbot_platform_root,settings.padelbot_platform_owner))
 
     async def setup_hook(self) -> None:
         logger.info("setup_hook: syncing slash commands...")
@@ -89,7 +95,7 @@ class PadelBot(commands.Bot):
             raise
 
         # Register the persistent SlotsView so day-buttons keep working across restarts
-        if settings.discord_owner_id:
+        if settings.discord_owner_id and self.platform is None:
             self.add_view(SlotsView(settings.discord_owner_id))
         from .match_ui import post_view
         for match in self.match_store.future_matches():
@@ -108,6 +114,9 @@ class PadelBot(commands.Bot):
     async def on_ready(self) -> None:
         logger.info("Bot ready as {} (id={}).", self.user, getattr(self.user, "id", "?"))
         owner_ok = bool(settings.discord_owner_id)
+        if self.platform is not None and (self._delivery_task is None or self._delivery_task.done()):
+            from .discord_delivery import run_deliveries
+            self._delivery_task=asyncio.create_task(run_deliveries(self,self.platform))
         guild_ok = bool(settings.discord_guild_id)
         logger.info(
             "Owner gating: {} · Guild scope: {} · Type /checkbookings in Discord to test.",
@@ -127,17 +136,21 @@ class PadelBot(commands.Bot):
             return
 
         # Start the precise scheduler (Type A: weekly opening moment)
-        self._scheduler_task = asyncio.create_task(
-            run_scheduler(self.rules_store, on_attempt=self._announce_attempt, booking_lock=self._booking_lock)
-        )
+        if self.platform is None:
+            self._scheduler_task = asyncio.create_task(
+                run_scheduler(self.rules_store, on_attempt=self._announce_attempt, booking_lock=self._booking_lock))
+        else:
+            # The web worker schedules every profile, including the existing owner.
+            self._scheduler_task=asyncio.create_task(self._platform_lifetime())
         # Start the keepalive task — periodic silent refresh to keep the
         # Shibboleth session warm and avoid idle-timeout MFA prompts.
-        self._keepalive_task = asyncio.create_task(self._run_keepalive())
-
-        # Live channel refreshers (only run if their channel is configured)
-        self._slots_refresh_task = asyncio.create_task(self._run_slots_refresh())
-        self._bookings_refresh_task = asyncio.create_task(self._run_bookings_refresh())
-        self._reminder_task = asyncio.create_task(self._run_session_reminders())
+        if self.platform is None:
+            self._keepalive_task = asyncio.create_task(self._run_keepalive())
+            self._slots_refresh_task = asyncio.create_task(self._run_slots_refresh())
+            self._bookings_refresh_task = asyncio.create_task(self._run_bookings_refresh())
+            self._reminder_task = asyncio.create_task(self._run_session_reminders())
+        # Platform profiles renew on their queued work. Legacy owner polling must
+        # not boot Android every minute while nobody is using the new hub.
 
         # Start the slot watcher (Type B: catches cancellations within the
         # 7-day window, auto-books if a watched slot frees up).
@@ -147,10 +160,12 @@ class PadelBot(commands.Bot):
                 on_hit=self._on_watch_hit,
                 poll_interval_s=settings.padelbot_watcher_poll_s,
             )
-        )
+        ) if self.platform is None else None
         self._availability_watcher_task = asyncio.create_task(run_availability_watcher(self))
 
     async def close(self):
+        if self._delivery_task is not None:
+            self._delivery_task.cancel();await asyncio.gather(self._delivery_task,return_exceptions=True)
         if self._hub_posts_task is not None:
             self._hub_posts_task.cancel()
             await asyncio.gather(self._hub_posts_task,return_exceptions=True)
@@ -161,6 +176,9 @@ class PadelBot(commands.Bot):
             except asyncio.CancelledError:
                 pass
         await super().close()
+
+    async def _platform_lifetime(self):
+        await asyncio.Event().wait()
 
     def _has_component_handler(self, interaction: discord.Interaction) -> bool:
         # discord.py dispatches the view before on_interaction. Consult the same
@@ -534,6 +552,12 @@ def _register_commands(bot: PadelBot) -> None:
     @bot.tree.command(name="checkbookings", description="Bekijk vrije padelvelden en boek via de knoppen")
     @app_commands.describe(dag="0 = vandaag, 1 = morgen, 2 = overmorgen; 0-5 = vandaag t/m over 5 dagen (standaard 0)")
     async def checkbookings_cmd(interaction: discord.Interaction, dag: str = "0") -> None:
+        if bot.platform is not None:
+            from .discord_platform import command
+            try:first,last=parse_day_range(dag)
+            except ValueError as error:
+                await interaction.response.send_message(str(error),ephemeral=True);return
+            await command(interaction,bot.platform,'slots',first,last);return
         if await _deny_if_not_owner(interaction):
             return
         try:
@@ -557,6 +581,9 @@ def _register_commands(bot: PadelBot) -> None:
 
     @bot.tree.command(name="autobook", description="Stel automatisch boeken in of beheer je bestaande regels")
     async def autobook_cmd(interaction: discord.Interaction) -> None:
+        if bot.platform is not None:
+            from .discord_platform import command
+            await command(interaction,bot.platform,'rules');return
         if await _deny_if_not_owner(interaction):
             return
         view = AutoBookView(settings.discord_owner_id, bot.rules_store)
@@ -564,6 +591,9 @@ def _register_commands(bot: PadelBot) -> None:
 
     @bot.tree.command(name="bookings", description="Bekijk je reservaties, deel met de groep of annuleer via de knoppen")
     async def bookings_cmd(interaction: discord.Interaction) -> None:
+        if bot.platform is not None:
+            from .discord_platform import command
+            await command(interaction,bot.platform,'bookings');return
         if await _deny_if_not_owner(interaction):
             return
         await interaction.response.defer(thinking=True, ephemeral=True)

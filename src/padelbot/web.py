@@ -27,6 +27,7 @@ from .web_store import PlatformStore
 from .web_runtime import JobRunner, rules_for, tenant_env
 from .web_device import DeviceManager
 from .web_cards import CardVault
+from .platform_service import PlatformService,install_url
 
 
 class WebSettings(BaseSettings):
@@ -42,6 +43,8 @@ class WebSettings(BaseSettings):
     tail_admin_node_ids: str = ""
     secure_cookies: bool = True
     card_vault_key_file: Path | None = None
+    discord_client_id: str = ''
+    discord_client_secret: str = ''
 
 
 class RangeRequest(BaseModel):
@@ -59,6 +62,7 @@ class RuleRequest(BaseModel):
 class PreferencesRequest(BaseModel):
     automatic_payment: bool = False
     max_amount: float = Field(ge=0,le=100)
+    payment_mode: str = Field(default='kul',pattern=r'^(kul|discord)$')
 
 
 class BookingRequest(BaseModel):
@@ -121,6 +125,7 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
     runner, devices = JobRunner(store), DeviceManager(store)
     cards = CardVault(store,config.card_vault_key_file)
     community = runner.community
+    platform=PlatformService(store,community)
     drafts=runner.drafts
     static = Path(__file__).parent/"web_static"
     keys = jwt.PyJWKClient("https://www.googleapis.com/oauth2/v3/certs",timeout=10)
@@ -138,6 +143,7 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
     app.state.store, app.state.config = store,config
     app.state.cards, app.state.community = cards,community
     app.state.devices=devices
+    app.state.platform=platform
     hosts = {urlsplit(config.public_url).hostname,urlsplit(config.tail_url).hostname,"localhost","127.0.0.1","192.168.0.220"}
     app.add_middleware(TrustedHostMiddleware,allowed_hosts=sorted(h for h in hosts if h))
     attempts = {}
@@ -269,6 +275,44 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
         response.delete_cookie("padel_session")
         return response
 
+    @app.get('/auth/discord')
+    def discord_start(request:Request,personal:bool=False,user=Depends(current)):
+        if not config.discord_client_secret:
+            return RedirectResponse(install_url(config.discord_client_id,personal=personal),status_code=302)
+        state=platform.oauth_start(user['id'],request.cookies['padel_session'])
+        return RedirectResponse('https://discord.com/oauth2/authorize?'+urlencode({
+            'client_id':config.discord_client_id,'redirect_uri':config.public_url+'/auth/discord/callback',
+            'response_type':'code','scope':'identify applications.commands' if personal else 'identify bot applications.commands',
+            'integration_type':1 if personal else 0,'permissions':0 if personal else 84992,'state':state}),status_code=302)
+
+    @app.get('/auth/discord/callback')
+    async def discord_callback(request:Request,user=Depends(current)):
+        if (not config.discord_client_secret or request.query_params.get('error') or
+            request.query_params.get('iss','https://discord.com')!='https://discord.com' or
+            not platform.oauth_consume(request.query_params.get('state',''),request.cookies['padel_session'],user['id'])):
+            raise HTTPException(400,'Discord-autorisatie is verlopen of geweigerd.')
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                response=await client.post('https://discord.com/api/oauth2/token',data={
+                    'client_id':config.discord_client_id,'client_secret':config.discord_client_secret,
+                    'grant_type':'authorization_code','code':request.query_params.get('code',''),
+                    'redirect_uri':config.public_url+'/auth/discord/callback'})
+                response.raise_for_status();access=response.json()['access_token']
+                response=await client.get('https://discord.com/api/v10/users/@me',headers={'Authorization':'Bearer '+access})
+                response.raise_for_status();identity=response.json()
+                if identity.get('bot'):raise ValueError()
+                platform.hub.link(user['id'],int(identity['id']))
+                platform.hub.remember_discord(int(identity['id']),identity.get('global_name') or identity['username'])
+                # Linking needs no retained Discord access/refresh token.
+                try:
+                    await client.post('https://discord.com/api/oauth2/token/revoke',data={
+                        'client_id':config.discord_client_id,'client_secret':config.discord_client_secret,'token':access})
+                except httpx.HTTPError:pass
+        except Exception:
+            raise HTTPException(400,'Discord kon niet gekoppeld worden. Probeer opnieuw.') from None
+        store.audit(user['id'],'discord_linked')
+        return RedirectResponse(config.public_url+'/#dashboard',status_code=303)
+
     @app.get("/api/me")
     def me(request:Request,user=Depends(current)):
         env = tenant_env(store,user)
@@ -281,6 +325,11 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
             "connected":connected,"device_ready":profile.exists() and (verified or connected),
             "needs_attention":Path(env["PADELBOT_ANDROID_FAILURE_FILE"]).exists(),
             "discord_linked":community.hub.linked(user['id']),
+            "discord_oauth":bool(config.discord_client_secret),
+            "discord_install":bool(config.discord_client_id),
+            "discord_online":platform.discord_online(),
+            "payment":platform.payment_status(user['id']),
+            "deliveries":platform.delivery_status(user['id']),
             "preferences":store.preferences(user["id"])}
 
     @app.post('/api/discord/link')
@@ -419,7 +468,7 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
         return {"ok":True}
 
     def enqueue(user,kind,payload,dedup=None):
-        return {"job_id":store.enqueue(user["id"],kind,payload,dedup=dedup)}
+        return {"job_id":platform.enqueue(user,kind,payload) if kind in {'slots','book','quote','login','account','bookings'} else store.enqueue(user['id'],kind,payload,dedup=dedup)}
 
     @app.post("/api/slots")
     def slots(body:RangeRequest,user=Depends(current)):

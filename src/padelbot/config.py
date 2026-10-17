@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     discord_bot_token: str = ""
     discord_owner_id: int = 0          # only this Discord user can use commands
     discord_guild_id: int = 0          # if set, slash commands appear instantly in this server (otherwise global, ~1h)
+    padelbot_platform_root: Path | None = None
+    padelbot_platform_owner: str = 'aafmichiels@gmail.com'
+    padelbot_public_url: str = 'https://padel.sigmadvisor.com'
 
     padelbot_rules_file: Path = Path("./data/rules.sqlite3")
     padel_member_id: int = 0

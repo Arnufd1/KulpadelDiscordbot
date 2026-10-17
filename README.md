@@ -4,6 +4,14 @@ Python-bot om padelvelden van KU Leuven Sport via Discord te bekijken en te rese
 
 De persoonlijke webapp voor `padel.sigmadvisor.com` draait op de mini-pc en gebruikt Google-login, gescheiden gebruikersprofielen, een gedeelde emulator die op aanvraag start, en privébeheer via Tailscale. Installatie, betalingsmogelijkheden en resterende verificatie staan in [web-hosting](docs/web-hosting.md).
 
+## Website en Discord
+
+Open [het dashboard](https://padel.sigmadvisor.com), meld aan met Google, koppel KUL en klik **Toevoegen aan Discord**. De Discord-autorisatie koppelt je eigen profiel en installeert de bot; een persoonlijke installatie zonder server staat onder Instellingen. `/checkbookings`, `/bookings` en `/autobook` gebruiken je eigen profiel.
+
+Kies bij Betalen een bij KUL gekoppelde betaalmethode, of een betaallink via Discord. Bij KUL blijft het saldo, de geldige standaardkaart of de domiciliëring leidend. De losse kaartkluis verleent geen betaalmachtiging. Zonder automatische betaalmethode krijgt dezelfde privéboodschap de hosted betaallink. De bot controleert eerst of hij dat privébericht kan afleveren; bij een fout wordt niets gereserveerd. Een bankcontrole voor een gekoppelde kaart wordt eveneens via Discord afgehandeld.
+
+Met `PADELBOT_PLATFORM_ROOT=/opt/padelbot/data/platform` gebruiken Discord en web dezelfde profielkoppeling, voorkeuren, takenwachtrij, boekingsworker en matchdeelnames. De oude automatische Discord-scheduler wordt dan uitgeschakeld: één worker voert de regels van alle profielen uit. Standalone CLI-installaties zonder deze instelling behouden hun bestaande gedrag.
+
 ## Snel starten op Windows
 
 Python 3.10 of nieuwer is vereist. Voer de commando's uit vanuit de projectmap.

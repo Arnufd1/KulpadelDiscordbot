@@ -126,6 +126,7 @@ class JobRunner:
             env = tenant_env(self.store,source_user)
             env['PADELWEB_HUB_DB']=str(self.community.matches.path.resolve())
             env["PADELWEB_RESULT"] = str(output)
+            env['PADELWEB_JOB_ID']=row['id']
             try:
                 self.process = await asyncio.create_subprocess_exec(sys.executable,"-m","padelbot.web_worker",
                     env=env,stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.DEVNULL,stderr=asyncio.subprocess.DEVNULL)
@@ -159,6 +160,9 @@ class JobRunner:
                 self.drafts.uncertain_conversion(payload['draft_id'])
         if job and job['kind']=='bookings' and status=='done':
             self.community.sync(job['user_id'],result.get('bookings',[]),device_verified=result.get('device_verified') is True)
+        if job and job['kind'] in {'login','account','quote'} and status=='done' and result.get('payment'):
+            from .platform_service import PlatformService
+            PlatformService(self.store,self.community).remember_payment(job['user_id'],result['payment'])
         with self.store.conn() as c:
             c.execute("UPDATE jobs SET status=?,result=?,finished=? WHERE id=?",(status,json.dumps(result),time.time(),job_id))
             if status=='done' and result.get('waiting') is True:
@@ -174,7 +178,7 @@ class JobRunner:
         while True:
             now = datetime.now(tz)
             with self.store.conn() as c:
-                users = [dict(r) for r in c.execute("SELECT * FROM users WHERE owner=0 AND suspended=0")]
+                users = [dict(r) for r in c.execute("SELECT * FROM users WHERE suspended=0")]
             for user in users:
                 prefs = self.store.preferences(user["id"])
                 if not prefs.get("automatic_payment") or float(prefs.get("max_amount",0))<=0:

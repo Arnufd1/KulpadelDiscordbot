@@ -86,6 +86,9 @@ class OwnerView(discord.ui.View):
         self.busy = False
 
     async def interaction_check(self, interaction):
+        if getattr(getattr(interaction,'client',None),'platform',None) is not None:
+            await interaction.response.send_message('Open het gedeelde overzicht met /checkbookings of /bookings.',ephemeral=True)
+            return False
         if not self.owner_id or interaction.user.id != self.owner_id:
             await interaction.response.send_message("Alleen de eigenaar kan deze knoppen gebruiken.", ephemeral=True)
             return False
