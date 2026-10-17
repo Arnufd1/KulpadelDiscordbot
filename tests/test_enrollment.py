@@ -224,7 +224,51 @@ def test_save_requires_account_to_survive_app_restart(monkeypatch,survives):
     if survives:verify_saved_account(SavedDevice())
     else:
         with pytest.raises(ValueError,match='bewaard'):verify_saved_account(SavedDevice())
-    assert actions==['home',('shell','sync'),'stop','start']
+    assert actions==['home',('shell','sync'),'stop','start']+([('shell','sync')] if survives else [])
+
+
+def test_enrollment_close_allows_worker_to_persist_before_exit():
+    async def run():
+        actions=[]
+        class Input:
+            def write(self,value):actions.append(json.loads(value))
+            async def drain(self):actions.append('drain')
+        class Worker:
+            returncode=None
+            stdin=Input()
+            async def wait(self):
+                actions.extend(['flush_native_storage','close_emulator'])
+                self.returncode=0
+            def terminate(self):pytest.fail('A responsive enrollment worker was interrupted')
+            def kill(self):pytest.fail('A responsive enrollment worker was killed')
+        manager=DeviceManager(SimpleNamespace(audit=lambda *a:None))
+        manager.process=Worker();manager.user_id='alice'
+        await manager.close()
+        assert actions==[{'action':'stop'},'drain','flush_native_storage','close_emulator']
+        assert manager.process is None and manager.user_id is None
+    asyncio.run(run())
+
+
+def test_provision_existing_enrollment_preserves_native_identity_on_repeated_runs(tmp_path,monkeypatch):
+    from padelbot import web_device
+    from padelbot.config import settings
+    home=tmp_path/'emulators';avd=home/'KulPadelAuth.avd';avd.mkdir(parents=True)
+    index=home/'KulPadelAuth.ini'
+    index.write_text('path='+str(avd)+'\n')
+    config=avd/'config.ini';config.write_text('AvdId=KulPadelAuth\navd.ini.displayname=Old name\n')
+    disk=avd/'userdata-qemu.img';disk.write_bytes(b'existing native account')
+    overlay=avd/'userdata-qemu.img.qcow2';overlay.write_bytes(b'existing writable identity and keys')
+    profile=tmp_path/'profile.json';profile.write_text('{"enrollment_verified":true}')
+    monkeypatch.setattr(settings,'padelbot_android_emulator_home',home)
+    monkeypatch.setattr(settings,'padelbot_android_emulator_name','KulPadelAuth')
+    monkeypatch.setattr(settings,'padelbot_android_profile_file',profile)
+    original={path:path.read_bytes() for path in [index,disk,overlay,profile]}
+    web_device.provision()
+    # Recreating application objects or deploying code invokes the same
+    # provisioner; neither operation may create another Android identity.
+    web_device.provision()
+    assert all(path.read_bytes()==value for path,value in original.items())
+    assert config.read_text().count('avd.ini.displayname=padelreservering-auth')==1
 
 
 def test_slow_start_returns_immediately_is_private_and_can_be_cancelled(monkeypatch):

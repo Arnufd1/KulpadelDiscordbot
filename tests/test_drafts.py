@@ -133,6 +133,7 @@ def test_worker_checks_cart_without_creating_sale_and_cleanup_never_repeats_fore
     profile=tmp_path/'registered';profile.touch()
     monkeypatch.setattr(web_worker,'settings',SimpleNamespace(padelbot_android_profile_file=profile,padelbot_rules_file=tmp_path/'worker-rules.sqlite3'))
     monkeypatch.setenv('PADELWEB_USER_ID',owner['id'])
+    monkeypatch.setenv('PADELWEB_DB',str(community.store.path))
     assert web_worker.execute('draft_refresh',{'draft_id':row['id']})['draft_id']==row['id']
     assert client.writes==['/cart-items']
     assert drafts.get(row['id'])['state']=='active'

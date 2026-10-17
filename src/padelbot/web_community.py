@@ -34,7 +34,7 @@ class CommunityBookings:
                     match_id TEXT NOT NULL REFERENCES community_matches(id),user_id TEXT NOT NULL REFERENCES users(id),
                     joined REAL NOT NULL,PRIMARY KEY(match_id,user_id));
             """)
-            users=[dict(r) for r in c.execute('SELECT id,name,owner,suspended FROM users')]
+            users=[dict(r) for r in c.execute('SELECT id,name,owner,suspended,avatar_url FROM users')]
         for user in users:self.hub.register(user,owner_discord_id=base.discord_owner_id)
 
     def sync(self,user_id,bookings,*,device_verified):
@@ -80,10 +80,11 @@ class CommunityBookings:
                 if changed:self.matches.queue_hub_update(c,row['id'])
 
     def share(self,user_id,booking_id,shared):
+        if shared:self.store.assert_writable(user_id)
         with self.store.conn() as c:
             row=c.execute('SELECT * FROM community_matches WHERE user_id=? AND booking_id=?',(user_id,booking_id)).fetchone()
         with self.matches._connection() as c:
-            actor=self.hub.actor(c,user_id)
+            actor=self.hub.actor(c,user_id,write=shared)
         match=self.matches.for_booking(actor,booking_id)
         if not shared:
             if not match:raise ValueError('Vernieuw eerst je eigen boekingen.')
@@ -119,6 +120,7 @@ class CommunityBookings:
             if len(match.players)>=4 and not joined:continue
             result.append({'id':match.id,'title':match.court,'start':match.start_iso,'end':match.end_iso,
                 'host':match.names.get(match.owner_id,'Speler'),'players':[match.names[p] for p in match.players],
+                'player_profiles':[self.hub.player_identity(p) for p in match.players],
                 'count':len(match.players),'capacity':4,'joined':joined,'organiser':match.owner_id==actor,
                 'verified':match.hub_verified,'origin':'discord' if self.matches.posts(match.id,active_only=True) else 'web','kind':'confirmed'})
         return sorted(result,key=lambda row:timestamp(row['start']))[:100]
@@ -131,6 +133,7 @@ class CommunityBookings:
         return {'id':match.id,'user_id':host['id'],'booking_id':match.booking_id,'kind':'confirmed'}
 
     def join_verified(self,match_id,user_id):
+        self.store.assert_writable(user_id)
         user=self.store.user(user_id)
         if not user or user['suspended']:raise ValueError('Dit profiel is gepauzeerd.')
         self.hub.register(user)

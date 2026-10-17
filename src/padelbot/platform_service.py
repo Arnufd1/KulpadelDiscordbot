@@ -121,6 +121,7 @@ class PlatformService:
             raise ValueError('Dit profiel is gepauzeerd.')
         if kind not in {'slots','quote','book','bookings','login','account','rule','community_join'}:
             raise ValueError('Onbekende taak.')
+        if kind in {'book','rule','community_join'}:self.require_writable(user['id'])
         if kind=='account':return self.account_check(user,force=True)['check']['job_id']
         if kind=='rule':
             if not self.can_autobook(user['id']):raise ValueError(AUTOBOOK_CARD_REQUIRED)
@@ -184,16 +185,17 @@ class PlatformService:
         return {'payment':self.payment_status(user_id),'check':check,
                 'checking':bool(check and check['status'] in {'queued','running'})}
 
-    def account_check(self,user,*,force=False):
+    def account_check(self,user,*,force=False,login=False):
         """One bounded read, shared by the website and Discord; polling never enqueues."""
         if not self.store.user(user['id']) or self.store.user(user['id'])['suspended']:
             raise ValueError('Dit profiel is gepauzeerd.')
         with FileLock(str(self.store.root/('account-check-'+user['id']+'.lock')),timeout=15):
             state=self.account_status(user['id']);check=state['check'];now=time.time()
-            if check and (state['checking'] or check['next_check_at']>now or
-                          (not force and check['status']=='done' and check['checked']>now-300)):
+            if check and (state['checking'] or
+                          (check['next_check_at']>now and not (login and check['status']=='done')) or
+                          (not login and not force and check['status']=='done' and check['checked']>now-300)):
                 return state
-            self.store.enqueue(user['id'],'account',{})
+            self.store.enqueue(user['id'],'login' if login else 'account',{})
             return self.account_status(user['id'])
 
     def require_autobook_card(self,user_id,*,fresh=True):
@@ -208,16 +210,42 @@ class PlatformService:
 
     def save_preferences(self,user,values):
         if values.get('automatic_payment'):
+            self.require_writable(user['id'])
             if payment_mode(values)!='kul':raise ValueError(AUTOBOOK_CARD_REQUIRED)
             self.require_autobook_card(user['id'])
         return self.store.preferences(user['id'],values)
 
     def can_autobook(self,user_id):
+        try:self.require_writable(user_id)
+        except ValueError:return False
         prefs=self.store.preferences(user_id)
         if not prefs.get('automatic_payment') or payment_mode(prefs)!='kul':return False
         try:self.require_autobook_card(user_id,fresh=False)
         except ValueError:return False
         return True
+
+    def require_writable(self,user_id):
+        user=self.store.assert_writable(user_id)
+        self.hub.register(user)
+        try:
+            with self.hub.matches._connection() as c:
+                self.hub.actor(c,user_id,write=True)
+        except RuntimeError as error:
+            raise ValueError(str(error)) from None
+
+    def access_status(self,user_id):
+        user=self.store.user(user_id)
+        state={'suspended':bool(not user or user['suspended']),'restricted':bool(user and user.get('restricted'))}
+        with self.hub.matches._connection() as c:
+            profile=c.execute('SELECT discord_id,suspended FROM hub_profiles WHERE id=?',(user_id,)).fetchone()
+            keys=['profile:'+user_id]+(['discord:'+str(profile['discord_id'])] if profile and profile['discord_id'] is not None else [])
+            if profile:state['suspended']=state['suspended'] or bool(profile['suspended'])
+            for key in keys:
+                row=c.execute('SELECT suspended,restricted FROM hub_moderation WHERE actor=?',(key,)).fetchone()
+                if row:
+                    state['suspended']=state['suspended'] or bool(row['suspended'])
+                    state['restricted']=state['restricted'] or bool(row['restricted'])
+        return state
 
     def activity(self,user_id):
         with self.store.conn() as c:

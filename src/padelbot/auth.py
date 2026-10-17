@@ -84,6 +84,16 @@ def refresh(bundle: TokenBundle) -> TokenBundle:
         "refresh_token": bundle.refresh_token,
     }, timeout=30)
     if response.status_code >= 400:
+        # Expired/revoked grants require a new login on the same registered
+        # Authenticator. Other protocol, configuration and network failures
+        # must not trigger an Android approval or replay a PIN attempt.
+        try:
+            error = response.json()
+        except ValueError:
+            error = None
+        if (response.status_code in {400, 401} and isinstance(error, dict)
+                and error.get("error") == "invalid_grant"):
+            raise SessionExpiredError("The saved KUL session expired; a new login is required.")
         raise RuntimeError(f"OIDC refresh failed [{response.status_code}]. Re-login required.")
     return _bundle_from_response(response.json(), fallback_refresh=bundle.refresh_token)
 
@@ -191,7 +201,7 @@ def silent_refresh_via_session(
     The headless/id_token_hint arguments remain for compatibility with old callers.
     """
     if not storage_state_path.exists():
-        raise RuntimeError(f"No session state at {storage_state_path}; run `padelbot login` first.")
+        raise SessionExpiredError("No saved KUL session; a new login is required.")
     with _renewal_lock:
         return _http_login(storage_state_path, timeout_seconds=timeout_seconds)
 

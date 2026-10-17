@@ -28,6 +28,7 @@ from .web_runtime import JobRunner, rules_for, tenant_env
 from .web_device import DeviceManager
 from .web_cards import CardVault
 from .platform_service import PlatformService,install_url,CARD_MANAGE_URL
+from .matches import MatchError
 
 
 class WebSettings(BaseSettings):
@@ -105,6 +106,12 @@ class DraftConfirmRequest(BaseModel):
     amount: float = Field(gt=0,le=100)
 
 
+class ModerationRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    suspended: bool | None = None
+    restricted: bool | None = None
+
+
 def validate_google_claims(claims: dict, nonce: str, audience: str):
     if (claims.get("iss") not in {"https://accounts.google.com","accounts.google.com"}
             or claims.get("aud") != audience or claims.get("email_verified") is not True
@@ -121,6 +128,8 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
     cards = CardVault(store,config.card_vault_key_file)
     community = runner.community
     platform=PlatformService(store,community)
+    from .admin_service import AdminService
+    administration=AdminService(platform)
     drafts=runner.drafts
     static = Path(__file__).parent/"web_static"
     keys = jwt.PyJWKClient("https://www.googleapis.com/oauth2/v3/certs",timeout=10)
@@ -186,10 +195,11 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
         response.headers.update({"X-Content-Type-Options":"nosniff","X-Frame-Options":"DENY",
             "Referrer-Policy":"no-referrer","Cache-Control":"no-store",
             "Permissions-Policy":"camera=(), microphone=(), geolocation=()",
-            "Content-Security-Policy":"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"})
+            "Content-Security-Policy":"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https://*.googleusercontent.com https://cdn.discordapp.com https://media.discordapp.net; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"})
         return response
 
     @app.exception_handler(ValueError)
+    @app.exception_handler(MatchError)
     async def bad_value(request,error):
         return JSONResponse({"detail":str(error)},status_code=400)
 
@@ -298,7 +308,10 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
                 response.raise_for_status();identity=response.json()
                 if identity.get('bot'):raise ValueError()
                 platform.hub.link(user['id'],int(identity['id']))
-                platform.hub.remember_discord(int(identity['id']),identity.get('global_name') or identity['username'])
+                from .identity import discord_avatar
+                platform.hub.remember_discord(int(identity['id']),identity.get('global_name') or identity['username'],
+                    discord_avatar(int(identity['id']),identity.get('avatar'),identity.get('discriminator','0')))
+                platform.hub.observe_context(int(identity['id']),'oauth')
                 # Linking needs no retained Discord access/refresh token.
                 try:
                     await client.post('https://discord.com/api/oauth2/token/revoke',data={
@@ -316,18 +329,27 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
         profile=Path(env['PADELBOT_ANDROID_PROFILE_FILE'])
         try:verified=json.loads(profile.read_text()).get('enrollment_verified') is True
         except (OSError,ValueError,AttributeError):verified=False
+        account=platform.account_status(user['id'])
+        payment=account['payment']
+        check=account['check']
+        needs_attention=Path(env['PADELBOT_ANDROID_FAILURE_FILE']).exists()
+        device_ready=profile.exists() and (verified or connected)
+        newer_problem=bool(check and check['status']!='done' and check['checked']>(payment or {}).get('checked',0))
+        kul_verified=bool(connected and device_ready and payment and not needs_attention and not newer_problem)
         is_owner=bool(user['owner'] and user['email'].lower()==config.owner_email.lower())
         admin_eligible=bool(is_owner and request.state.session['admin_until']>time.time())
         return {"id":user["id"],"name":user["name"],"email":user["email"],"owner":is_owner,
+            "avatar_url":(community.hub.profile_identity(user['id']) or {}).get('avatar_url') or user.get('avatar_url'),
+            "restricted":platform.access_status(user['id'])['restricted'],
             "admin":admin_eligible,"admin_eligible":admin_eligible,"csrf":request.state.session["csrf"],
-            "connected":connected,"device_ready":profile.exists() and (verified or connected),
-            "needs_attention":Path(env["PADELBOT_ANDROID_FAILURE_FILE"]).exists(),
+            "connected":connected,"device_ready":device_ready,"kul_verified":kul_verified,
+            "needs_attention":needs_attention,
             "discord_linked":community.hub.linked(user['id']),
             "discord_oauth":bool(config.discord_client_secret),
             "discord_install":bool(config.discord_client_id),
             "discord_online":platform.discord_online(),
-            "payment":platform.payment_status(user['id']),
-            "account_status":platform.account_status(user['id']),
+            "payment":payment,
+            "account_status":account,
             "deliveries":platform.delivery_status(user['id']),
             "preferences":store.preferences(user["id"])}
 
@@ -353,10 +375,14 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
         if Path(env['PADELBOT_ANDROID_FAILURE_FILE']).exists():
             state['error']='Controleer je KUL-koppeling.'
             return state
-        if not Path(env['PADELBOT_TOKEN_FILE']).exists():
-            state['error']='Koppel eerst KU Leuven Authenticator.'
-            return state
-        return platform.account_check(user,force=body.force)
+        login=not Path(env['PADELBOT_TOKEN_FILE']).exists()
+        if login:
+            try:registered=json.loads(Path(env['PADELBOT_ANDROID_PROFILE_FILE']).read_text()).get('enrollment_verified') is True
+            except (OSError,ValueError,AttributeError):registered=False
+            if not registered:
+                state['error']='Koppel eerst KU Leuven Authenticator.'
+                return state
+        return platform.account_check(user,force=body.force,login=login)
 
     @app.get('/api/payments')
     def private_payments(user=Depends(current)):
@@ -485,6 +511,7 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
 
     @app.post("/api/rules")
     def add_rule(body:RuleRequest,user=Depends(current)):
+        platform.require_writable(user['id'])
         db = rules_for(store,user)
         if len(db.list_rules())>=10:
             raise ValueError("Je kunt maximaal tien wekelijkse regels instellen.")
@@ -496,6 +523,7 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
         rule = db.get_rule(rule_id)
         if not rule:
             raise HTTPException(404,"Regel niet gevonden.")
+        if not rule.enabled:platform.require_writable(user['id'])
         db.set_enabled(rule_id,not rule.enabled)
         return {"ok":True}
 
@@ -598,21 +626,34 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
 
     @app.get("/api/admin/users")
     def users(user=Depends(admin)):
-        with store.conn() as c:
-            rows = [dict(r) for r in c.execute("SELECT id,email,name,owner,suspended,created FROM users ORDER BY created")]
-        for row in rows:
-            env = tenant_env(store,row)
-            row["connected"] = Path(env["PADELBOT_TOKEN_FILE"]).exists()
-            row["rules"] = len(rules_for(store,row).list_rules())
-        return {"users":rows,"device_active":devices.user_id is not None}
+        return {"users":administration.users(),"guests":administration.guests(),
+                "device_active":devices.user_id is not None}
+
+    @app.get('/api/admin/users/{user_id}')
+    def user_detail(user_id:str,user=Depends(admin)):
+        return administration.user(user_id)
+
+    @app.patch('/api/admin/users/{user_id}')
+    async def moderate_user(user_id:str,body:ModerationRequest,user=Depends(admin)):
+        result=administration.moderate_user(user['id'],user_id,body.model_dump(exclude_none=True))
+        if result['profile']['suspended'] and devices.user_id==user_id:
+            await devices.close()
+        return result
+
+    @app.get('/api/admin/guests/{discord_id}')
+    def guest_detail(discord_id:str,user=Depends(admin)):
+        return administration.guest(discord_id)
+
+    @app.patch('/api/admin/guests/{discord_id}')
+    def moderate_guest(discord_id:str,body:ModerationRequest,user=Depends(admin)):
+        return administration.moderate_guest(user['id'],discord_id,body.model_dump(exclude_none=True))
 
     @app.post("/api/admin/users/{user_id}/toggle")
     async def suspend(user_id:str,user=Depends(admin)):
         target = store.user(user_id)
         if not target or target["owner"]:
             raise ValueError("Dit profiel kan niet gepauzeerd worden.")
-        store.suspend(user["id"],user_id,not target["suspended"])
-        community.hub.register(store.user(user_id))
+        administration.moderate_user(user['id'],user_id,{'suspended':not target['suspended']})
         if not target["suspended"] and devices.user_id==user_id:
             await devices.close()
         return {"ok":True}

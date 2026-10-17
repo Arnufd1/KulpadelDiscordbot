@@ -30,7 +30,10 @@ class ProfileView(discord.ui.View):
     async def interaction_check(self,interaction):
         if interaction.user.id!=self.discord_id or self.busy:
             await interaction.response.send_message('Open je eigen overzicht met /checkbookings.',ephemeral=True);return False
-        try:self.user=self.service.discord_user(interaction.user.id)
+        try:
+            from .identity import remember_interaction
+            remember_interaction(self.service.hub,interaction)
+            self.user=self.service.discord_user(interaction.user.id)
         except ValueError as error:
             await interaction.response.send_message(str(error),ephemeral=True);return False
         return True
@@ -181,6 +184,8 @@ async def share_booking(interaction,service,user,booking_id):
 
 
 async def command(interaction,service,kind,first=0,last=0):
+    from .identity import remember_interaction
+    remember_interaction(service.hub,interaction)
     try:user=service.discord_user(interaction.user.id)
     except ValueError:
         view=discord.ui.View();view.add_item(discord.ui.Button(label='Profiel koppelen',url=settings.padelbot_public_url+'/#dashboard'))

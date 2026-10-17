@@ -49,6 +49,11 @@ class PlatformStore:
             """)
             if "admin_until" not in {r[1] for r in c.execute("PRAGMA table_info(sessions)")}:
                 c.execute("ALTER TABLE sessions ADD COLUMN admin_until REAL NOT NULL DEFAULT 0")
+            columns={r[1] for r in c.execute('PRAGMA table_info(users)')}
+            if 'restricted' not in columns:
+                c.execute('ALTER TABLE users ADD COLUMN restricted INTEGER NOT NULL DEFAULT 0')
+            if 'avatar_url' not in columns:
+                c.execute('ALTER TABLE users ADD COLUMN avatar_url TEXT')
             owner=c.execute("SELECT email FROM users WHERE owner=1").fetchone()
             if owner and owner[0]!=owner_email.lower():
                 raise ValueError("Wijzig de eigenaar uitsluitend via een expliciete profielmigratie.")
@@ -93,6 +98,8 @@ class PlatformStore:
                               (user_id, claims["sub"], email, str(claims.get("name") or email)[:120], time.time()))
             else:
                 user_id = row["id"]
+            from .identity import google_avatar
+            c.execute('UPDATE users SET avatar_url=? WHERE id=?',(google_avatar(claims.get('picture')),user_id))
         user = self.user(user_id)
         if user["suspended"]:
             raise ValueError("Dit profiel is gepauzeerd. Neem contact op met de beheerder.")
@@ -159,6 +166,8 @@ class PlatformStore:
         return dict(row) if row else None
 
     def preferences(self, user_id: str, values: dict | None = None) -> dict:
+        if values is not None and values.get('automatic_payment'):
+            self.assert_writable(user_id)
         with self.conn() as c:
             if values is not None:
                 c.execute("UPDATE users SET preferences=? WHERE id=?", (json.dumps(values), user_id))
@@ -166,6 +175,8 @@ class PlatformStore:
         return json.loads(row[0])
 
     def enqueue(self, user_id: str, kind: str, payload: dict, *, dedup: str | None = None) -> str:
+        if kind in {'book','rule','community_join','draft_refresh'}:
+            self.assert_writable(user_id)
         job_id = uuid.uuid4().hex
         with self.conn() as c:
             c.execute("BEGIN IMMEDIATE")
@@ -195,9 +206,36 @@ class PlatformStore:
             c.execute("INSERT INTO audit(actor,action,target,created) VALUES(?,?,?,?)", (actor,action,target,time.time()))
 
     def suspend(self, actor: str, user_id: str, suspended: bool):
+        return self.moderate(actor,user_id,suspended=suspended)
+
+    def assert_writable(self,user_id: str):
+        user=self.user(user_id)
+        if not user or user['suspended']:
+            raise ValueError('Dit profiel is gepauzeerd.')
+        if user.get('restricted'):
+            raise ValueError('Dit profiel heeft alleen leestoegang. Neem contact op met de beheerder.')
+        return user
+
+    def moderate(self,actor: str,user_id: str,*,suspended: bool | None=None,restricted: bool | None=None):
         with self.conn() as c:
-            c.execute("UPDATE users SET suspended=? WHERE id=? AND owner=0", (int(suspended),user_id))
+            c.execute('BEGIN IMMEDIATE')
+            row=c.execute('SELECT * FROM users WHERE id=?',(user_id,)).fetchone()
+            if not row or row['owner']:
+                raise ValueError('Dit profiel kan niet gemodereerd worden.')
+            suspended=bool(row['suspended']) if suspended is None else suspended
+            restricted=bool(row['restricted']) if restricted is None else restricted
+            c.execute('UPDATE users SET suspended=?,restricted=? WHERE id=?',(int(suspended),int(restricted),user_id))
+            if suspended or restricted:
+                preferences=json.loads(row['preferences'])
+                preferences['automatic_payment']=False
+                c.execute('UPDATE users SET preferences=? WHERE id=?',(json.dumps(preferences),user_id))
+                c.execute("UPDATE jobs SET status='cancelled',finished=? WHERE user_id=? AND status='queued' AND kind IN ('book','rule','community_join','draft_refresh')",(time.time(),user_id))
             if suspended:
                 c.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
-                c.execute("UPDATE jobs SET status='cancelled',finished=? WHERE user_id=? AND status='queued'", (time.time(),user_id))
-        self.audit(actor, "suspend" if suspended else "resume", user_id)
+                c.execute("UPDATE jobs SET status='cancelled',finished=? WHERE user_id=? AND status='queued' AND kind!='draft_release'", (time.time(),user_id))
+                tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if 'discord_oauth' in tables:c.execute('DELETE FROM discord_oauth WHERE user_id=?',(user_id,))
+                if 'discord_deliveries' in tables:
+                    c.execute("UPDATE discord_deliveries SET status='cancelled',payload='',finished=? WHERE user_id=? AND status='queued'",(time.time(),user_id))
+        self.audit(actor,'moderation_updated',user_id)
+        return self.user(user_id)

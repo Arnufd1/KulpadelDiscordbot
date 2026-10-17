@@ -105,6 +105,14 @@ class MatchStore:
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, discord_id INTEGER UNIQUE,
                     suspended INTEGER NOT NULL DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS hub_discord_names (id INTEGER PRIMARY KEY,name TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS hub_moderation (
+                    actor TEXT PRIMARY KEY,suspended INTEGER NOT NULL DEFAULT 0,
+                    restricted INTEGER NOT NULL DEFAULT 0,updated REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS hub_discord_guilds (
+                    id INTEGER PRIMARY KEY,name TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1,last_seen REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS hub_discord_contexts (
+                    discord_id INTEGER NOT NULL,context TEXT NOT NULL,guild_id INTEGER NOT NULL DEFAULT 0,
+                    last_seen REAL NOT NULL,PRIMARY KEY(discord_id,context,guild_id));
                 CREATE TABLE IF NOT EXISTS hub_link_codes (
                     code TEXT PRIMARY KEY, profile_id TEXT NOT NULL REFERENCES hub_profiles(id),expires REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS hub_post_updates (
@@ -115,6 +123,31 @@ class MatchStore:
             for name,definition in {'hub_profile_id':'TEXT','hub_verified':'REAL NOT NULL DEFAULT 0',
                                     'hub_confirmed':'INTEGER NOT NULL DEFAULT 0','hub_visible':'INTEGER NOT NULL DEFAULT 1'}.items():
                 if name not in columns:c.execute(f'ALTER TABLE shared_matches ADD COLUMN {name} {definition}')
+            for table, additions in {
+                'hub_profiles': {'google_avatar': 'TEXT'},
+                'hub_discord_names': {'avatar': 'TEXT', 'seen_at': 'REAL NOT NULL DEFAULT 0'},
+            }.items():
+                columns={r['name'] for r in c.execute(f'PRAGMA table_info({table})')}
+                for name,definition in additions.items():
+                    if name not in columns:c.execute(f'ALTER TABLE {table} ADD COLUMN {name} {definition}')
+
+    @staticmethod
+    def require_actor(c, actor, *, write=True):
+        if isinstance(actor, int):
+            keys=['discord:'+str(actor)]
+            profile=c.execute('SELECT * FROM hub_profiles WHERE discord_id=?',(actor,)).fetchone()
+        else:
+            profile_id=str(actor).removeprefix('web:').removeprefix('profile:')
+            keys=['profile:'+profile_id]
+            profile=c.execute('SELECT * FROM hub_profiles WHERE id=?',(profile_id,)).fetchone()
+        if profile:
+            if profile['suspended']:raise MatchError('Dit profiel is gepauzeerd.')
+            keys.append('profile:'+profile['id'])
+            if profile['discord_id'] is not None:keys.append('discord:'+str(profile['discord_id']))
+        for key in set(keys):
+            state=c.execute('SELECT suspended,restricted FROM hub_moderation WHERE actor=?',(key,)).fetchone()
+            if state and state['suspended']:raise MatchError('Dit profiel is gepauzeerd.')
+            if state and state['restricted'] and write:raise MatchError('Dit profiel heeft alleen leestoegang.')
 
     @contextmanager
     def _connection(self):
@@ -136,8 +169,8 @@ class MatchStore:
         names={}
         for actor in set(players+(row['owner_id'],)):
             if isinstance(actor,int):
-                person=c.execute('SELECT name FROM hub_profiles WHERE discord_id=?',(actor,)).fetchone()
-                person=person or c.execute('SELECT name FROM hub_discord_names WHERE id=?',(actor,)).fetchone()
+                person=c.execute('SELECT name FROM hub_discord_names WHERE id=?',(actor,)).fetchone()
+                person=person or c.execute('SELECT name FROM hub_profiles WHERE discord_id=?',(actor,)).fetchone()
             else:
                 person=c.execute('SELECT name FROM hub_profiles WHERE id=?',(str(actor).removeprefix('web:'),)).fetchone()
             names[actor]=person['name'] if person else 'Discord-speler' if isinstance(actor,int) else 'Speler'
@@ -164,6 +197,7 @@ class MatchStore:
         match_id = uuid.uuid4().hex
         with self._connection() as c:
             c.execute("BEGIN IMMEDIATE")
+            self.require_actor(c,owner_id)
             row = c.execute("SELECT id FROM shared_matches WHERE owner_id=? AND booking_id=?",
                             (owner_id, booking_id)).fetchone()
             if row:
@@ -202,6 +236,7 @@ class MatchStore:
     def change_player(self, match_id: str, user_id: int, *, join: bool) -> Match:
         with self._connection() as c:
             c.execute("BEGIN IMMEDIATE")
+            self.require_actor(c,user_id,write=join)
             match = self._get(c, match_id)
             if match is None:
                 raise MatchError("Dit groepsbericht is niet meer beschikbaar.")
@@ -267,6 +302,7 @@ class MatchStore:
     def reserve_post(self, match_id, owner_id, channel_id, guild_id, *, move=False):
         with self._connection() as c:
             c.execute("BEGIN IMMEDIATE")
+            self.require_actor(c,owner_id)
             match = self._get(c, match_id)
             if match is None or match.owner_id != owner_id or match.status != "open" or match.started:
                 raise MatchError("Deze reservatie kan niet meer gedeeld worden.")

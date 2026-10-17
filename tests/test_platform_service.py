@@ -100,7 +100,9 @@ def test_delivery_cannot_leak_to_changed_or_suspended_identity(portal):
         def get_user(self,_):pytest.fail('Suspended profile must not receive a link')
     from padelbot.discord_delivery import deliver_once
     asyncio.run(deliver_once(Bot(),s))
-    assert s.delivery_status(alice['id'])[0]['status']=='failed'
+    assert s.delivery_status(alice['id'])[0]['status']=='cancelled'
+    with store.conn() as c:
+        assert c.execute('SELECT payload FROM discord_deliveries WHERE user_id=?',(alice['id'],)).fetchone()[0]==''
 
 
 def test_discord_oauth_links_verified_identity_without_storing_token(portal,monkeypatch):

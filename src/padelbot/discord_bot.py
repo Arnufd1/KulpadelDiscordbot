@@ -71,6 +71,7 @@ class PadelBot(commands.Bot):
         self._last_keepalive_at: float = 0.0
         self.platform=None
         self._delivery_task=None
+        self._identity_task=None
         if settings.padelbot_platform_root is not None:
             from .web_store import PlatformStore
             from .platform_service import PlatformService
@@ -113,6 +114,13 @@ class PadelBot(commands.Bot):
 
     async def on_ready(self) -> None:
         logger.info("Bot ready as {} (id={}).", self.user, getattr(self.user, "id", "?"))
+        from .hub import HubStore
+        from .identity import run_identity_refresh
+        hub=HubStore(self.match_store)
+        hub.sync_guilds(self.guilds)
+        hub.backfill_shared_contexts()
+        if self._identity_task is None or self._identity_task.done():
+            self._identity_task=asyncio.create_task(run_identity_refresh(self,hub))
         owner_ok = bool(settings.discord_owner_id)
         if self.platform is not None and (self._delivery_task is None or self._delivery_task.done()):
             from .discord_delivery import run_deliveries
@@ -167,6 +175,8 @@ class PadelBot(commands.Bot):
         self._availability_watcher_task = asyncio.create_task(run_availability_watcher(self))
 
     async def close(self):
+        if self._identity_task is not None:
+            self._identity_task.cancel();await asyncio.gather(self._identity_task,return_exceptions=True)
         if self._reminder_task is not None:
             self._reminder_task.cancel();await asyncio.gather(self._reminder_task,return_exceptions=True)
         if self._delivery_task is not None:
@@ -184,6 +194,14 @@ class PadelBot(commands.Bot):
 
     async def _platform_lifetime(self):
         await asyncio.Event().wait()
+
+    async def on_guild_join(self,guild):
+        from .hub import HubStore
+        HubStore(self.match_store).remember_guild(guild.id,guild.name)
+
+    async def on_guild_remove(self,guild):
+        from .hub import HubStore
+        HubStore(self.match_store).remember_guild(guild.id,guild.name,active=False)
 
     def _has_component_handler(self, interaction: discord.Interaction) -> bool:
         # discord.py dispatches the view before on_interaction. Consult the same
@@ -209,6 +227,12 @@ class PadelBot(commands.Bot):
 
     async def on_interaction(self, interaction: discord.Interaction) -> None:
         """Recover expired reservation panels without replaying their action."""
+        try:
+            from .hub import HubStore
+            from .identity import remember_interaction
+            remember_interaction(HubStore(self.match_store),interaction)
+        except Exception as error:
+            logger.warning('Discord identity capture deferred: {}',type(error).__name__)
         if interaction.type != discord.InteractionType.component:
             return
         message = interaction.message
@@ -553,7 +577,8 @@ def _register_commands(bot: PadelBot) -> None:
             if interaction.user.bot:raise ValueError('Gebruik je persoonlijke Discord-account.')
             hub=HubStore(bot.match_store)
             await asyncio.to_thread(hub.consume_code,code,interaction.user.id)
-            hub.remember_discord(interaction.user.id,getattr(interaction.user,'display_name','Discord-speler'))
+            from .identity import remember_interaction
+            remember_interaction(hub,interaction)
             message='Discord is gekoppeld. De hub en Discord gebruiken nu dezelfde deelname. Vernieuw je profiel in de hub.'
         except ValueError as error:
             message=str(error)

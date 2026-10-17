@@ -60,6 +60,7 @@ class DraftStore:
         return row
 
     def create(self,profile_id,product,court,target,end):
+        self.community.store.assert_writable(profile_id)
         from .web_community import timestamp
         start=timestamp(target);finish=timestamp(end);now=time.time()
         target=datetime.fromtimestamp(start,timezone.utc).isoformat()
@@ -73,7 +74,7 @@ class DraftStore:
             if old:raise ValueError('Voor dit tijdslot bestaat al een draft. De maximale looptijd wordt niet opnieuw gestart.')
             if c.execute("SELECT count(*) FROM hub_drafts WHERE profile_id=? AND state IN ('pending','active','refreshing','uncertain','converting','payment_pending')",(profile_id,)).fetchone()[0]>=3:
                 raise ValueError('Je kunt maximaal drie actieve drafts hebben.')
-            actor=self.community.hub.actor(c,profile_id)
+            actor=self.community.hub.actor(c,profile_id,write=True)
             match_id=uuid.uuid4().hex
             c.execute('''INSERT INTO shared_matches(id,owner_id,booking_id,start_iso,end_iso,start_at,court,channel_id,
                 status,hub_profile_id,hub_visible,hub_confirmed) VALUES(?,?,?,?,?,?,?,0,'draft',?,0,0)''',
@@ -160,21 +161,24 @@ class DraftStore:
             c.execute("UPDATE shared_matches SET hub_visible=0 WHERE id IN (SELECT id FROM hub_drafts WHERE state IN ('uncertain','payment_pending'))")
 
     def joined(self,draft_id,profile_id):
+        self.community.store.assert_writable(profile_id)
         with self.matches._connection() as c:
             c.execute('BEGIN IMMEDIATE')
             row=c.execute('SELECT * FROM hub_drafts WHERE id=?',(draft_id,)).fetchone()
             if not row or row['state'] not in {'active','refreshing'} or time.time()>=min(row['deadline'],draft_deadline(row['created'],datetime.fromisoformat(row['target']).timestamp(),time.time())):raise ValueError('Deze draft is niet meer actief.')
             host=c.execute('SELECT suspended FROM hub_profiles WHERE id=?',(row['profile_id'],)).fetchone()
             if not host or host['suspended']:raise ValueError('Deze draft is niet meer beschikbaar.')
-            actor=self.community.hub.actor(c,profile_id)
+            actor=self.community.hub.actor(c,profile_id,write=True)
             match=self.matches._get(c,draft_id)
             if actor in match.players:return
             if len(match.players)>=4:raise ValueError('Deze draft heeft al vier deelnemers.')
             c.execute('INSERT INTO match_players VALUES(?,?,?)',(draft_id,actor,time.time()))
 
     def start_conversion(self,draft_id,profile_id):
+        self.community.store.assert_writable(profile_id)
         with self.matches._connection() as c:
             c.execute('BEGIN IMMEDIATE')
+            self.community.hub.actor(c,profile_id,write=True)
             row=c.execute('SELECT * FROM hub_drafts WHERE id=? AND profile_id=?',(draft_id,profile_id)).fetchone()
             if not row or row['state']!='active' or time.time()>=min(row['deadline'],draft_deadline(row['created'],datetime.fromisoformat(row['target']).timestamp(),time.time())):
                 raise ValueError('Deze draft is niet meer actief of hoort bij een ander profiel.')

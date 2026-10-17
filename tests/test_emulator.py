@@ -66,6 +66,33 @@ def test_other_tenants_emulator_is_never_borrowed(virtual_setup,monkeypatch):
         emulator.ensure_emulator()
 
 
+@pytest.mark.parametrize('missing',['index','config','disk','overlay','key','wrong_path','empty_disk'])
+def test_verified_enrollment_never_silently_initializes_another_identity(virtual_setup,monkeypatch,missing):
+    home=settings.padelbot_android_emulator_home
+    avd=home/'KulPadelAuth.avd';avd.mkdir()
+    index=home/'KulPadelAuth.ini';index.write_text('path='+str(avd)+'\n')
+    config=avd/'config.ini';config.write_text('AvdId=KulPadelAuth\n')
+    disk=avd/'userdata-qemu.img';disk.write_bytes(b'registered identity')
+    overlay=avd/'userdata-qemu.img.qcow2';overlay.write_bytes(b'registered identity overlay')
+    key=avd/'encryptionkey.img';key.write_bytes(b'native encryption key')
+    profile=home/'profile.json'
+    import json
+    original=json.dumps({'enrollment_verified':True,'native_storage':['userdata-qemu.img','userdata-qemu.img.qcow2','encryptionkey.img']})
+    profile.write_text(original)
+    monkeypatch.setattr(settings,'padelbot_android_profile_file',profile)
+    if missing=='index':index.unlink()
+    elif missing=='config':config.unlink()
+    elif missing=='disk':disk.unlink()
+    elif missing=='overlay':overlay.unlink()
+    elif missing=='key':key.unlink()
+    elif missing=='wrong_path':index.write_text('path='+str(home/'another.avd')+'\n')
+    else:disk.write_bytes(b'')
+    monkeypatch.setattr(emulator.subprocess,'Popen',lambda *a,**k:pytest.fail('An enrolled disk was reinitialized'))
+    with pytest.raises(RuntimeError,match='koppeling blijft bewaard'):
+        emulator.ensure_emulator()
+    assert profile.read_text()==original
+
+
 @pytest.mark.parametrize('serial', ['physical-phone', '192.168.0.10:5554', 'emulator-5555', 'emulator-99999'])
 def test_invalid_or_physical_target_is_rejected_before_device_actions(virtual_setup, monkeypatch, serial):
     monkeypatch.setattr(settings, 'padelbot_android_serial', serial)

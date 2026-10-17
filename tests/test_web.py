@@ -112,7 +112,7 @@ def test_admin_proof_is_bound_to_google_session_and_cannot_be_replayed(portal):
     r=client.get('/api/admin/users')
     assert r.status_code==200
     assert len(r.json()['users'])==3
-    assert all(set(u)<= {'id','email','name','owner','suspended','created','connected','rules'} for u in r.json()['users'])
+    assert all(set(u)<= {'id','email','name','owner','suspended','restricted','created','connected','rules','avatar_url','discord_id'} for u in r.json()['users'])
 
 
 def test_explicit_tagged_admin_device_can_confirm_but_public_header_cannot(portal):

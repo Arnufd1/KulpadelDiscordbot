@@ -317,6 +317,130 @@ def test_expired_token_without_refresh_token_uses_http_session(tmp_path, monkeyp
     assert store.load().access_token == "renewed"
 
 
+@pytest.mark.parametrize("status", [400, 401])
+def test_revoked_refresh_grant_is_classified_as_expired_session(monkeypatch, status):
+    monkeypatch.setattr(auth.httpx, "post", lambda *a, **k: httpx.Response(status, json={
+        "error": "invalid_grant", "error_description": "private provider detail"}))
+    with pytest.raises(idp.SessionExpiredError) as error:
+        auth.refresh(TokenBundle("old", "", "revoked", "Bearer", 0, "openid"))
+    assert "private provider detail" not in str(error.value)
+
+
+def test_revoked_refresh_grant_renews_once_and_keeps_identity_across_clients(tmp_path, monkeypatch):
+    from padelbot import android
+    store = make_store(tmp_path)
+    original_key = store.key_file.read_bytes()
+    monkeypatch.setattr(settings, "padelbot_android_autologin", True)
+    calls = []
+    provider = object()
+    monkeypatch.setattr(android, "AndroidApprover", lambda: provider)
+    def expired(*args, **kwargs):
+        calls.append("refresh")
+        return httpx.Response(400, json={"error": "invalid_grant"})
+    def login(approver):
+        assert approver is provider
+        calls.append("native-login")
+        return TokenBundle("renewed", "", "new-grant", "Bearer", time.time() + 600, "openid")
+    monkeypatch.setattr(auth.httpx, "post", expired)
+    monkeypatch.setattr(auth, "login_via_android", login)
+    # Different jobs/process clients continue to use the same encrypted state;
+    # an expired grant does not create a new identity or registration.
+    def worker(_):
+        return auth.get_access_token(TokenStore(store.key_file, store.blob_file))
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        assert list(pool.map(worker, range(4))) == ["renewed"] * 4
+    assert calls == ["refresh", "native-login"]
+    reopened = TokenStore(store.key_file, store.blob_file)
+    assert reopened.load().refresh_token == "new-grant"
+    assert reopened.key_file.read_bytes() == original_key
+
+
+def test_revoked_refresh_grant_never_enables_android_implicitly(tmp_path, monkeypatch):
+    from padelbot import android
+    store = make_store(tmp_path)
+    before = store.blob_file.read_bytes()
+    monkeypatch.setattr(settings, "padelbot_android_autologin", False)
+    monkeypatch.setattr(auth.httpx, "post", lambda *a, **k: httpx.Response(400, json={"error": "invalid_grant"}))
+    monkeypatch.setattr(android, "AndroidApprover", lambda: pytest.fail("Android was not enabled"))
+    with pytest.raises(idp.SessionExpiredError):
+        auth.get_access_token(store)
+    assert store.blob_file.read_bytes() == before
+
+
+@pytest.mark.parametrize("status,body", [
+    (400, {"error": "invalid_client"}), (401, {"error": "unauthorized_client"}),
+    (503, {"error": "invalid_grant"}), (400, []), (400, None),
+])
+def test_refresh_protocol_failures_do_not_trigger_native_login(tmp_path, monkeypatch, status, body):
+    from padelbot import android
+    store = make_store(tmp_path)
+    before = store.blob_file.read_bytes()
+    monkeypatch.setattr(settings, "padelbot_android_autologin", True)
+    response = httpx.Response(status, json=body) if body is not None else httpx.Response(status, text="unavailable")
+    monkeypatch.setattr(auth.httpx, "post", lambda *a, **k: response)
+    monkeypatch.setattr(android, "AndroidApprover", lambda: pytest.fail("Unexpected native login"))
+    with pytest.raises(RuntimeError) as error:
+        auth.get_access_token(store)
+    assert not isinstance(error.value, idp.SessionExpiredError)
+    assert store.blob_file.read_bytes() == before
+
+
+def test_refresh_network_failure_does_not_trigger_native_login(tmp_path, monkeypatch):
+    from padelbot import android
+    store = make_store(tmp_path)
+    before = store.blob_file.read_bytes()
+    monkeypatch.setattr(settings, "padelbot_android_autologin", True)
+    def unavailable(*args, **kwargs):
+        raise httpx.ConnectError("network unavailable")
+    monkeypatch.setattr(auth.httpx, "post", unavailable)
+    monkeypatch.setattr(android, "AndroidApprover", lambda: pytest.fail("Unexpected native login"))
+    with pytest.raises(httpx.ConnectError):
+        auth.get_access_token(store)
+    assert store.blob_file.read_bytes() == before
+
+
+def test_revoked_refresh_grant_preserves_existing_pin_failure_latch(tmp_path, monkeypatch):
+    from padelbot import android
+    store = make_store(tmp_path)
+    before = store.blob_file.read_bytes()
+    failure = tmp_path / "pin-failure.json"
+    failure.write_text('{"failed":true}')
+    monkeypatch.setattr(settings, "padelbot_android_autologin", True)
+    monkeypatch.setattr(settings, "padelbot_android_failure_file", failure)
+    monkeypatch.setattr(auth.httpx, "post", lambda *a, **k: httpx.Response(400, json={"error": "invalid_grant"}))
+    monkeypatch.setattr(auth, "login_via_android", lambda *a, **k: pytest.fail("Blocked PIN was retried"))
+    with pytest.raises(RuntimeError, match="earlier Android PIN attempt failed"):
+        auth.get_access_token(store)
+    assert failure.exists() and store.blob_file.read_bytes() == before
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_missing_cookie_session_can_use_existing_native_registration(tmp_path, monkeypatch, enabled):
+    from padelbot import android
+    store = make_store(tmp_path)
+    bundle = store.load()
+    bundle.refresh_token = None
+    store.save(bundle)
+    monkeypatch.setattr(settings, "padelbot_storage_file", tmp_path / "missing-session.json")
+    monkeypatch.setattr(settings, "padelbot_android_autologin", enabled)
+    calls = []
+    provider = object()
+    monkeypatch.setattr(android, "AndroidApprover", lambda: provider if enabled else pytest.fail("Android disabled"))
+    def login(approver):
+        assert approver is provider
+        calls.append("native-login")
+        return TokenBundle("renewed", "", None, "Bearer", time.time() + 600, "openid")
+    monkeypatch.setattr(auth, "login_via_android", login)
+    if enabled:
+        assert auth.get_access_token(store) == "renewed"
+        assert calls == ["native-login"]
+    else:
+        with pytest.raises(idp.SessionExpiredError):
+            auth.get_access_token(store)
+        assert store.load().access_token == "expired"
+        assert calls == []
+
+
 def test_keepalive_recovers_after_failures_without_restart_or_repeated_dm(monkeypatch):
     import asyncio
     from padelbot.discord_bot import PadelBot

@@ -100,7 +100,8 @@ class GroupMatchView(discord.ui.View):
         if not await self.interaction_check(interaction):
             return
         from .hub import HubStore
-        HubStore(self.store).remember_discord(interaction.user.id,getattr(interaction.user,'display_name','Discord-speler'))
+        from .identity import remember_interaction
+        remember_interaction(HubStore(self.store),interaction)
         if action == "remove" and interaction.user.id != self.store.get(self.match_id).owner_id:
             await interaction.response.send_message("Alleen de organisator kan dit groepsbericht verwijderen.", ephemeral=True)
             return

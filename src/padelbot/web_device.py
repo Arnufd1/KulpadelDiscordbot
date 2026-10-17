@@ -84,9 +84,11 @@ def _registration_payload(payload:bytes) -> str|None:
 
 def provision():
     from .config import settings
+    from .emulator import require_persisted_avd
     home = settings.padelbot_android_emulator_home.resolve()
     name = settings.padelbot_android_emulator_name
     avd = home / (name+".avd")
+    require_persisted_avd(home,name)
     if (home / (name+".ini")).exists():
         config=avd/'config.ini'
         if config.is_file():
@@ -133,6 +135,12 @@ def save_profile(pin: str):
                     "guard":{"resourceId":PACKAGE+":id/title","text":"Is it you trying to sign in?"},
                     "length":4,"empty_selector":{"resourceId":PACKAGE+":id/pin_input_not_set"},
                     "keypad":{str(i):{"resourceId":PACKAGE+f":id/button{i}","text":str(i)} for i in range(10)}}]}
+    if settings.padelbot_android_emulator_autostart:
+        from .emulator import AVD_IDENTITY_FILES
+        avd=settings.padelbot_android_emulator_home/(settings.padelbot_android_emulator_name+'.avd')
+        profile['native_storage']=[name for name in AVD_IDENTITY_FILES if (avd/name).is_file() and (avd/name).stat().st_size>0]
+        if 'userdata-qemu.img' not in profile['native_storage']:
+            raise ValueError('KUL kon de koppeling nog niet bewaren. Probeer opnieuw.')
     AndroidPinStore(initial.key_file,settings.padelbot_android_pin_file).save(pin)
     from .idp import save_state
     save_state(settings.padelbot_android_profile_file,profile)
@@ -189,6 +197,8 @@ def verify_saved_account(device):
     device.app_stop(PACKAGE)
     device.app_start(PACKAGE,wait=True)
     wait_registered()
+    # The proof and the persisted Android data must refer to the same restart.
+    run_adb('shell','sync',serial=settings.padelbot_android_serial)
 
 
 def prepare_enrollment(device):
@@ -434,12 +444,22 @@ class DeviceManager:
 
     async def _stop(self):
         if self.process and self.process.returncode is None:
-            self.process.terminate()
+            # Let the worker leave its command loop and flush/close Android in
+            # its finally block. SIGTERM remains a fallback for an unresponsive
+            # command, rather than interrupting a completed profile save.
             try:
+                if self.process.stdin:
+                    self.process.stdin.write(b'{"action":"stop"}\n')
+                    await self.process.stdin.drain()
                 await asyncio.wait_for(self.process.wait(),timeout=40)
-            except asyncio.TimeoutError:
-                self.process.kill()
-                await self.process.wait()
+            except (asyncio.TimeoutError,BrokenPipeError,ConnectionResetError):
+                if self.process.returncode is None:
+                    self.process.terminate()
+                    try:
+                        await asyncio.wait_for(self.process.wait(),timeout=40)
+                    except asyncio.TimeoutError:
+                        self.process.kill()
+                        await self.process.wait()
         self.process = None
         self.user_id = None
 

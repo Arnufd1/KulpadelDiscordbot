@@ -55,6 +55,9 @@ def tenant_env(store: PlatformStore, user: dict) -> dict[str, str]:
     env["PADELBOT_ENV_FILE"] = ""
     for key, value in config.items():
         if value is not None:
+            # Identity files stay anchored to the service directory even if a
+            # child starts from another checkout or working directory.
+            if isinstance(value,Path):value=value.resolve()
             env[key.upper()] = str(value) if not isinstance(value,bool) else str(value).lower()
     env["PADELWEB_PROFILE_ROOT"] = str(root)
     env["PADELWEB_PREFERENCES"] = json.dumps(store.preferences(user["id"]))
@@ -110,6 +113,12 @@ class JobRunner:
             if not user or (user["suspended"] and row['kind']!='draft_release'):
                 self.finish(row["id"],"cancelled",{"error":"Profiel is gepauzeerd."})
                 continue
+            if row['kind'] in {'book','rule','community_join','draft_refresh'}:
+                try:
+                    self.store.assert_writable(user['id'])
+                except ValueError as error:
+                    self.finish(row['id'],'cancelled',{'error':str(error)})
+                    continue
             with self.store.conn() as c:
                 c.execute("UPDATE jobs SET status='running' WHERE id=?",(row["id"],))
             output = tenant_root(self.store,user) / ("job-"+row["id"]+".json")
@@ -194,7 +203,7 @@ class JobRunner:
         while True:
             now = datetime.now(tz)
             with self.store.conn() as c:
-                users = [dict(r) for r in c.execute("SELECT * FROM users WHERE suspended=0")]
+                users = [dict(r) for r in c.execute("SELECT * FROM users WHERE suspended=0 AND restricted=0")]
             for user in users:
                 prefs = self.store.preferences(user["id"])
                 if not service.can_autobook(user['id']) or float(prefs.get("max_amount",0))<=0:

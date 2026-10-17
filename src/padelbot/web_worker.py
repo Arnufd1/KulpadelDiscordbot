@@ -23,12 +23,19 @@ _prepared_service=None
 
 def current_preferences() -> dict:
     if os.environ.get('PADELWEB_DB') and os.environ.get('PADELWEB_USER_ID'):
-        with sqlite3.connect(os.environ['PADELWEB_DB']) as c:
-            row=c.execute('SELECT preferences,suspended FROM users WHERE id=?',(os.environ['PADELWEB_USER_ID'],)).fetchone()
-        if row is None or row[1]:
-            raise ValueError('Dit profiel is gepauzeerd.')
-        return json.loads(row[0])
+        user=assert_writable_profile()
+        return json.loads(user['preferences'])
     return json.loads(os.environ.get('PADELWEB_PREFERENCES','{}'))
+
+
+def assert_writable_profile():
+    """Re-read moderation at the reservation boundary, including queued jobs."""
+    from .platform_service import PlatformService
+    context=platform_context()
+    service=PlatformService(context.store,context)
+    user_id=os.environ['PADELWEB_USER_ID']
+    service.require_writable(user_id)
+    return context.store.user(user_id)
 
 
 def initialise_key():
@@ -82,6 +89,8 @@ def execute(kind: str, payload: dict) -> dict:
     global _reservation_started,_prepared_delivery,_prepared_service
     _reservation_started=False
     _prepared_delivery=_prepared_service=None
+    if kind in {'book','rule','draft_refresh'} and os.environ.get('PADELWEB_DB'):
+        assert_writable_profile()
     from .client import BackboneClient
     from .booking import find_slots_window, find_slots, book, get_product_names
     from .booking_manager import list_my_bookings
@@ -140,10 +149,11 @@ def execute(kind: str, payload: dict) -> dict:
                     drafts.release(client,draft['id'],int(me['id']))
                     raise ValueError('Dit terrein is niet meer beschikbaar. De draft is gestopt.')
                 user=drafts.community.store.user(os.environ['PADELWEB_USER_ID'])
-                if not user or user['suspended']:
+                if not user or user['suspended'] or user.get('restricted'):
                     drafts.stop(draft['id'],draft['profile_id'],'cancelled')
                     drafts.release(client,draft['id'],int(me['id']))
-                    raise ValueError('Dit profiel is gepauzeerd; de draft is gestopt.')
+                    raise ValueError('Dit profiel kan geen nieuwe reserveringen maken; de draft is gestopt.')
+                assert_writable_profile()
                 item=ensure_draft_cart(client,slot,int(me['id']),int(me.get('category') or 0),'Sigmadvisor draft '+draft['id'])
                 name=get_product_names(client,{slot.bookable_product_id}).get(slot.bookable_product_id,'Padel')
                 drafts.activate(draft['id'],slot,item,name)
@@ -226,6 +236,7 @@ def execute(kind: str, payload: dict) -> dict:
             me=attach_stored_method(client,fresh,cards_only=True)
             service.remember_payment(os.environ['PADELWEB_USER_ID'],payment_summary(me))
             validate_autobook_payment(me,mode)
+        assert_writable_profile()
         _reservation_started=True
         result = book(client,slot,member_id=int(me["id"]),me=me,expected_amount=amount,label=rule.notes if rule else "Sigmadvisor",payment_mode=mode)
         payment_via_discord=False

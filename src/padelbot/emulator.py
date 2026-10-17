@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 import os
 from pathlib import Path
 import re
@@ -17,6 +18,37 @@ from .config import settings
 
 
 _start_lock = threading.RLock()
+AVD_IDENTITY_FILES = ("userdata-qemu.img", "userdata-qemu.img.qcow2", "encryptionkey.img", "encryptionkey.img.qcow2")
+
+
+def require_persisted_avd(home: Path, name: str) -> None:
+    """Never replace an enrolled identity with a newly initialized Android disk."""
+    profile = settings.padelbot_android_profile_file
+    if not profile.is_file():
+        return
+    try:
+        saved = json.loads(profile.read_text(encoding="utf-8"))
+        registered = saved.get("enrollment_verified") is True
+    except (OSError, ValueError, AttributeError):
+        registered = False
+    if not registered:
+        return
+    avd = (home / f"{name}.avd").resolve()
+    index = home / f"{name}.ini"
+    try:
+        values = dict(line.split("=", 1) for line in index.read_text(encoding="utf-8").splitlines() if "=" in line)
+        indexed = Path(values["path"]).resolve()
+        # Older web profiles also use a writable QCOW overlay: the small raw
+        # base image alone does not contain their registered account.
+        files = saved.get("native_storage", list(AVD_IDENTITY_FILES[:2]))
+        valid_files = (isinstance(files,list) and "userdata-qemu.img" in files
+                       and bool(files) and all(name in AVD_IDENTITY_FILES for name in files))
+        if (indexed == avd and (avd / "config.ini").is_file() and valid_files
+                and all((avd / name).is_file() and (avd / name).stat().st_size > 0 for name in files)):
+            return
+    except (OSError, KeyError, ValueError):
+        pass
+    raise RuntimeError("Het bewaarde KUL-toestel is niet beschikbaar. De koppeling blijft bewaard; neem contact op met de beheerder.")
 
 
 def _release_file_cache(roots: tuple[Path, ...]) -> None:
@@ -106,6 +138,7 @@ def _ensure_emulator(timeout: float = 120) -> StartedEmulator | None:
     name = settings.padelbot_android_emulator_name
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
         raise RuntimeError("Invalid virtual Android name.")
+    require_persisted_avd(settings.padelbot_android_emulator_home.resolve(), name)
 
     with _start_lock:
         connected = next((d for d in list_devices() if d["serial"] == serial), None)
