@@ -182,8 +182,8 @@ def _ensure_emulator(timeout: float = 120) -> StartedEmulator | None:
         elif connected["state"] == "unauthorized":
             raise RuntimeError("The configured virtual Android is not authorized for debugging.")
         elif connected["state"] == "device":
-            active_name = run_adb("emu", "avd", "name", serial=serial).splitlines()[0].strip()
-            if active_name != name:
+            active_names = run_adb("emu", "avd", "name", serial=serial).splitlines()
+            if not active_names or active_names[0].strip() != name:
                 raise RuntimeError("Another user's virtual Android is active; wait for its session to finish.")
 
         try:
@@ -194,10 +194,18 @@ def _ensure_emulator(timeout: float = 120) -> StartedEmulator | None:
                 if started is not None and started.process.poll() is not None:
                     raise RuntimeError("Virtual Android stopped before startup completed; check its local log.")
                 try:
-                    if run_adb("shell", "getprop", "sys.boot_completed", serial=serial).strip() == "1":
-                        return started
+                    ready = run_adb("shell", "getprop", "sys.boot_completed", serial=serial).strip() == "1"
                 except RuntimeError:
-                    pass
+                    ready = False
+                if ready:
+                    if started is None and connected["state"] != "device":
+                        # A previously offline ADB slot can belong to another
+                        # profile. Becoming reachable proves boot, not identity.
+                        # Never reuse it or touch its app before checking AVD.
+                        active_names=run_adb('emu','avd','name',serial=serial).splitlines()
+                        if not active_names or active_names[0].strip()!=name:
+                            raise RuntimeError("Another user's virtual Android is active; wait for its session to finish.")
+                    return started
                 time.sleep(1)
             raise RuntimeError("Virtual Android did not finish starting; check its local log before retrying.")
         except BaseException as error:

@@ -247,6 +247,7 @@ class AndroidApprover:
         self.device_info = None
         self._emulator = None
         self._remote = None
+        self._prepared_device = None
         if not manual and settings.padelbot_android_failure_file.exists():
             raise RuntimeError("An earlier Android PIN attempt failed. Check the app, then run android reset-failure.")
         self.profile = None if manual else read_profile()
@@ -279,6 +280,20 @@ class AndroidApprover:
             if (self.profile[identity_key] != info.get(identity_key)
                     or self.profile["app_version"] != info["app_version"]):
                 raise RuntimeError("Android device or app version changed. Recalibrate before automatic approval.")
+        if (settings.padelbot_android_emulator_autostart and self.profile is not None
+                and 'startup_guard' in self.profile):
+            # Native SDK/UI automation initialization can take tens of seconds
+            # after a cold boot. Finish it before the IdP creates its short-lived
+            # challenge. Clear old confirmation activities once, before warm-up.
+            device=connect_device(info['serial'])
+            device.app_stop(PACKAGE)
+            device.screen_on()
+            device.app_start(PACKAGE)
+            ready=device(packageName=PACKAGE,**self.profile['startup_guard'])
+            if (not ready.wait(timeout=60) or ready.count!=1
+                    or device.app_current().get('package')!=PACKAGE):
+                raise RuntimeError('Authenticator did not finish loading its registered account; no login link opened.')
+            self._prepared_device=device
         self.device_info = info
 
     def close(self) -> None:
@@ -288,6 +303,7 @@ class AndroidApprover:
         if self._emulator is not None:
             self._emulator.close()
             self._emulator = None
+        self._prepared_device = None
 
     def _enter_keypad(self, device, step: dict) -> None:
         empty = device(packageName=PACKAGE, **step["empty_selector"])
@@ -333,19 +349,27 @@ class AndroidApprover:
                 self.attempted_pin = self._remote.attempted_pin
             return
         self.prepare()
-        device = connect_device(self.device_info["serial"])
-        # Repeated deep links can leave old confirmation activities underneath
-        # the current one. Start this challenge with only its own app UI alive.
-        device.app_stop(PACKAGE)
-        device.screen_on()
-        if self.profile is not None and "startup_guard" in self.profile:
-            # On a freshly booted virtual Android, initialize the SDK and
-            # wait for its registered account before delivering the link.
-            device.app_start(PACKAGE)
+        device=getattr(self,'_prepared_device',None)
+        if device is not None:
+            # Reuse this login's already initialized SDK. Another app restart
+            # here would spend the challenge lifetime on the same cold work.
+            device.screen_on()
             ready = device(packageName=PACKAGE, **self.profile["startup_guard"])
-            if (not ready.wait(timeout=20) or ready.count != 1
+            if (ready.count != 1
                     or device.app_current().get("package") != PACKAGE):
                 raise RuntimeError("Authenticator did not finish loading its registered account; no login link opened.")
+        else:
+            # Preserve the physical/manual device path, including clearing old
+            # confirmation activities before opening this one login link.
+            device = connect_device(self.device_info["serial"])
+            device.app_stop(PACKAGE)
+            device.screen_on()
+            if self.profile is not None and "startup_guard" in self.profile:
+                device.app_start(PACKAGE)
+                ready = device(packageName=PACKAGE, **self.profile["startup_guard"])
+                if (not ready.wait(timeout=20) or ready.count != 1
+                        or device.app_current().get("package") != PACKAGE):
+                    raise RuntimeError("Authenticator did not finish loading its registered account; no login link opened.")
         open_challenge(link, serial=self.device_info["serial"])
         logger.info("Android: opened the bot's current login challenge.")
         time.sleep(0.5)

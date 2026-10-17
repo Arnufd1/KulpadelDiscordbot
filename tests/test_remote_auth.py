@@ -220,3 +220,26 @@ def test_remote_interruption_guard_is_durable_before_network_cleanup(tmp_path,mo
     provider._remote=SimpleNamespace(attempted_pin=True,on_failure=interrupted_remote_cleanup)
     with pytest.raises(SystemExit):provider.on_failure()
     assert provider.attempted_pin and failure.exists()
+
+
+def test_native_error_diagnostics_only_expose_fixed_stage_and_class():
+    assert remote_auth_worker.safe_native_failure(RuntimeError('Authenticator did not finish loading its registered account; no login link opened.'))=={
+        'stage':'startup_account','error_type':'RuntimeError'}
+    secret='7392 https://icts.kuleuven.be/apps/authenticator/private'
+    result=remote_auth_worker.safe_native_failure(RuntimeError(secret))
+    assert result=={'stage':'native','error_type':'RuntimeError'}
+    assert secret not in json.dumps(result)
+    Unknown=type('contains_private_account',(Exception,),{})
+    assert remote_auth_worker.safe_native_failure(Unknown(secret))['error_type']=='unknown'
+
+
+@pytest.mark.parametrize('message,stage',[
+    ('Virtual Android did not finish starting; check its local log before retrying.','boot_timeout'),
+    ('Virtual Android stopped before startup completed; check its local log.','boot_exit'),
+    ('The configured virtual Android is not authorized for debugging.','adb_unauthorized'),
+    ('ADB command failed (exit 1); check the device connection.','adb_command'),
+    ('ADB command failed (exit secret); check the device connection.','native'),
+])
+def test_native_boot_failure_diagnostics_remain_coarse(message,stage):
+    result=remote_auth_worker.safe_native_failure(RuntimeError(message))
+    assert result=={'stage':stage,'error_type':'RuntimeError'}

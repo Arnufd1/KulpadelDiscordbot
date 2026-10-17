@@ -301,6 +301,88 @@ def test_profile_startup_guard_initializes_registered_account_before_opening_lin
     assert events == ["initialize-own-app", "own-account-ready", "open-own-link", "own-confirmation-ready", "clicked"]
 
 
+@pytest.fixture
+def warm_native_setup(tmp_path,monkeypatch):
+    monkeypatch.setattr(settings,'padelbot_android_failure_file',tmp_path/'failure')
+    monkeypatch.setattr(settings,'padelbot_auth_remote_command',None)
+    monkeypatch.setattr(settings,'padelbot_android_emulator_autostart',True)
+    events=[]
+    monkeypatch.setattr(android,'read_profile',lambda:{'serial':'emulator-5554','app_version':'1',
+        'startup_guard':{'resourceId':'own-account'},'steps':[
+            {'action':'click','selector':{'resourceId':'own-next'},'guard':{'resourceId':'own-confirmation'}}]})
+    def start():
+        events.append('boot')
+        return types.SimpleNamespace(close=lambda:events.append('shutdown'))
+    monkeypatch.setattr('padelbot.emulator.ensure_emulator',start)
+    monkeypatch.setattr(android,'doctor',lambda:(events.append('doctor') or {'serial':'emulator-5554','app_version':'1'}))
+    class Element:
+        def __init__(self,resource):self.resource=resource
+        @property
+        def count(self):return int(device.home_ready) if self.resource=='own-account' else 1
+        def wait(self,timeout):
+            events.append(('wait',self.resource,timeout))
+            return device.home_ready if self.resource=='own-account' else True
+        def click(self):events.append('next')
+    class Device:
+        home_ready=True
+        def app_stop(self,package):events.append('stop')
+        def screen_on(self):events.append('screen')
+        def app_start(self,package):events.append('start')
+        def app_current(self):return {'package':android.PACKAGE}
+        def __call__(self,**kwargs):
+            assert kwargs['packageName']==android.PACKAGE
+            return Element(kwargs['resourceId'])
+    device=Device()
+    monkeypatch.setattr(android,'connect_device',lambda serial:(events.append('connect') or device))
+    monkeypatch.setattr(android,'open_challenge',lambda *args,**kwargs:events.append('open-challenge'))
+    monkeypatch.setattr('time.sleep',lambda seconds:None)
+    return device,events
+
+
+def test_emulator_warms_sdk_before_challenge_and_reuses_it_without_restart(warm_native_setup):
+    device,events=warm_native_setup
+    approver=android.AndroidApprover()
+    approver.prepare()
+    assert events==['boot','doctor','connect','stop','screen','start',('wait','own-account',60)]
+    events.append('challenge-created')
+    approver(LINK)
+    assert events==['boot','doctor','connect','stop','screen','start',('wait','own-account',60),
+                    'challenge-created','screen','open-challenge',('wait','own-confirmation',15),'next']
+    assert events.count('stop')==events.count('start')==events.count('connect')==1
+    assert not approver.attempted_pin
+    approver.close()
+    assert events[-1]=='shutdown'
+
+
+def test_emulator_unready_registered_account_fails_before_any_challenge(warm_native_setup):
+    device,events=warm_native_setup;device.home_ready=False
+    approver=android.AndroidApprover()
+    with pytest.raises(RuntimeError,match='registered account'):
+        approver.prepare()
+    assert 'open-challenge' not in events and 'next' not in events
+    assert not approver.attempted_pin
+    approver.close()
+    assert events[-1]=='shutdown'
+
+
+def test_changed_warmed_home_is_rejected_without_restart_or_challenge(warm_native_setup):
+    device,events=warm_native_setup
+    approver=android.AndroidApprover();approver.prepare();device.home_ready=False
+    with pytest.raises(RuntimeError,match='registered account'):approver(LINK)
+    assert events.count('stop')==events.count('start')==1
+    assert 'open-challenge' not in events and 'next' not in events
+    assert not approver.attempted_pin
+
+
+def test_physical_prepare_does_not_start_or_initialize_app(warm_native_setup,monkeypatch):
+    device,events=warm_native_setup
+    monkeypatch.setattr(settings,'padelbot_android_emulator_autostart',False)
+    monkeypatch.setattr('padelbot.emulator.ensure_emulator',lambda:None)
+    approver=android.AndroidApprover();approver.prepare()
+    assert events==['doctor']
+    assert approver._prepared_device is None
+
+
 def test_mirror_launches_only_selected_device_without_audio(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(android, "selected_device", lambda: {"serial": "test-device"})

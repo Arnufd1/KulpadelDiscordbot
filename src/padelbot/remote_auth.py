@@ -14,10 +14,14 @@ import threading
 import uuid
 
 from .config import settings
+from loguru import logger
 
 MAX_LINE = 64 * 1024
 REMOTE_TIMEOUT = 360
 ERROR = "KUL-authenticatie is tijdelijk niet beschikbaar. Probeer later opnieuw."
+ERROR_STAGES = frozenset({'startup_account','calibrated_guard','foreground','pin_controls','identity','challenge_open','action','native',
+                         'boot_timeout','boot_exit','boot_identity','boot_config','boot_missing','adb_unauthorized','adb_offline','adb_timeout','adb_command','native_storage'})
+ERROR_TYPES = frozenset({'RuntimeError','ValueError','TimeoutError','unknown'})
 
 
 def bridge_command(mode: str, env: dict[str, str] | None = None) -> list[str] | None:
@@ -109,6 +113,10 @@ class RemoteApprover:
         self.attempted_pin |= response.get("attempted_pin") is True
         # Worker errors deliberately contain no provider output or user data.
         if response.get("error"):
+            stage=response.get('stage')
+            error_type=response.get('error_type')
+            if stage in ERROR_STAGES and error_type in ERROR_TYPES:
+                logger.warning('Native authenticator failed stage={} type={}',stage,error_type)
             raise RuntimeError(ERROR)
         return response
 

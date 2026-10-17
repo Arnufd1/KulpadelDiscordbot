@@ -16,7 +16,7 @@ import tempfile
 import time
 
 from .config import settings
-from .remote_auth import MAX_LINE
+from .remote_auth import MAX_LINE, ERROR_TYPES
 
 _telemetry_started=time.time()
 _real_stdout=None
@@ -113,6 +113,36 @@ def emit(value: dict):
     print(json.dumps(value, separators=(",", ":")), file=target,flush=True)
 
 
+def safe_native_failure(error:BaseException) -> dict:
+    # Match only our own constant messages. Never return provider exceptions,
+    # URLs, UI text, selectors, PINs or arbitrary exception class names.
+    stages={
+        'Authenticator did not finish loading its registered account; no login link opened.':'startup_account',
+        'Authenticator screen differs from the calibrated profile; no action taken.':'calibrated_guard',
+        'Authenticator is not in the foreground. Unlock the Android before login.':'foreground',
+        'PIN keypad is not empty or its controls changed; no PIN was entered.':'pin_controls',
+        'Android device or app version changed. Recalibrate before automatic approval.':'identity',
+        'The Authenticator app did not accept the current login link.':'challenge_open',
+        'Android UI action failed; no PIN or approval retry was attempted.':'action',
+        'Virtual Android did not finish starting; check its local log before retrying.':'boot_timeout',
+        'Virtual Android stopped before startup completed; check its local log.':'boot_exit',
+        "Another user's virtual Android is active; wait for its session to finish.":'boot_identity',
+        'Virtual Android requires an explicit emulator serial with an even local port.':'boot_config',
+        'Invalid virtual Android name.':'boot_config',
+        'The configured virtual Android has not been created.':'boot_missing',
+        'Android Emulator is not installed; follow the software-authenticator setup.':'boot_missing',
+        'The configured virtual Android is not authorized for debugging.':'adb_unauthorized',
+        'The Android is offline; reconnect the cable and unlock the device.':'adb_offline',
+        'ADB did not respond; check the USB connection.':'adb_timeout',
+        'Het bewaarde KUL-toestel is niet beschikbaar. De koppeling blijft bewaard; neem contact op met de beheerder.':'native_storage',
+    }
+    error_type=type(error).__name__
+    message=str(error)
+    stage=stages.get(message,'native')
+    if re.fullmatch(r'ADB command failed \(exit -?\d+\); check the device connection\.',message):stage='adb_command'
+    return {'stage':stage, 'error_type':error_type if error_type in ERROR_TYPES else 'unknown'}
+
+
 class EnrollmentOutput:
     """Add bounded native telemetry to the existing enrollment JSON stream."""
     def __init__(self):self.buffer=''
@@ -147,8 +177,8 @@ def run_approval(stream):
                     emit({"attempted_pin": approver.attempted_pin})
                 else:
                     raise ValueError("Unsupported native operation")
-            except Exception:
-                emit({"error": "Native authentication failed", "attempted_pin": approver.attempted_pin})
+            except Exception as error:
+                emit({"error": "Native authentication failed", "attempted_pin": approver.attempted_pin,**safe_native_failure(error)})
     finally:
         approver.close()
 
@@ -177,8 +207,8 @@ def main():
                 run_approval(sys.stdin)
             # Export the stop event only after native userdata flush/shutdown.
             emit({'closed':True})
-    except BaseException:
-        emit({"error": "Native authentication unavailable"})
+    except BaseException as error:
+        emit({"error": "Native authentication unavailable",**safe_native_failure(error)})
 
 
 if __name__ == "__main__":

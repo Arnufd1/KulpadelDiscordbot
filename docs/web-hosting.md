@@ -56,7 +56,11 @@ Autobooking vereist betaalwijze `kul` en een recent bevestigde eigen KUL-creditc
 - `/opt/padelbot/data/platform/platform.sqlite3`: gebruikers, sessiehashes, eenmalige OAuth-/beheerstaten, taken en auditregels.
 - `/opt/padelbot/data/platform/profiles/<random-id>/`: persoonlijke gegevens; nieuwe profielen krijgen elk een eigen versleutelsleutel. Het bestaande eigenaarsprofiel verwijst naar de eerder gemigreerde botbestanden.
 
-De VM heeft 4 GB beschikbaar guestgeheugen voor korte Android-pieken. Free-page-reporting en het vrijgeven van Android-bestandscache laten ongebruikt fysiek hostgeheugen terugkomen. Er staat geen emulator permanent aan en er komt geen VM per gebruiker.
+De web-VM heeft 1 GiB RAM. De aparte authenticator-VM heeft tijdens gebruik 4 GiB beschikbaar voor Android en zijn overhead; uitgeschakeld gebruikt zij geen guest-RAM. Er komt geen VM per gebruiker: alleen de eigen Android-userdata wordt per profiel bewaard, naast de gedeelde SDK en system image. Verwijder of vervang die userdata nooit tijdens een code-update.
+
+De native werker initialiseert de geregistreerde app voordat de IdP een tijdelijke aanmeldvraag maakt. Dezelfde app blijft voor die ene vraag actief. Een mislukte of onzekere PIN-poging wordt nooit automatisch herhaald. Vóór een geplande openingsronde kan de scheduler de sessie maximaal eenmaal per profiel voorbereiden; daarvoor worden opnieuw de actuele boekings- en betaalvoorwaarden gecontroleerd.
+
+De getoonde emulatorwachttijd is alleen de wachttijd op de native lock; taakwachttijd en VM-start horen daar niet bij. De RAM-piek betreft het emulatorproces, exclusief guest-OS en hypervisor. Gebruik looptijd, taakvertraging en waargenomen MFA-frequentie samen voor een capaciteitsbeslissing; een aantal geregistreerde profielen is geen aantal gelijktijdig draaiende emulators.
 
 ## KUL koppelen
 

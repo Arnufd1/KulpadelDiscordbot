@@ -113,6 +113,24 @@ def test_offline_device_timeout_does_not_launch_another_copy(virtual_setup, monk
         emulator.ensure_emulator(timeout=1)
 
 
+@pytest.mark.parametrize('active_name',['KulPadelAuth','OtherTenant',''])
+def test_offline_slot_becoming_online_must_match_registered_avd(virtual_setup,monkeypatch,active_name):
+    monkeypatch.setattr(android,'list_devices',lambda:[{'serial':'emulator-5554','state':'offline'}])
+    monkeypatch.setattr(emulator.subprocess,'Popen',lambda *a,**k:pytest.fail('Offline transport must not cause duplicate launch'))
+    actions=[]
+    def adb(*args,serial):
+        actions.append(args)
+        if args==('shell','getprop','sys.boot_completed'):return '1'
+        if args==('emu','avd','name'):return active_name+'\n' if active_name else ''
+        pytest.fail('No app/PIN/cleanup action may target an unowned transport')
+    monkeypatch.setattr(android,'run_adb',adb)
+    if active_name=='KulPadelAuth':assert emulator.ensure_emulator() is None
+    else:
+        with pytest.raises(RuntimeError,match="Another user's"):
+            emulator.ensure_emulator()
+    assert actions==[('shell','getprop','sys.boot_completed'),('emu','avd','name')]
+
+
 def test_disabled_autostart_does_not_touch_android(monkeypatch):
     monkeypatch.setattr(settings, 'padelbot_android_emulator_autostart', False)
     monkeypatch.setattr(android, 'list_devices', lambda: pytest.fail('Disabled feature queried Android'))
