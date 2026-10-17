@@ -163,6 +163,11 @@ def execute(kind: str, payload: dict) -> dict:
         prefs = current_preferences()
         if kind!="quote" and not prefs.get("automatic_payment") and (kind=='rule' or 'payment_mode' not in prefs):
             raise ValueError('Schakel autobooking in bij Instellingen.' if kind=='rule' else 'Kies eerst je betaalwijze bij Instellingen.')
+        if kind=='rule':
+            from .platform_service import PlatformService,payment_mode,validate_autobook_payment
+            context=platform_context()
+            PlatformService(context.store,context).remember_payment(os.environ['PADELWEB_USER_ID'],payment_summary(me))
+            validate_autobook_payment(me,payment_mode(prefs))
         target = datetime.fromisoformat(payload["target"].replace('Z','+00:00'))
         if target.tzinfo is None:
             raise ValueError("Ongeldig tijdstip.")
@@ -215,6 +220,12 @@ def execute(kind: str, payload: dict) -> dict:
         if rule:
             current=rules.get_rule(rule.id)
             if not current or not current.enabled:raise ValueError('Autobooking is gestopt. Er is niets geboekt.')
+            # A rule may wait for availability. Re-read the KUL-owned card token
+            # immediately before the reservation, including for balance-funded sales.
+            fresh=dict(me);fresh.pop('_stored_method',None)
+            me=attach_stored_method(client,fresh,cards_only=True)
+            service.remember_payment(os.environ['PADELWEB_USER_ID'],payment_summary(me))
+            validate_autobook_payment(me,mode)
         _reservation_started=True
         result = book(client,slot,member_id=int(me["id"]),me=me,expected_amount=amount,label=rule.notes if rule else "Sigmadvisor",payment_mode=mode)
         payment_via_discord=False

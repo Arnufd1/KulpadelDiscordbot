@@ -19,7 +19,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, SecretStr, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -27,7 +27,7 @@ from .web_store import PlatformStore
 from .web_runtime import JobRunner, rules_for, tenant_env
 from .web_device import DeviceManager
 from .web_cards import CardVault
-from .platform_service import PlatformService,install_url
+from .platform_service import PlatformService,install_url,CARD_MANAGE_URL
 
 
 class WebSettings(BaseSettings):
@@ -84,14 +84,9 @@ class QRRequest(BaseModel):
     image: str = Field(max_length=10_666_668)
 
 
-class CardRequest(BaseModel):
+class AccountCheckRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    holder: SecretStr = Field(min_length=1,max_length=80)
-    number: SecretStr = Field(min_length=13,max_length=32)
-    month: int = Field(ge=1,le=12)
-    year: int = Field(ge=2026,le=2100)
-    label: str = Field(default='',max_length=40)
-    primary: bool = False
+    force: bool = False
 
 
 class ShareRequest(BaseModel):
@@ -332,6 +327,7 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
             "discord_install":bool(config.discord_client_id),
             "discord_online":platform.discord_online(),
             "payment":platform.payment_status(user['id']),
+            "account_status":platform.account_status(user['id']),
             "deliveries":platform.delivery_status(user['id']),
             "preferences":store.preferences(user["id"])}
 
@@ -343,7 +339,24 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
 
     @app.post("/api/preferences")
     def preferences(body:PreferencesRequest,user=Depends(current)):
-        return store.preferences(user["id"],body.model_dump())
+        return platform.save_preferences(user,body.model_dump())
+
+    @app.get('/api/account/status')
+    def account_status(user=Depends(current)):
+        return platform.account_status(user['id'])
+
+    @app.post('/api/account/check')
+    def account_check(body:AccountCheckRequest,user=Depends(current)):
+        env=tenant_env(store,user)
+        state=platform.account_status(user['id'])
+        if state['checking']:return state
+        if Path(env['PADELBOT_ANDROID_FAILURE_FILE']).exists():
+            state['error']='Controleer je KUL-koppeling.'
+            return state
+        if not Path(env['PADELBOT_TOKEN_FILE']).exists():
+            state['error']='Koppel eerst KU Leuven Authenticator.'
+            return state
+        return platform.account_check(user,force=body.force)
 
     @app.get('/api/payments')
     def private_payments(user=Depends(current)):
@@ -354,8 +367,8 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
         return {'enabled':cards.key is not None,'card':cards.summary(user['id']),'cards':cards.list(user['id'])}
 
     @app.post('/api/payment-card')
-    def card_save(body:CardRequest,user=Depends(current)):
-        return {'card':cards.save(user['id'],holder=body.holder.get_secret_value(),number=body.number.get_secret_value(),month=body.month,year=body.year,label=body.label,primary=body.primary)}
+    def card_save(user=Depends(current)):
+        return JSONResponse(status_code=410,content={'detail':'Koppel je kaart via KU Leuven Sport.','manage_url':CARD_MANAGE_URL})
 
     @app.post('/api/payment-card/{card_id}/primary')
     def primary_card(card_id:str,user=Depends(current)):
@@ -524,9 +537,7 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
 
     @app.get("/api/history")
     def history(user=Depends(current)):
-        with store.conn() as c:
-            rows = c.execute("SELECT id,kind,status,created,result FROM jobs WHERE user_id=? ORDER BY created DESC LIMIT 30",(user["id"],)).fetchall()
-        return {"jobs":[{**dict(r),"result":json.loads(r["result"]) if r["result"] else None} for r in rows]}
+        return {"jobs":platform.activity(user['id'])}
 
     @app.post("/api/device/start")
     async def device_start(user=Depends(current)):

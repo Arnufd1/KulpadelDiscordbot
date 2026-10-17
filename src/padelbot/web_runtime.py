@@ -187,6 +187,8 @@ class JobRunner:
                 c.execute("UPDATE jobs SET dedup=NULL WHERE id=? AND kind IN ('book','rule')",(job_id,))
 
     async def scheduler(self):
+        from .platform_service import PlatformService
+        service=PlatformService(self.store,self.community)
         tz = ZoneInfo("Europe/Brussels")
         last_checked={}
         while True:
@@ -195,7 +197,7 @@ class JobRunner:
                 users = [dict(r) for r in c.execute("SELECT * FROM users WHERE suspended=0")]
             for user in users:
                 prefs = self.store.preferences(user["id"])
-                if not prefs.get("automatic_payment") or float(prefs.get("max_amount",0))<=0:
+                if not service.can_autobook(user['id']) or float(prefs.get("max_amount",0))<=0:
                     continue
                 rules=rules_for(self.store,user)
                 for rule in rules.list_rules(enabled_only=True):

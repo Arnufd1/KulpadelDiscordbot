@@ -40,6 +40,31 @@ def validate_payment(me,amount,mode):
     raise ValueError('Koppel een KUL-betaalmethode of kies een betaallink.')
 
 
+CARD_MANAGE_URL='https://usc.kuleuven.cloud/members/profile/myshopping#storedpaymethodcard'
+AUTOBOOK_CARD_REQUIRED='Koppel eerst een kaart bij KUL voor autobooking.'
+
+
+def validate_autobook_payment(me,mode):
+    """Autobooking always needs a KUL token, even when this sale uses balance."""
+    if mode!='kul' or me.get('_stored_method',{}).get('type')!=3:
+        raise ValueError(AUTOBOOK_CARD_REQUIRED)
+
+
+def public_job_error(error):
+    """Activity is a human summary, never a second copy of provider diagnostics."""
+    value=str(error or '').lower()
+    if 'kaart' in value or 'betaalmethode' in value:return 'Controleer je gekoppelde kaart bij KUL.'
+    if 'prijs' in value or 'maximum' in value:return 'De prijs past niet binnen je ingestelde maximum.'
+    if 'niet meer vrij' in value or 'niet meer beschikbaar' in value:return 'Dit tijdstip is niet meer vrij.'
+    if 'al een boeking' in value:return 'Je hebt al een boeking op dit tijdstip.'
+    if 'gepauzeerd' in value:return 'Je profiel is gepauzeerd.'
+    if 'pin' in value or 'authenticator' in value or 'koppel eerst' in value:return 'Controleer je KUL-koppeling.'
+    if 'instellingen zijn gewijzigd' in value or 'betaalinstellingen' in value:return 'Je instellingen zijn gewijzigd. Er is niets geboekt.'
+    if 'lang' in value or 'onderbroken' in value or 'herstart' in value:return 'De controle werd onderbroken. Controleer je boekingen.'
+    if 'wachtrij' in value or 'taken klaar' in value:return 'Er staan al taken klaar. Wacht even.'
+    return 'KUL kon de controle niet afronden. Controleer je koppeling en boekingen.'
+
+
 class PlatformService:
     def __init__(self,store:PlatformStore,community=None):
         self.store=store
@@ -96,6 +121,9 @@ class PlatformService:
             raise ValueError('Dit profiel is gepauzeerd.')
         if kind not in {'slots','quote','book','bookings','login','account','rule','community_join'}:
             raise ValueError('Onbekende taak.')
+        if kind=='account':return self.account_check(user,force=True)['check']['job_id']
+        if kind=='rule':
+            if not self.can_autobook(user['id']):raise ValueError(AUTOBOOK_CARD_REQUIRED)
         dedup=None
         if kind=='slots':
             if not 0<=int(payload['start'])<=int(payload['end'])<=30:raise ValueError('Kies een periode van 0 tot 30 dagen.')
@@ -142,6 +170,79 @@ class PlatformService:
         with self.store.conn() as c:
             row=c.execute('SELECT balance,direct_debit,checked,stored_method,stored_card FROM payment_accounts WHERE user_id=?',(user_id,)).fetchone()
         return dict(row) if row else None
+
+    def account_status(self,user_id):
+        with self.store.conn() as c:
+            row=c.execute("SELECT id,status,created,finished,result FROM jobs WHERE user_id=? AND kind IN ('account','login') ORDER BY CASE WHEN status IN ('queued','running') THEN 0 ELSE 1 END,created DESC LIMIT 1",(user_id,)).fetchone()
+        check=None
+        if row:
+            result=json.loads(row['result']) if row['result'] else {}
+            stamp=row['finished'] or row['created']
+            check={'job_id':row['id'],'status':row['status'],'checked':stamp,
+                   'next_check_at':stamp+(30 if row['status']=='done' else 60),
+                   'error':public_job_error(result.get('error')) if result.get('error') else None}
+        return {'payment':self.payment_status(user_id),'check':check,
+                'checking':bool(check and check['status'] in {'queued','running'})}
+
+    def account_check(self,user,*,force=False):
+        """One bounded read, shared by the website and Discord; polling never enqueues."""
+        if not self.store.user(user['id']) or self.store.user(user['id'])['suspended']:
+            raise ValueError('Dit profiel is gepauzeerd.')
+        with FileLock(str(self.store.root/('account-check-'+user['id']+'.lock')),timeout=15):
+            state=self.account_status(user['id']);check=state['check'];now=time.time()
+            if check and (state['checking'] or check['next_check_at']>now or
+                          (not force and check['status']=='done' and check['checked']>now-300)):
+                return state
+            self.store.enqueue(user['id'],'account',{})
+            return self.account_status(user['id'])
+
+    def require_autobook_card(self,user_id,*,fresh=True):
+        payment=self.payment_status(user_id)
+        if (not payment or not payment.get('stored_card') or
+            (fresh and payment['checked']<time.time()-300)):
+            raise ValueError(AUTOBOOK_CARD_REQUIRED)
+        if fresh:
+            check=self.account_status(user_id)['check']
+            if check and check['status']!='done' and check['checked']>payment['checked']:
+                raise ValueError('Wacht tot je kaart bij KUL is gecontroleerd.')
+
+    def save_preferences(self,user,values):
+        if values.get('automatic_payment'):
+            if payment_mode(values)!='kul':raise ValueError(AUTOBOOK_CARD_REQUIRED)
+            self.require_autobook_card(user['id'])
+        return self.store.preferences(user['id'],values)
+
+    def can_autobook(self,user_id):
+        prefs=self.store.preferences(user_id)
+        if not prefs.get('automatic_payment') or payment_mode(prefs)!='kul':return False
+        try:self.require_autobook_card(user_id,fresh=False)
+        except ValueError:return False
+        return True
+
+    def activity(self,user_id):
+        with self.store.conn() as c:
+            rows=c.execute('SELECT id,kind,status,created,finished,result FROM jobs WHERE user_id=? ORDER BY COALESCE(finished,created) DESC LIMIT 1000',(user_id,)).fetchall()
+        groups={}
+        for row in rows:
+            result=json.loads(row['result']) if row['result'] else {}
+            if row['status'] in {'queued','running'}:continue
+            failed=row['status'] in {'failed','unknown','cancelled'}
+            error=public_job_error(result.get('error')) if failed else None
+            # Repeated account checks and the same failed retries occupy one line.
+            key=(('error',error) if failed else
+                 ('check' if row['kind'] in {'account','login'} else row['kind'],
+                  'done' if row['kind'] in {'account','login','slots','bookings','quote'} else row['id']))
+            if key in groups:
+                groups[key]['attempts']+=1
+                continue
+            message=('Je hebt geboekt.' if row['kind'] in {'book','rule'} and result.get('paid') is True else
+                     'Wachten op betaling.' if result.get('payment_available') else
+                     'Nog geen terrein vrij.' if result.get('waiting') else None)
+            groups[key]={'id':row['id'],'kind':row['kind'],'status':row['status'],
+                         'created':row['finished'] or row['created'],'finished':row['finished'],
+                         'result':{'error':error} if failed else {'message':message} if message else None,
+                         'attempts':1}
+        return list(groups.values())[:30]
 
     def cipher(self):
         path=self.store.root/'discord-delivery.key'

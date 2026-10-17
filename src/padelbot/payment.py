@@ -74,6 +74,8 @@ def stored_methods(client,member_id):
 
 def attach_stored_method(client,me,*,cards_only=False):
     me=dict(me)
+    # A failed or empty refresh must revoke any token from an older snapshot.
+    me.pop('_stored_method',None)
     try:
         methods=stored_methods(client,int(me['id']))
         if cards_only:methods=[m for m in methods if m['type']==3]

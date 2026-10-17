@@ -162,8 +162,8 @@ def test_booking_submissions_are_idempotent_and_queue_is_bounded(portal):
     b=client.post('/api/book',json=body,headers=headers).json()
     assert a==b
     for _ in range(2):
-        assert client.post('/api/actions/account',json={},headers=headers).status_code==200
-    assert client.post('/api/actions/account',json={},headers=headers).status_code==400
+        assert client.post('/api/actions/bookings',json={},headers=headers).status_code==200
+    assert client.post('/api/actions/bookings',json={},headers=headers).status_code==400
 
 
 def test_invalid_ranges_rules_and_other_users_device_are_rejected(portal):
@@ -406,20 +406,17 @@ def test_cards_are_encrypted_in_database_and_never_return_full_number(portal):
     app.state.cards.key=AESGCM.generate_key(bit_length=256)
     headers=sign_in(client,store,alice)
     data={'holder':'Example Cardholder','number':'4111 1111 1111 1111','month':12,'year':2035}
-    result=client.post('/api/payment-card',json=data,headers=headers)
-    assert result.status_code==200
-    assert {k:result.json()['card'][k] for k in ('brand','last4','month','year')}=={'brand':'Visa','last4':'1111','month':12,'year':2035}
-    first_id=result.json()['card']['id']
-    assert '4111111111111111' not in result.text and data['holder'] not in result.text
+    saved=app.state.cards.save(alice['id'],**data)
+    assert {k:saved[k] for k in ('brand','last4','month','year')}=={'brand':'Visa','last4':'1111','month':12,'year':2035}
+    first_id=saved['id']
+    assert '4111111111111111' not in json.dumps(saved) and data['holder'] not in json.dumps(saved)
     for path in [store.path,store.path.with_name(store.path.name+'-wal')]:
         if path.exists():
             blob=path.read_bytes()
             assert b'4111111111111111' not in blob and b'Example Cardholder' not in blob
     with store.conn() as c:
         first=c.execute('SELECT ciphertext,nonce,wrapped_key FROM payment_cards').fetchone()
-    second_result=client.post('/api/payment-card',json=data,headers=headers)
-    assert second_result.status_code==200
-    second_id=second_result.json()['card']['id']
+    second_id=app.state.cards.save(alice['id'],**data)['id']
     with store.conn() as c:
         second=c.execute('SELECT ciphertext,nonce,wrapped_key FROM payment_cards WHERE id=?',(second_id,)).fetchone()
     assert all(first[i]!=second[i] for i in range(3))
@@ -440,12 +437,13 @@ def test_card_validation_does_not_echo_pan_or_accept_cvc(portal):
     headers=sign_in(client,store,alice)
     data={'holder':'Example','number':'4111111111111111','month':12,'year':2035,'cvc':'987'}
     response=client.post('/api/payment-card',json=data,headers=headers)
-    assert response.status_code==422
+    assert response.status_code==410
     assert data['number'] not in response.text and '987' not in response.text
+    assert response.json()['manage_url'].startswith('https://usc.kuleuven.cloud/')
     del data['cvc']
     data['number']='4111111111111112'
     response=client.post('/api/payment-card',json=data,headers=headers)
-    assert response.status_code==400 and data['number'] not in response.text
+    assert response.status_code==410 and data['number'] not in response.text
     assert client.get('/api/payment-card').json()['card'] is None
     assert client.post('/api/payment-card',json=data,headers={'Origin':'http://testserver'}).status_code==403
 
@@ -455,7 +453,7 @@ def test_card_ciphertext_cannot_move_to_another_profile_or_use_wrong_key(portal)
     app,client,store,(_,alice,bob)=portal
     app.state.cards.key=AESGCM.generate_key(bit_length=256)
     headers=sign_in(client,store,alice)
-    assert client.post('/api/payment-card',json={'holder':'Example','number':'4111111111111111','month':12,'year':2035},headers=headers).status_code==200
+    app.state.cards.save(alice['id'],holder='Example',number='4111111111111111',month=12,year=2035)
     with store.conn() as c:
         c.execute('UPDATE payment_cards SET user_id=? WHERE user_id=?',(bob['id'],alice['id']))
     sign_in(client,store,bob)

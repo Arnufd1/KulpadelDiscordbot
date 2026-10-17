@@ -13,8 +13,8 @@ def test_multiple_primary_cards_remain_private_and_deletion_selects_fallback(por
     app,client,store,(_,alice,bob)=portal
     app.state.cards.key=AESGCM.generate_key(bit_length=256)
     headers=sign_in(client,store,alice)
-    first=client.post('/api/payment-card',json={**CARD,'label':'Revolut'},headers=headers).json()['card']['id']
-    second=client.post('/api/payment-card',json={**CARD,'label':'Reserve','primary':True},headers=headers).json()['card']['id']
+    first=app.state.cards.save(alice['id'],**CARD,label='Revolut')['id']
+    second=app.state.cards.save(alice['id'],**CARD,label='Reserve',primary=True)['id']
     data=client.get('/api/payment-card').json()
     assert len(data['cards'])==2 and data['card']['id']==second
     headers=sign_in(client,store,bob)

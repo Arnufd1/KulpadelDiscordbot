@@ -5,6 +5,18 @@ import pytest
 from padelbot import payment, worldline_driver
 
 
+@pytest.mark.parametrize('result',['empty','failed','debit_only'])
+def test_stored_card_refresh_never_retains_an_old_unverified_token(monkeypatch,result):
+    original={'id':42,'_stored_method':{'id':10,'type':3,'preferred':True}}
+    def methods(*args):
+        if result=='failed':raise RuntimeError('Provider unavailable')
+        return [{'id':11,'type':2,'preferred':True}] if result=='debit_only' else []
+    monkeypatch.setattr(payment,'stored_methods',methods)
+    refreshed=payment.attach_stored_method(object(),original,cards_only=True)
+    assert '_stored_method' not in refreshed
+    assert original['_stored_method']['id']==10
+
+
 SALE = {
     "id": 12, "statusCode": 0, "total": "24.00",
     "payments": [{"saleId": 12, "amount": "24.00", "collectStatus": 0,

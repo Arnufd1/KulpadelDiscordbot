@@ -63,8 +63,12 @@ class CardVault:
         card_id = uuid.uuid4().hex
         data_key = AESGCM.generate_key(bit_length=256)
         nonce, wrap_nonce = secrets.token_bytes(12), secrets.token_bytes(12)
+        # Labels are returned in plain text by the masked-card endpoint. Check the
+        # whole input before truncation, including punctuation and zero-width
+        # separators, so a formatted PAN cannot leak through the display name.
+        if len(re.findall(r'[0-9]',label))>=13:
+            raise ValueError('Gebruik een kaartnaam, geen kaartnummer.')
         label=' '.join(label.split())[:40]
-        if re.search(r'(?:[0-9][ -]?){13,19}',label):raise ValueError('Gebruik een kaartnaam, geen kaartnummer.')
         payload = json.dumps({'holder':holder,'number':number,'month':month,'year':year,'label':label}).encode()
         ciphertext = AESGCM(data_key).encrypt(nonce,payload,self._aad(user_id,card_id,'data'))
         wrapped = AESGCM(self.key).encrypt(wrap_nonce,data_key,self._aad(user_id,card_id,'key'))
@@ -99,7 +103,12 @@ class CardVault:
             raise ValueError('De bewaarde kaart kon niet veilig worden gelezen. Neem contact op met de beheerder.') from None
         number = data['number']
         brand = 'Visa' if number.startswith('4') else 'American Express' if number[:2] in {'34','37'} else 'Mastercard' if 51<=int(number[:2])<=55 or 2221<=int(number[:4])<=2720 else 'Betaalkaart'
-        return {'id':row['id'],'brand':brand,'label':data.get('label') or brand,'last4':number[-4:],
+        label=data.get('label')
+        # Old encrypted records predate the input guard. Never let those labels
+        # bypass the masked-only response contract either.
+        if not isinstance(label,str) or len(re.findall(r'[0-9]',label))>=13:
+            label=''
+        return {'id':row['id'],'brand':brand,'label':label or brand,'last4':number[-4:],
                 'month':data['month'],'year':data['year'],'primary':bool(row['is_primary'])}
 
     def delete(self, user_id: str,card_id=None):
