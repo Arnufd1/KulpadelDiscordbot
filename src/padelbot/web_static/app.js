@@ -49,7 +49,7 @@ function applyMe(updatePreferences=true){
  $('autobook-card-state').textContent=hasCard?'\u2713 Kaart gekoppeld':'Voeg een kaart toe voor autobooking.';$('autobook-card-state').classList.toggle('is-linked',hasCard);
  const p=me.payment,box=$('payment-state');box.replaceChildren();
  const balanceKnown=p&&p.balance!==null&&p.balance!==undefined&&Number.isFinite(Number(p.balance));
- $('kul-balance').textContent=balanceKnown?euro(p.balance):'Nog niet opgehaald';
+ $('kul-balance').textContent=balanceKnown?euro(p.balance):'-/';
  $('setup-payment-balance').textContent=balanceKnown?'KUL-saldo '+euro(p.balance):'';
  $('setup-payment-balance').hidden=!balanceKnown;
  $('kul-balance-checked').textContent=p?.checked?'Gecontroleerd om '+clock(new Date(p.checked*1000).toISOString()):'';
