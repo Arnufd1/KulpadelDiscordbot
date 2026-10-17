@@ -59,7 +59,9 @@ def auth_context(value: str):
 def _connect(path: Path, *, create: bool = True) -> sqlite3.Connection:
     if create:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        c = sqlite3.connect(path, timeout=0.25)
+        # WAL writers may briefly queue behind a filesystem flush. Bound the
+        # wait without dropping ordinary concurrent measurements or retrying auth.
+        c = sqlite3.connect(path, timeout=1.0)
     else:
         c = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.25)
     c.row_factory = sqlite3.Row
