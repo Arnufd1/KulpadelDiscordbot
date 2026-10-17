@@ -246,6 +246,7 @@ class AndroidApprover:
         self.used = False
         self.device_info = None
         self._emulator = None
+        self._remote = None
         if not manual and settings.padelbot_android_failure_file.exists():
             raise RuntimeError("An earlier Android PIN attempt failed. Check the app, then run android reset-failure.")
         self.profile = None if manual else read_profile()
@@ -258,10 +259,17 @@ class AndroidApprover:
                 for step in self.profile["steps"]:
                     if step["action"] == "pin" and step.get("length") and len(self.pin) != step["length"]:
                         raise RuntimeError("Stored app PIN length differs from the calibrated keypad. Run android set-pin again.")
+        if settings.padelbot_auth_remote_command and not manual:
+            from .remote_auth import RemoteApprover
+            self._remote = RemoteApprover(self.profile, self.pin)
 
     def prepare(self) -> None:
         """Boot Android only when the IdP actually asks for authentication."""
         if self.device_info is not None:
+            return
+        if getattr(self, '_remote', None) is not None:
+            self._remote.prepare()
+            self.device_info = self._remote.device_info
             return
         from .emulator import ensure_emulator
         self._emulator = ensure_emulator()
@@ -275,6 +283,8 @@ class AndroidApprover:
 
     def close(self) -> None:
         """Release a login-owned emulator; leave manually started devices alone."""
+        if getattr(self, '_remote', None) is not None:
+            self._remote.close()
         if self._emulator is not None:
             self._emulator.close()
             self._emulator = None
@@ -316,6 +326,12 @@ class AndroidApprover:
         if self.used:
             raise RuntimeError("This Android login has already been attempted; no approval retry was made.")
         self.used = True
+        if getattr(self, '_remote', None) is not None:
+            try:
+                self._remote(link)
+            finally:
+                self.attempted_pin = self._remote.attempted_pin
+            return
         self.prepare()
         device = connect_device(self.device_info["serial"])
         # Repeated deep links can leave old confirmation activities underneath
@@ -370,8 +386,14 @@ class AndroidApprover:
             time.sleep(0.3)
 
     def on_failure(self) -> None:
+        if getattr(self, '_remote', None) is not None:
+            self.attempted_pin |= self._remote.attempted_pin
         if self.attempted_pin:
             save_state(settings.padelbot_android_failure_file, {"reason": "Login did not complete after an app PIN attempt."})
+        # Write the application VM's durable guard before a bounded remote
+        # round-trip: termination during transport cleanup must not lose it.
+        if getattr(self, '_remote', None) is not None:
+            self._remote.on_failure()
 
 
 class AndroidPinStore:

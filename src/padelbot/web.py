@@ -10,6 +10,7 @@ import hmac
 import json
 from pathlib import Path
 import secrets
+import subprocess
 import time
 from urllib.parse import urlencode, urlsplit
 
@@ -414,7 +415,7 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
     @app.get('/api/community')
     def online(user=Depends(current)):
         with store.conn() as c:
-            refreshing=bool(c.execute("SELECT 1 FROM jobs WHERE kind='bookings' AND dedup LIKE 'online-refresh:%' AND status IN ('queued','running') LIMIT 1").fetchone())
+            refreshing=bool(c.execute("SELECT 1 FROM jobs WHERE kind='bookings' AND dedup LIKE 'online-refresh:%' AND status IN ('queued','running','waiting_auth') LIMIT 1").fetchone())
         return {'matches':community.list(user['id'])+drafts.list(user['id']),'refreshing':refreshing}
 
     @app.post('/api/drafts')
@@ -628,6 +629,23 @@ def create_app(config: WebSettings | None = None, *, start_workers: bool = True)
     def users(user=Depends(admin)):
         return {"users":administration.users(),"guests":administration.guests(),
                 "device_active":devices.user_id is not None}
+
+    @app.get('/api/admin/metrics')
+    def system_metrics(user=Depends(admin)):
+        from .telemetry import metrics_summary
+        from .config import Settings
+        summary=metrics_summary(store.root/'telemetry.sqlite3',days=30)
+        bridge=Settings().padelbot_auth_remote_command
+        status='local'
+        if bridge:
+            try:
+                result=subprocess.run([str(bridge),'status'],capture_output=True,text=True,timeout=8)
+                state=json.loads(result.stdout)
+                status=state.get('status','unknown') if result.returncode==0 else 'unknown'
+                if status not in {'running','stopped','starting'}:status='unknown'
+            except Exception:status='unknown'
+        summary['auth_vm']={'status':status,'label':'Authenticator'}
+        return summary
 
     @app.get('/api/admin/users/{user_id}')
     def user_detail(user_id:str,user=Depends(admin)):

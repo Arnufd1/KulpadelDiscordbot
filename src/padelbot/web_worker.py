@@ -258,8 +258,14 @@ def main():
     # SIGTERM unwinds finally blocks, including emulator cleanup.
     signal.signal(signal.SIGTERM,lambda *_:sys.exit(1))
     message = json.loads(sys.stdin.buffer.read())
+    from .auth import NativeAuthRequired
     try:
         result = execute(message["kind"],message["payload"])
+    except NativeAuthRequired:
+        # Only safe reads may leave their HTTP lane and resume after one
+        # serialized login. Reservation/payment operations are never replayed.
+        from .web_store import READ_JOB_KINDS
+        result = {'reauth_required':True} if message['kind'] in READ_JOB_KINDS else {'error':'KUL vraagt opnieuw aanmelden. Controleer je koppeling.'}
     except (ValueError,) as error:
         result = {"error":str(error)}
     except BaseException:

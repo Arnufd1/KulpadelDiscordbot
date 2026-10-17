@@ -10,6 +10,8 @@ import sqlite3
 import time
 import uuid
 
+READ_JOB_KINDS = frozenset({'slots','account','quote','bookings'})
+ACTIVE_JOB_STATUSES = ('queued','running','waiting_auth')
 
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
@@ -54,6 +56,10 @@ class PlatformStore:
                 c.execute('ALTER TABLE users ADD COLUMN restricted INTEGER NOT NULL DEFAULT 0')
             if 'avatar_url' not in columns:
                 c.execute('ALTER TABLE users ADD COLUMN avatar_url TEXT')
+            job_columns={r[1] for r in c.execute('PRAGMA table_info(jobs)')}
+            for field,declaration in [('started','REAL'),('auth_job_id','TEXT'),('reauth_attempts','INTEGER NOT NULL DEFAULT 0'),('auth_started','REAL')]:
+                if field not in job_columns:c.execute(f'ALTER TABLE jobs ADD COLUMN {field} {declaration}')
+            c.execute('CREATE INDEX IF NOT EXISTS jobs_pending ON jobs(status,created)')
             owner=c.execute("SELECT email FROM users WHERE owner=1").fetchone()
             if owner and owner[0]!=owner_email.lower():
                 raise ValueError("Wijzig de eigenaar uitsluitend via een expliciete profielmigratie.")
@@ -184,8 +190,8 @@ class PlatformStore:
                 row = c.execute("SELECT id FROM jobs WHERE dedup=?", (dedup,)).fetchone()
                 if row:
                     return row[0]
-            active = c.execute("SELECT count(*) FROM jobs WHERE user_id=? AND status IN ('queued','running')", (user_id,)).fetchone()[0]
-            total = c.execute("SELECT count(*) FROM jobs WHERE status IN ('queued','running')").fetchone()[0]
+            active = c.execute("SELECT count(*) FROM jobs WHERE user_id=? AND status IN ('queued','running','waiting_auth')", (user_id,)).fetchone()[0]
+            total = c.execute("SELECT count(*) FROM jobs WHERE status IN ('queued','running','waiting_auth')").fetchone()[0]
             if active >= 3 or total >= 100:
                 raise ValueError("Er staan al taken klaar. Wacht even tot die klaar zijn.")
             c.execute("INSERT INTO jobs(id,user_id,kind,payload,status,created,dedup) VALUES(?,?,?,?,'queued',?,?)",
@@ -229,10 +235,10 @@ class PlatformStore:
                 preferences=json.loads(row['preferences'])
                 preferences['automatic_payment']=False
                 c.execute('UPDATE users SET preferences=? WHERE id=?',(json.dumps(preferences),user_id))
-                c.execute("UPDATE jobs SET status='cancelled',finished=? WHERE user_id=? AND status='queued' AND kind IN ('book','rule','community_join','draft_refresh')",(time.time(),user_id))
+                c.execute("UPDATE jobs SET status='cancelled',finished=? WHERE user_id=? AND status IN ('queued','waiting_auth') AND kind IN ('book','rule','community_join','draft_refresh')",(time.time(),user_id))
             if suspended:
                 c.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
-                c.execute("UPDATE jobs SET status='cancelled',finished=? WHERE user_id=? AND status='queued' AND kind!='draft_release'", (time.time(),user_id))
+                c.execute("UPDATE jobs SET status='cancelled',finished=? WHERE user_id=? AND status IN ('queued','waiting_auth') AND kind!='draft_release'", (time.time(),user_id))
                 tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 if 'discord_oauth' in tables:c.execute('DELETE FROM discord_oauth WHERE user_id=?',(user_id,))
                 if 'discord_deliveries' in tables:

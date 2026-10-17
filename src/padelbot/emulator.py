@@ -15,6 +15,7 @@ from loguru import logger
 from filelock import FileLock
 
 from .config import settings
+from .telemetry import Measurement, ProcessMemorySampler, measure
 
 
 _start_lock = threading.RLock()
@@ -76,8 +77,14 @@ class StartedEmulator:
     cache_roots: tuple[Path, ...] = ()
     _closed: bool = field(default=False, init=False, repr=False)
     lease: object | None = field(default=None, repr=False)
+    measurement: Measurement | None = field(default=None, init=False, repr=False)
+    memory_sampler: ProcessMemorySampler | None = field(default=None, init=False, repr=False)
 
-    def close(self) -> None:
+    def __post_init__(self):
+        self.measurement = measure("emulator")
+        self.memory_sampler = ProcessMemorySampler(self.process.pid, self.measurement)
+
+    def close(self, error: BaseException | None = None) -> None:
         from .android import run_adb
 
         with _start_lock:
@@ -102,6 +109,10 @@ class StartedEmulator:
                         self.process.kill()
                         self.process.wait(timeout=5)
             _release_file_cache(self.cache_roots)
+            if self.memory_sampler is not None:
+                self.memory_sampler.close()
+            if self.measurement is not None:
+                self.measurement.finish(error)
             self._closed = True
             if self.lease is not None:
                 self.lease.release()
@@ -113,7 +124,8 @@ def ensure_emulator(timeout: float = 120) -> StartedEmulator | None:
         return None
     settings.padelbot_emulator_lock_file.parent.mkdir(parents=True, exist_ok=True)
     lease = FileLock(settings.padelbot_emulator_lock_file, timeout=600)
-    lease.acquire()
+    with measure("emulator_wait"):
+        lease.acquire()
     try:
         started = _ensure_emulator(timeout)
         if started is None:
@@ -188,10 +200,10 @@ def _ensure_emulator(timeout: float = 120) -> StartedEmulator | None:
                     pass
                 time.sleep(1)
             raise RuntimeError("Virtual Android did not finish starting; check its local log before retrying.")
-        except BaseException:
+        except BaseException as error:
             if started is not None:
                 try:
-                    started.close()
-                except Exception as error:
-                    logger.error("Virtual Android startup cleanup failed: {}", type(error).__name__)
+                    started.close(error)
+                except Exception as cleanup_error:
+                    logger.error("Virtual Android startup cleanup failed: {}", type(cleanup_error).__name__)
             raise

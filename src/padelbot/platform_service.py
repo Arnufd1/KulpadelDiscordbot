@@ -174,7 +174,7 @@ class PlatformService:
 
     def account_status(self,user_id):
         with self.store.conn() as c:
-            row=c.execute("SELECT id,status,created,finished,result FROM jobs WHERE user_id=? AND kind IN ('account','login') ORDER BY CASE WHEN status IN ('queued','running') THEN 0 ELSE 1 END,created DESC LIMIT 1",(user_id,)).fetchone()
+            row=c.execute("SELECT id,status,created,finished,result FROM jobs WHERE user_id=? AND kind IN ('account','login') ORDER BY CASE WHEN status IN ('queued','running','waiting_auth') THEN 0 ELSE 1 END,created DESC LIMIT 1",(user_id,)).fetchone()
         check=None
         if row:
             result=json.loads(row['result']) if row['result'] else {}
@@ -183,7 +183,7 @@ class PlatformService:
                    'next_check_at':stamp+(30 if row['status']=='done' else 60),
                    'error':public_job_error(result.get('error')) if result.get('error') else None}
         return {'payment':self.payment_status(user_id),'check':check,
-                'checking':bool(check and check['status'] in {'queued','running'})}
+                'checking':bool(check and check['status'] in {'queued','running','waiting_auth'})}
 
     def account_check(self,user,*,force=False,login=False):
         """One bounded read, shared by the website and Discord; polling never enqueues."""
@@ -253,7 +253,7 @@ class PlatformService:
         groups={}
         for row in rows:
             result=json.loads(row['result']) if row['result'] else {}
-            if row['status'] in {'queued','running'}:continue
+            if row['status'] in {'queued','running','waiting_auth'}:continue
             failed=row['status'] in {'failed','unknown','cancelled'}
             error=public_job_error(result.get('error')) if failed else None
             # Repeated account checks and the same failed retries occupy one line.

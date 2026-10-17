@@ -21,7 +21,7 @@ def refresh_due_bookings(service,*,now=None):
             if not service.discord_id(user_id) and not c.execute(
                 "SELECT 1 FROM private_payments WHERE user_id=? AND status='pending' AND created>? LIMIT 1",
                 (user_id,now-3600)).fetchone():continue
-            if c.execute("SELECT 1 FROM jobs WHERE user_id=? AND status IN ('queued','running') LIMIT 1",(user_id,)).fetchone():
+            if c.execute("SELECT 1 FROM jobs WHERE user_id=? AND status IN ('queued','running','waiting_auth') LIMIT 1",(user_id,)).fetchone():
                 continue
             previous=c.execute("SELECT status,created FROM jobs WHERE user_id=? AND kind='bookings' ORDER BY created DESC LIMIT 1",(user_id,)).fetchone()
             # Authentication failures must not repeatedly start an idle emulator.

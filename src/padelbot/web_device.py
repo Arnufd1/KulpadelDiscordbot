@@ -115,7 +115,7 @@ def provision():
     (avd/"config.ini").write_text("".join(f"{k}={v}\n" for k,v in config.items()))
 
 
-def save_profile(pin: str):
+def save_profile(pin: str, *, persist: bool = True):
     from .android import doctor, AndroidPinStore, connect_device, PACKAGE
     from .config import settings
     from .web_worker import initialise_key
@@ -126,7 +126,6 @@ def save_profile(pin: str):
         raise ValueError("Deze appversie moet eerst door de beheerder worden gecontroleerd.")
     device = connect_device()
     verify_saved_account(device)
-    initial = initialise_key()
     profile = {"version":1,"enrollment_verified":True,"name":"padelreservering-auth","serial":info["serial"],"device_id":info["device_id"],"app_version":info["app_version"],
                "startup_guard":{"resourceId":PACKAGE+":id/account"},"steps":[
                    {"action":"click","selector":{"resourceId":PACKAGE+":id/positive_button","text":"NEXT"},
@@ -141,20 +140,24 @@ def save_profile(pin: str):
         profile['native_storage']=[name for name in AVD_IDENTITY_FILES if (avd/name).is_file() and (avd/name).stat().st_size>0]
         if 'userdata-qemu.img' not in profile['native_storage']:
             raise ValueError('KUL kon de koppeling nog niet bewaren. Probeer opnieuw.')
-    AndroidPinStore(initial.key_file,settings.padelbot_android_pin_file).save(pin)
-    from .idp import save_state
-    save_state(settings.padelbot_android_profile_file,profile)
+    if persist:
+        initial = initialise_key()
+        AndroidPinStore(initial.key_file,settings.padelbot_android_pin_file).save(pin)
+        from .idp import save_state
+        save_state(settings.padelbot_android_profile_file,profile)
     # Do not clear an existing failed-PIN latch through an ordinary save.
+    return profile
 
 
-def complete_profile(pin:str,checked:bool=False):
+def complete_profile(pin:str,checked:bool=False,*,persist:bool=True):
     from .config import settings
     failed=settings.padelbot_android_failure_file.exists()
     if failed and checked is not True:
         raise ValueError('De PIN is geblokkeerd na een mislukte poging. Neem contact op met de beheerder.')
-    save_profile(pin)
+    profile=save_profile(pin) if persist else save_profile(pin,persist=False)
     if failed and checked is True:
         settings.padelbot_android_failure_file.unlink(missing_ok=True)
+    return profile
 
 
 def enrollment_phase(xml: str) -> str:
@@ -281,7 +284,7 @@ def setup_enrollment_pin(device,pin,confirm_pin):
     return result
 
 
-def child_main():
+def child_main(*, export_profile:bool=False):
     from filelock import FileLock
     from .android import run_adb, PACKAGE, doctor
     from .config import settings
@@ -333,8 +336,9 @@ def child_main():
                             serial=settings.padelbot_android_serial)
                     answer = {}
                 elif action == "finish":
-                    complete_profile(str(request["pin"]))
+                    profile=complete_profile(str(request["pin"]),persist=not export_profile)
                     answer = {"saved":True}
+                    if export_profile:answer['profile']=profile
                 else:
                     raise ValueError("Onbekende actie.")
                 print(json.dumps(answer),flush=True)
@@ -353,6 +357,26 @@ def child_main():
             identity_lock.release()
 
 
+def persist_remote_profile(env:dict, profile:dict, pin:str):
+    """Keep long-lived encryption keys and PIN storage on the application VM."""
+    from filelock import FileLock
+    from .android import AndroidPinStore
+    from .idp import save_state
+    from .store import TokenStore
+    if (not isinstance(profile,dict) or profile.get('version')!=1
+            or profile.get('enrollment_verified') is not True or profile.get('app_version')!='2.1.16'
+            or profile.get('name')!='padelreservering-auth' or not re.fullmatch(r'[0-9]{4}',pin)):
+        raise ValueError('Invalid native enrollment result')
+    if set(profile)-{'version','enrollment_verified','name','serial','device_id','app_version','startup_guard','steps','native_storage'}:
+        raise ValueError('Unexpected native enrollment fields')
+    store=TokenStore(Path(env['PADELBOT_KEY_FILE']),Path(env['PADELBOT_TOKEN_FILE']))
+    store.key_file.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+    with FileLock(str(store.key_file)+'.init.lock',timeout=15):
+        if not store.key_file.exists():store.init_key()
+    AndroidPinStore(store.key_file,Path(env['PADELBOT_ANDROID_PIN_FILE'])).save(pin)
+    save_state(Path(env['PADELBOT_ANDROID_PROFILE_FILE']),profile)
+
+
 class DeviceManager:
     def __init__(self, store):
         self.store = store
@@ -365,6 +389,8 @@ class DeviceManager:
         self.startup_task=None
         self.startup_result={}
         self.enrollment_owner=None
+        self.remote_identity_lock=None
+        self.remote_env=None
 
     async def begin(self,user):
         async with self.lifecycle_lock:
@@ -401,6 +427,7 @@ class DeviceManager:
 
     async def start(self,user:dict):
         from .web_runtime import tenant_env
+        from .remote_auth import bridge_command, native_request, encode_request
         async with self.lock:
             if self.process is not None and self.process.returncode is None:
                 if self.user_id != user["id"]:
@@ -409,11 +436,26 @@ class DeviceManager:
                 return {"ready":True}
             self.user_id = user["id"]
             self.started = self.touched = time.monotonic()
-            self.process = await asyncio.create_subprocess_exec(sys.executable,"-m","padelbot.web_device",
-                env=tenant_env(self.store,user),stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.DEVNULL,
-                limit=8*1024*1024)
+            env=tenant_env(self.store,user)
+            command=bridge_command('enroll',env)
             try:
-                result = json.loads(await asyncio.wait_for(self.process.stdout.readline(),timeout=180))
+                if command:
+                    from filelock import FileLock
+                    # Hold the application's identity lock throughout enrollment,
+                    # just like a local worker: renewal must not read a partial PIN.
+                    self.remote_identity_lock=FileLock(env['PADELBOT_TOKEN_FILE']+'.renew.lock',timeout=1)
+                    self.remote_identity_lock.acquire()
+                    self.remote_env=env
+                self.process = await asyncio.create_subprocess_exec(*(command or [sys.executable,"-m","padelbot.web_device"]),
+                    env=env,stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.DEVNULL,
+                    limit=64*1024 if command else 8*1024*1024)
+                if command:
+                    self.process.stdin.write(encode_request(native_request('enroll',env=env)))
+                    await self.process.stdin.drain()
+                result = json.loads(await asyncio.wait_for(self.process.stdout.readline(),timeout=360 if command else 180))
+                if command:
+                    from .remote_auth import ingest_response
+                    ingest_response(result,env)
                 if "error" in result:
                     await self._stop()
                 return result
@@ -430,10 +472,19 @@ class DeviceManager:
             await self.process.stdin.drain()
             try:
                 result = json.loads(await asyncio.wait_for(self.process.stdout.readline(),timeout=75 if command['action']=='setup_pin' else 45))
+                if self.remote_env:
+                    from .remote_auth import ingest_response
+                    ingest_response(result,self.remote_env)
             except BaseException:
                 await self._stop()
                 raise
             if command["action"] == "finish" and result.get("saved"):
+                if self.remote_env:
+                    try:
+                        persist_remote_profile(self.remote_env,result.pop('profile',None),str(command['pin']))
+                    except Exception:
+                        await self._stop()
+                        raise ValueError('De koppeling kon niet veilig worden bewaard. Probeer opnieuw.') from None
                 self.store.audit(user_id,'device_profile_saved')
                 logger.info('Enrollment profile saved profile={}',user_id)
                 await self._stop()
@@ -443,6 +494,17 @@ class DeviceManager:
             return result
 
     async def _stop(self):
+        try:
+            await self._stop_process()
+        finally:
+            self.process = None
+            self.user_id = None
+            if self.remote_identity_lock is not None:
+                self.remote_identity_lock.release()
+                self.remote_identity_lock=None
+            self.remote_env=None
+
+    async def _stop_process(self):
         if self.process and self.process.returncode is None:
             # Let the worker leave its command loop and flush/close Android in
             # its finally block. SIGTERM remains a fallback for an unresponsive
@@ -452,6 +514,15 @@ class DeviceManager:
                     self.process.stdin.write(b'{"action":"stop"}\n')
                     await self.process.stdin.drain()
                 await asyncio.wait_for(self.process.wait(),timeout=40)
+                if self.remote_env and self.process.stdout:
+                    # A final event is sent after Android flushes and stops.
+                    # It is telemetry only; never expose it to the website.
+                    from .remote_auth import ingest_response
+                    for _ in range(3):
+                        line=await asyncio.wait_for(self.process.stdout.readline(),timeout=2)
+                        if not line:break
+                        try:ingest_response(json.loads(line),self.remote_env)
+                        except (ValueError,TypeError):pass
             except (asyncio.TimeoutError,BrokenPipeError,ConnectionResetError):
                 if self.process.returncode is None:
                     self.process.terminate()
@@ -460,8 +531,6 @@ class DeviceManager:
                     except asyncio.TimeoutError:
                         self.process.kill()
                         await self.process.wait()
-        self.process = None
-        self.user_id = None
 
     async def close(self):
         async with self.lifecycle_lock:

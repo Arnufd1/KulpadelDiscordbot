@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     padelbot_android_emulator_memory_mb: int | None = Field(default=None, ge=1536, le=8192)
     padelbot_android_emulator_cores: int | None = Field(default=None, ge=1, le=8)
     padelbot_emulator_lock_file: Path = Path("./data/emulator.lock")
+    # Fixed local bridge executable. It owns wake-up and the restricted SSH
+    # connection; challenge links and PINs travel through its private stdin.
+    padelbot_auth_remote_command: Path | None = None
 
     discord_webhook_url: str = ""
     discord_bot_token: str = ""

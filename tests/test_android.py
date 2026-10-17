@@ -332,6 +332,30 @@ def test_fresh_android_login_ignores_saved_session_and_marks_pin_failure(monkeyp
     assert calls == ["failure"]
 
 
+@pytest.mark.parametrize('interruption',[SystemExit(1),KeyboardInterrupt()])
+@pytest.mark.parametrize('pin_attempted',[False,True])
+def test_interrupted_android_login_persists_pin_guard_before_cleanup(tmp_path,monkeypatch,interruption,pin_attempted):
+    failure=tmp_path/'failure.json'
+    monkeypatch.setattr(settings,'padelbot_android_failure_file',failure)
+    provider=android.AndroidApprover.__new__(android.AndroidApprover)
+    provider._remote=None
+    provider.attempted_pin=pin_attempted
+    closed=[]
+    def close():
+        # This corresponds to SIGTERM after native entry but before the IdP
+        # redirect. A subsequent process must see the durable latch already.
+        assert failure.exists() is pin_attempted
+        closed.append(True)
+    provider.close=close
+    def interrupted_http(*args,**kwargs):raise interruption
+    monkeypatch.setattr(auth,'_http_login',interrupted_http)
+    with pytest.raises(type(interruption)) as caught:
+        auth.login_via_android(provider)
+    assert caught.value is interruption
+    assert failure.exists() is pin_attempted
+    assert closed==[True]
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_expired_session_uses_android_only_when_enabled(tmp_path, monkeypatch, enabled):
     store = TokenStore(tmp_path / "key", tmp_path / "tokens")

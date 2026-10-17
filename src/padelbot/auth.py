@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import secrets
 import threading
 import time
@@ -17,9 +18,14 @@ from loguru import logger
 from .config import settings
 from .idp import SessionExpiredError, load_cookies, same_endpoint, save_state, snapshot, walk_oidc
 from .store import TokenBundle, TokenStore
+from .telemetry import auth_context, current_context, measure
 
 
 _renewal_lock = threading.RLock()
+
+
+class NativeAuthRequired(SessionExpiredError):
+    """The read dispatcher can park this task while the native lane logs in."""
 
 
 def _pkce_pair() -> tuple[str, str]:
@@ -77,6 +83,11 @@ def exchange_code(code: str, verifier: str, *, warn_no_refresh: bool = False) ->
 
 
 def refresh(bundle: TokenBundle) -> TokenBundle:
+    with measure("refresh_token"):
+        return _refresh(bundle)
+
+
+def _refresh(bundle: TokenBundle) -> TokenBundle:
     if not bundle.refresh_token:
         raise RuntimeError("No refresh token stored; session renewal is required.")
     response = httpx.post(settings.kul_token_url, data={
@@ -173,10 +184,22 @@ def login_via_http(
 
 def login_via_android(authenticate_link: Callable[[str], None], *, fresh: bool = False) -> TokenBundle:
     """Passwordless OIDC login on an explicitly selected registered Android."""
-    with _renewal_lock:
+    with _renewal_lock, measure("android_login") as measurement:
+        def measured_link(link: str) -> None:
+            measurement.mark_native()
+            with measure("native_mfa"):
+                authenticate_link(link)
+        # The walker warms the registered device before opening its expiring
+        # challenge. Preserve this hook without treating warm-up as MFA success.
+        prepare = getattr(authenticate_link, "prepare", None)
+        if prepare is not None:
+            measured_link.prepare = prepare
         try:
-            return _http_login(settings.padelbot_storage_file, authenticate_link=authenticate_link, use_saved_session=not fresh)
-        except Exception:
+            return _http_login(settings.padelbot_storage_file, authenticate_link=measured_link, use_saved_session=not fresh)
+        except BaseException:
+            # SIGTERM is translated to SystemExit by the job worker. An
+            # interrupted PIN attempt is just as uncertain as an HTTP error;
+            # persist its guard before cleanup or another task can reuse it.
             on_failure = getattr(authenticate_link, "on_failure", None)
             if on_failure is not None:
                 on_failure()
@@ -200,17 +223,19 @@ def silent_refresh_via_session(
 
     The headless/id_token_hint arguments remain for compatibility with old callers.
     """
-    if not storage_state_path.exists():
-        raise SessionExpiredError("No saved KUL session; a new login is required.")
-    with _renewal_lock:
-        return _http_login(storage_state_path, timeout_seconds=timeout_seconds)
+    with measure("silent_session"):
+        if not storage_state_path.exists():
+            raise SessionExpiredError("No saved KUL session; a new login is required.")
+        with _renewal_lock:
+            return _http_login(storage_state_path, timeout_seconds=timeout_seconds)
 
 
 def renew_access_token(store: TokenStore) -> str:
     """Force renewal and persist tokens under the shared process lock."""
     from filelock import FileLock
     store.blob_file.parent.mkdir(parents=True, exist_ok=True)
-    with _renewal_lock, FileLock(str(store.blob_file) + ".renew.lock", timeout=300):
+    context = current_context()
+    with auth_context(context if context in {"probe", "enrollment"} else "renewal"), _renewal_lock, FileLock(str(store.blob_file) + ".renew.lock", timeout=300):
         bundle = store.load()
         if bundle is None:
             raise RuntimeError("No tokens stored — run `padelbot login` first.")
@@ -219,6 +244,8 @@ def renew_access_token(store: TokenStore) -> str:
         except SessionExpiredError:
             if not settings.padelbot_android_autologin:
                 raise
+            if os.environ.get("PADELWEB_DEFER_AUTH", "").lower() == "true":
+                raise NativeAuthRequired("The saved KUL session requires native authentication.") from None
             from .android import AndroidApprover
             new_bundle = login_via_android(AndroidApprover())
         store.save(new_bundle)
